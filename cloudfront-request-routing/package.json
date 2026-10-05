@@ -1,0 +1,8 @@
+{
+  "name": "cloudfront-request-routing-sample",
+  "private": true,
+  "description": "Unit tests for the CloudFront request routing sample. No dependencies.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs && node scripts/check-function-sync.mjs"
+  }
+}
