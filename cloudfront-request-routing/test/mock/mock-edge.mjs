@@ -75,6 +75,12 @@ http.createServer(async (req, res) => {
   res.end(out.body);
 }).listen(port, '127.0.0.1');
 
+// Direct calls to the origin function URLs (no CloudFront signing): refused unless MOCK_DIRECT_OPEN=1 (to test the FAIL path).
+http.createServer((req, res) => {
+  res.writeHead(process.env.MOCK_DIRECT_OPEN === '1' ? 200 : 403);
+  res.end('{"message":"Forbidden"}');
+}).listen(Number(process.argv[5] || 18789), '127.0.0.1');
+
 // Mock of the Lambda@Edge variant on a second port.
 const edgeSrc = readSource('edge-origin-request.js').replaceAll('.example.net', SFX);
 http.createServer((req, res) => {

@@ -8,6 +8,7 @@
 #   ROUTE_ATTRIBUTE (x-backend|host)  CACHE_KEY_ATTRIBUTE (x-backend|host|none)
 #   ALIAS_A ALIAS_B CERT_ARN        all three, for the Host-based tests (aliases: lower-case a-z 0-9 . -)
 #   COST_TAG_KEY (project)
+#   ORIGIN_AUTH (AWS_IAM|NONE; default AWS_IAM, forced to NONE with DEPLOY_EDGE=true)
 #   ENABLE_TEST_BEHAVIORS (true here; the template default is false)
 #   DEPLOY_EDGE=true                also deploy the optional Lambda@Edge stack
 #   EDGE_STACK_NAME (<STACK_NAME>-edge)  EDGE_NAME_PREFIX (cfrouting-edge)
@@ -33,6 +34,12 @@ printf '%s' "$EDGE_NAME_PREFIX" | grep -Eq '^[a-z][a-z0-9-]{0,19}$' || { echo "b
 
 params=("NamePrefix=$NAME_PREFIX" "EnableTestBehaviors=${ENABLE_TEST_BEHAVIORS:-true}")
 add() { [ -z "${2:-}" ] || params+=("$1=$2"); }
+ORIGIN_AUTH="${ORIGIN_AUTH:-AWS_IAM}"
+if [ "${DEPLOY_EDGE:-false}" = "true" ] && [ "$ORIGIN_AUTH" != "NONE" ]; then
+  echo "DEPLOY_EDGE=true: Lambda@Edge cannot sign requests to a retargeted origin, so the test origins are deployed PUBLIC (OriginAuth=NONE)."
+  ORIGIN_AUTH=NONE
+fi
+params+=("OriginAuth=$ORIGIN_AUTH")
 add RouteAttribute "${ROUTE_ATTRIBUTE:-}"
 add CacheKeyAttribute "${CACHE_KEY_ATTRIBUTE:-}"
 add AliasDomainA "$ALIAS_A"
@@ -68,6 +75,8 @@ kv EDGE_NAME_PREFIX "$EDGE_NAME_PREFIX"
 kv KVS_ARN "$(out "$STACK_NAME" RouteStoreArn)"
 kv ORIGIN_A_HOST "$ORIGIN_A_HOST"
 kv ORIGIN_B_HOST "$ORIGIN_B_HOST"
+kv DEFAULT_ORIGIN_HOST "$(out "$STACK_NAME" OriginDefaultHost)"
+kv ORIGIN_AUTH "$ORIGIN_AUTH"
 kv ROUTE_ATTRIBUTE "$(out "$STACK_NAME" RouteAttribute)"
 kv CACHE_KEY_ATTRIBUTE "$(out "$STACK_NAME" CacheKeyAttribute)"
 kv ALIAS_A "$ALIAS_A"

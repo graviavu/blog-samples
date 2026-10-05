@@ -11,6 +11,7 @@
 #   ROUTE_ATTRIBUTE       x-backend (default) or host      CACHE_KEY_ATTRIBUTE  x-backend (default), host or none
 #   ALIAS_A ALIAS_B       alias domains, only for Host-based routing
 #   KVS_ARN ORIGIN_A_HOST ORIGIN_B_HOST FUNCTION_NAME      for T4 (needs aws CLI)
+#   ORIGIN_A_HOST ORIGIN_B_HOST DEFAULT_ORIGIN_HOST ORIGIN_AUTH   for T6i (direct calls must be refused when ORIGIN_AUTH=AWS_IAM)
 #   EDGE_DOMAIN           domain of the optional Lambda@Edge stack, enables T7
 #   RESULTS_FILE          output file (default verify-results-<utc time>.txt)
 #   READY_MAX (900)       seconds to wait for the stack to answer     T4_MAX (180)  seconds to wait in T4
@@ -34,6 +35,8 @@ KVS_ARN="${KVS_ARN:-}"
 ORIGIN_A_HOST="${ORIGIN_A_HOST:-}"
 ORIGIN_B_HOST="${ORIGIN_B_HOST:-}"
 FUNCTION_NAME="${FUNCTION_NAME:-}"
+DEFAULT_ORIGIN_HOST="${DEFAULT_ORIGIN_HOST:-}"
+ORIGIN_AUTH="${ORIGIN_AUTH:-AWS_IAM}"
 EDGE_DOMAIN="${EDGE_DOMAIN:-}"
 READY_MAX="${READY_MAX:-900}"
 T4_MAX="${T4_MAX:-180}"
@@ -344,6 +347,49 @@ if need_route_keys T6a; then
   else
     emit T6a INCONCLUSIVE "no clean routed response: status $R_CODE origin '$(jget origin)'"
     emit T6b INCONCLUSIVE "depends on T6a"
+  fi
+fi
+
+# T6i: the origins are IAM-protected. A direct call to a function URL without CloudFront signing must be refused,
+# while the routed call through CloudFront works. Together they confirm OAC + function-based origin selection.
+hyp T6i "With OriginAuth=AWS_IAM, a direct call to each function URL (no CloudFront signing) is refused with 403, while the routed call through CloudFront returns 200 from the right backend (updateRequestOrigin with originAccessControlConfig, originType lambda)" \
+  "direct calls: 403 for origin A, B and default; routed calls: 200 from origin-a and origin-b"
+if [ "$ORIGIN_AUTH" != "AWS_IAM" ]; then
+  emit T6i INCONCLUSIVE "not applicable: origins deployed with OriginAuth=$ORIGIN_AUTH (public)"
+elif [ -z "$ORIGIN_A_HOST" ] || [ -z "$ORIGIN_B_HOST" ] || [ -z "$KEY_A" ] || [ -z "$KEY_B" ]; then
+  emit T6i INCONCLUSIVE "not run: needs ORIGIN_A_HOST, ORIGIN_B_HOST (deploy.env) and route keys"
+else
+  [ "$SCHEME" = "https" ] && dport=443 || dport=80
+  direct_status() { # name host
+    if [ -n "${VERIFY_DIRECT_CONNECT:-}" ]; then   # test hook for the local mock only
+      req "T6i direct $1" "$SCHEME://$2/t6i/$RUN" --connect-to "$2:$dport:$VERIFY_DIRECT_CONNECT"
+    else
+      req "T6i direct $1" "$SCHEME://$2/t6i/$RUN"
+    fi
+  }
+  open_hosts=""; odd=""; detail=""
+  for pair in "A|$ORIGIN_A_HOST" "B|$ORIGIN_B_HOST" "default|$DEFAULT_ORIGIN_HOST"; do
+    nm=${pair%%|*}; hh=${pair#*|}
+    [ -n "$hh" ] || continue
+    direct_status "$nm" "$hh"
+    detail="$detail direct-$nm=$R_CODE"
+    case "$R_CODE" in
+      403) ;;
+      200) open_hosts="$open_hosts $nm" ;;
+      *) odd="$odd $nm" ;;
+    esac
+  done
+  route_req "T6i routed A" "$KEY_A" "/t6i/$RUN/a"; ra=$R_CODE; oa=$(jget origin)
+  route_req "T6i routed B" "$KEY_B" "/t6i/$RUN/b"; rb=$R_CODE; ob=$(jget origin)
+  detail="$detail; routed-A=$ra/${oa:-none} routed-B=$rb/${ob:-none}"
+  if [ -n "$open_hosts" ]; then
+    emit T6i FAIL "origin(s)$open_hosts answered a direct unsigned call with 200 (not protected). $detail"
+  elif [ "$ra" != "200" ] || [ "$oa" != "origin-a" ] || [ "$rb" != "200" ] || [ "$ob" != "origin-b" ]; then
+    emit T6i FAIL "direct calls refused but the routed call failed: OAC with function-based origin selection did not work. Fallback: see README. $detail"
+  elif [ -n "$odd" ]; then
+    emit T6i INCONCLUSIVE "direct call to$odd returned neither 403 nor 200. $detail"
+  else
+    emit T6i PASS "$detail"
   fi
 fi
 

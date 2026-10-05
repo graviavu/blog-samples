@@ -22,13 +22,14 @@ Main stack, `template.yaml` (us-east-1):
 | KeyValueStore | The route table: route key to backend domain name. Seeded by `seed-kvs.sh`. |
 | CloudFront Function (runtime 2.0) | `function/route.js`: normalizes the key, checks the table, calls `updateRequestOrigin()`. Unknown key gives 404, bad value gives 500, never a fall-through to the default origin. |
 | Cache policy and origin request policy | The routing attribute (`x-backend` or `host`) is in the cache key. The origin request policy forwards one harmless test header and not `Host`. |
-| Three Lambda functions with function URLs | Test origins (default origin, backend A, backend B). Each returns JSON that echoes the Host it saw, the path, three test headers and its own name. **Backends A and B are public** (auth `NONE`). The default origin requires IAM auth and is reachable only through this distribution (origin access control). |
+| Three Lambda functions with function URLs | Test origins (default origin, backend A, backend B). Each returns JSON that echoes the Host it saw, the path, three test headers and its own name. By default (`OriginAuth=AWS_IAM`) all three require IAM auth and are reachable only through this distribution (origin access control); `OriginAuth=NONE` makes them public. |
 | Response headers policy | Basic security headers (HSTS, nosniff, frame deny, no-referrer) on routed responses. |
 | Test-only behaviors `/control/*` and `/probe/*` | Optional. The template default for `EnableTestBehaviors` is **false**; `deploy.sh` sets it to true because `verify.sh` needs them. `/control/*` has a cache key with only the path (test T1a). `/probe/*` shows the raw Host seen by a function (test T8). Without them T1a and T8 report INCONCLUSIVE. |
 | Log groups, one IAM role | Three log groups (3-day retention) and one role that can only write to them. No wildcard permissions. No S3 buckets. |
 
 Optional second stack, `template-lambda-edge.yaml`: the Lambda@Edge origin request variant from the post, with its own
-distribution (test T7). It reuses the main stack's test origins. Deleting it is slow (see Teardown).
+distribution (test T7). It reuses the main stack's test origins, which must then be public (`OriginAuth=NONE`) because Lambda@Edge cannot sign
+requests to a retargeted origin. Deleting it is slow (see Teardown).
 
 Everything carries the tags `sample=cloudfront-request-routing` and `<CostTagKey>=cloudfront-request-routing` (the tag
 key is a parameter, default `project`; activate it as a cost allocation tag if you want to see the cost).
@@ -98,14 +99,14 @@ No amounts are quoted here because they change. **Check current pricing** before
 ```bash
 cd cloudfront-request-routing
 ./deploy.sh                      # about 5 to 15 minutes; writes deploy.env (no secrets)
-DEPLOY_EDGE=true ./deploy.sh     # optional: also deploy the Lambda@Edge stack (needed for T7)
+DEPLOY_EDGE=true ./deploy.sh     # optional: also deploy the Lambda@Edge stack (needed for T7); forces PUBLIC test origins
 ```
 
 `deploy.sh` runs `aws cloudformation deploy` (with `EnableTestBehaviors=true`, which `verify.sh` needs), then `seed-kvs.sh`, then writes
 `deploy.env` (shell-quoted with `printf %q`) for `verify.sh` and `teardown.sh`. It rejects alias names that are not lower-case letters,
 digits, dots and hyphens.
 It reads these optional environment variables: `STACK_NAME`, `NAME_PREFIX`, `ROUTE_ATTRIBUTE`, `CACHE_KEY_ATTRIBUTE`,
-`ALIAS_A`, `ALIAS_B`, `CERT_ARN`, `COST_TAG_KEY`, `ENABLE_TEST_BEHAVIORS`.
+`ALIAS_A`, `ALIAS_B`, `CERT_ARN`, `COST_TAG_KEY`, `ENABLE_TEST_BEHAVIORS`, `ORIGIN_AUTH` (`AWS_IAM` default, or `NONE`).
 
 ### Option B: console
 
@@ -138,7 +139,7 @@ It reads these optional environment variables: `STACK_NAME`, `NAME_PREFIX`, `ROU
    That is why seeding is a separate step.
 4. For `verify.sh`, run it with the values from the outputs, for example
    `CF_DOMAIN=<DistributionDomain> ORIGIN_A_HOST=<OriginAHost> ORIGIN_B_HOST=<OriginBHost> KVS_ARN=<RouteStoreArn> ./verify.sh`.
-5. Optional Lambda@Edge variant: create a second stack from `template-lambda-edge.yaml` (us-east-1) with the three host
+5. Optional Lambda@Edge variant: set the main stack's `OriginAuth` parameter to `NONE` (public test origins), then create a second stack from `template-lambda-edge.yaml` (us-east-1) with the three host
    outputs as parameters, then add `EDGE_DOMAIN=<EdgeDistributionDomain>` to the `verify.sh` command.
 
 ### Try it by hand
@@ -202,19 +203,31 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
 
 ## Safety notes
 
-- **Backends A and B are public endpoints** (Lambda function URLs with auth `NONE`). Anyone who learns their URL can call them directly,
-  and you pay for those calls. They echo only non-secret request data: the Host header, path, query string, three test headers, the
-  origin name and a request id. They have no access to anything else and are deleted by teardown. Do not put real backends, credentials
-  or secrets in this sample. Do not send private data through it.
-- **What is locked down, and what is not.** The default origin uses function URL auth `AWS_IAM` with a CloudFront origin access control
-  (type `lambda`, SigV4 `always`); its resource policy lets only `cloudfront.amazonaws.com` invoke it, only on behalf of this
-  distribution (`SourceArn`). A and B are not locked because the origin switch is done by `updateRequestOrigin()` in the function, and I
-  could not confirm from the official documentation while writing this that the helper can carry origin access control settings for a
-  function URL origin (the documentation pages were not reachable from the build environment). I did not guess the field names. A
-  possible follow-up once confirmed: set `AuthType: AWS_IAM` on A and B, grant `cloudfront.amazonaws.com` invoke with the same
-  `SourceArn`, and pass the origin access control settings in the function. Until then the public exposure above applies. T6a will also show
-  whether a routed request inherits the default origin's signing settings without breaking (the template does not rely on it).
-  The template itself has only been checked with cfn-lint, not deployed.
+- **Exposure of the test origins.** By default (`OriginAuth=AWS_IAM`) all three test origins are Lambda function URLs with IAM auth,
+  and each function's resource policy lets only `cloudfront.amazonaws.com` invoke it, only on behalf of this distribution (`SourceArn`),
+  with both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (two permission statements per function, as the Lambda documentation
+  requires for new function URLs). They echo only non-secret request data (Host header, path, query string, three test headers,
+  origin name, request id) and are deleted by teardown. Do not put real backends, credentials or secrets in this sample.
+  **Public mode:** with `OriginAuth=NONE` the three function URLs are public: anyone who learns a URL can call it directly and you pay for
+  those calls. `deploy.sh` forces this mode when you ask for the Lambda@Edge variant (`DEPLOY_EDGE=true`), because Lambda@Edge cannot sign
+  requests to an origin it retargets.
+- **How the lock works, and what is and is not documented.** `route.js` passes
+  `originAccessControlConfig: { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' }` on every
+  `updateRequestOrigin()` call. The AWS documentation for `updateRequestOrigin()` lists these properties and lists Lambda function URLs as a
+  supported origin type, and says an OAC set on the call applies to the new origin (its only worked example is S3). The documentation
+  also describes the Lambda function URL OAC setup (auth `AWS_IAM`, two permissions, HTTPS-only origin). **But AWS has no Lambda-specific
+  example of the combination "function-based origin selection plus OAC for a Lambda function URL", and the docs are ambiguous about how
+  the signing is bound when the origin is not defined in the distribution.** So this is unproven until the first deployment. Tests
+  **T6a** (routed call returns 200 from the right backend) and **T6i** (a direct, unsigned call to each function URL returns 403 while the
+  routed call through CloudFront returns 200) confirm or refute it. The template itself has only been checked with cfn-lint, not deployed.
+- **If T6a or T6i fails, fallback.** If the routed call fails (403 from the backend) the combination does not work as assumed. Then either
+  (a) redeploy with `ORIGIN_AUTH=NONE` (public test origins) and accept the exposure for the short life of the stack, optionally also
+  setting reserved concurrency on the three Lambda functions in the console to bound abuse, or (b) keep IAM auth only for backends defined
+  as origins in the distribution and select them with `selectRequestOriginById()` (the documented way to use an OAC attached to a configured
+  origin). If the direct call returns 200, the resource policy is too open: tear down and do not use the sample until that is understood.
+- **POST and PUT.** With OAC for a Lambda function URL, a client that sends a request body must send its SHA256 in the
+  `x-amz-content-sha256` header, because Lambda does not support unsigned payloads. This sample uses GET only, so it does not matter here;
+  it matters as soon as you proxy POST or PUT to a function URL.
 - **TLS.** Viewers must use HTTPS. With the default `*.cloudfront.net` certificate CloudFront does not let you set a minimum TLS version;
   `MinimumProtocolVersion: TLSv1.2_2021` applies only when you bring an alias and a certificate. Backends are reached over TLS 1.2 only.
 - **Backend allow-list.** Besides the domain pattern, `route.js` accepts a stored value only if it ends with `BACKEND_SUFFIX` (default
@@ -239,7 +252,8 @@ The post: [Route to many backends with CloudFront alone](https://blog.ar-logs.co
 | T1b | Does adding the routing attribute to the cache policy separate the routes? Rerun with `CACHE_KEY_ATTRIBUTE=none` to see the hazard. | "Add the Host header (or the attribute you route on) to the cache policy" | nothing |
 | T1c | Which Host does the backend see when the function sets `hostHeader` and the attribute is in the cache key? Does the origin request policy reach the backend? | "Which Host the backend then sees ... is not yet confirmed by a test (T1)" | nothing |
 | T4 | Is a changed KeyValueStore value live at the edge without republishing, and how many seconds does it take (from one vantage point)? | "AWS says updates reach the edge in a few seconds (not yet confirmed by a test)" | AWS CLI v2 |
-| T6a, T6b | Does a routed request work with the settings inherited from the default custom origin, including its custom header? | "settings you omit are inherited from the origin the behavior would have used" | nothing |
+| T6i | With IAM-protected origins, is a direct unsigned call to each function URL refused (403) while the routed call through CloudFront works (OAC with function-based origin selection)? | not in the post; confirms the sample's lock-down | `OriginAuth=AWS_IAM` |
+| T6a, T6b | Does a routed request work (including the OAC signing) with the settings inherited from the default custom origin, including its custom header? | "settings you omit are inherited from the origin the behavior would have used" | nothing |
 | T6c to T6h | Bad stored values (colon, IP address, upper case, valid domain outside the allowed suffix), unknown key and missing key: do they fail closed with no fall-through to the default origin? | "fail closed; never fall back to the default origin" | header routing |
 | T7 | Does the Lambda@Edge origin request sample retarget the origin, pass TLS validation, set the Host the backend sees, and avoid fall-through? | "Whether TLS validation and the Host value work as the sample assumes is not yet confirmed (T7)" | optional edge stack |
 | T8 | Can the Host value in the function event carry upper case, a port or a trailing dot (probe function)? | "Whether the real value can carry a port or a trailing dot is not yet confirmed (T8)" | `/probe/*` behavior |

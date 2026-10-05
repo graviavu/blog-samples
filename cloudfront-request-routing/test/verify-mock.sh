@@ -17,7 +17,7 @@ run_case() { # name key-attribute expected-substrings...
   sleep 1
   mkdir -p "$dir/bin"; cp test/mock/fake-aws "$dir/bin/aws"
   out=$(PATH="$dir/bin:$PATH" VERIFY_SCHEME=http RESULTS_FILE="$dir/results-$name.txt" CF_DOMAIN=127.0.0.1:18787 EDGE_DOMAIN=127.0.0.1:18788 \
-    KVS_ARN=fake ORIGIN_A_HOST=origin-a$SFX ORIGIN_B_HOST=origin-b$SFX FUNCTION_NAME=fake \
+    VERIFY_DIRECT_CONNECT=127.0.0.1:18789 DEFAULT_ORIGIN_HOST=origin-default$SFX KVS_ARN=fake ORIGIN_A_HOST=origin-a$SFX ORIGIN_B_HOST=origin-b$SFX FUNCTION_NAME=fake \
     CACHE_KEY_ATTRIBUTE=$keyattr READY_MAX=20 bash ./verify.sh 2>&1)
   kill $mock_pid 2>/dev/null; wait $mock_pid 2>/dev/null
   rm -f "$FAKE_KVS_LOG"
@@ -31,10 +31,13 @@ run_case() { # name key-attribute expected-substrings...
 run_case keyed x-backend \
   'TEST=T1a RESULT=PASS' 'TEST=T1b RESULT=PASS' 'TEST=T1c RESULT=PASS' 'TEST=T4 RESULT=PASS' \
   'TEST=T6a RESULT=PASS' 'TEST=T6b RESULT=PASS' 'TEST=T6c RESULT=PASS' 'TEST=T6d RESULT=PASS' 'TEST=T6e RESULT=PASS' \
-  'TEST=T6f RESULT=PASS' 'TEST=T6h RESULT=PASS' 'TEST=T6g RESULT=PASS' 'TEST=T7 RESULT=PASS' 'TEST=T8 RESULT=PASS' 'SUMMARY pass=.* fail=0'
+  'TEST=T6f RESULT=PASS' 'TEST=T6i RESULT=PASS' 'TEST=T6h RESULT=PASS' 'TEST=T6g RESULT=PASS' 'TEST=T7 RESULT=PASS' 'TEST=T8 RESULT=PASS' 'SUMMARY pass=.* fail=0'
 
 # Same stack but the attribute is NOT in the cache key: T1b must now expect (and see) the shared entry.
 run_case unkeyed none 'TEST=T1a RESULT=PASS' 'TEST=T1b RESULT=PASS'
+
+# Origins that answer a direct unsigned call must be reported as exposed.
+MOCK_DIRECT_OPEN=1 run_case exposed x-backend 'TEST=T6i RESULT=FAIL'
 
 # AWS CLI failure with an AccessDenied message that contains an account id and ARNs (built at run time).
 FAKE_AWS_FAIL=1 run_case awsfail x-backend 'TEST=T4 RESULT=INCONCLUSIVE' 'AccessDeniedException'
