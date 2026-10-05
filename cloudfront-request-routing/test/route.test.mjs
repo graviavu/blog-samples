@@ -115,6 +115,37 @@ test('x-backend attribute (default): routes on the header, ignores Host', async 
   assert.equal((await handler(only)).statusCode, 404);
 });
 
+test('shipped suffix allow-list: only the default suffix passes, lookalikes and other domains fail', async () => {
+  const sfx = '.lambda-url.us-east-1.on' + '.aws';
+  const store = {
+    ok: `origin-a${sfx}`,
+    other: 'origin-a.example.net',
+    lookalike: `evil${sfx}.example.net`,
+    nodot: `xlambda-url.us-east-1.on${'.aws'}`,
+    otherregion: 'origin-a.lambda-url.eu-west-1.on' + '.aws',
+  };
+  const { handler, calls } = loadRoute({ store, attribute: 'host', suffix: null });
+  assert.equal((await handler(host('ok'))).method, 'GET');
+  for (const k of ['other', 'lookalike', 'nodot', 'otherregion']) {
+    assert.equal((await handler(host(k))).statusCode, 500, k);
+  }
+  assert.equal(calls.updates.length, 1);
+});
+
+test('suffix allow-list is configurable and enforced', async () => {
+  const strict = loadRoute({ store: { a: 'origin-a.example.net' }, attribute: 'host', suffix: '.corp.example.net' });
+  assert.equal((await strict.handler(host('a'))).statusCode, 500);
+  const ok = loadRoute({ store: { a: 'origin-a.corp.example.net' }, attribute: 'host', suffix: '.corp.example.net' });
+  assert.equal((await ok.handler(host('a'))).method, 'GET');
+  assert.equal(ok.calls.updates.length, 1);
+});
+
+test('empty suffix disables only the suffix check, not the domain pattern', async () => {
+  const open = loadRoute({ store: { a: 'origin-a.example.net', b: '192.0.2.1' }, attribute: 'host', suffix: '' });
+  assert.equal((await open.handler(host('a'))).method, 'GET');
+  assert.equal((await open.handler(host('b'))).statusCode, 500);
+});
+
 test('the request value is only ever used as a key, never as the origin', async () => {
   const { handler, calls } = loadRoute({ store: { 'route-a': 'origin-a.example.net' } });
   const res = await handler(event('x-backend', 'attacker.example.org'));

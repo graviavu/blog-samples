@@ -22,9 +22,12 @@ exports.handler = (event, context, callback) => {
     callback(null, { status: '404', statusDescription: 'Not Found' });
     return;
   }
-  if (request.origin.custom) {
-    request.origin.custom.domainName = target;
-    request.headers.host = [{ key: 'Host', value: target }];
+  if (!request.origin || !request.origin.custom) {
+    // The sample only retargets custom origins. Fail closed instead of sending the request on unchanged.
+    callback(null, { status: '500', statusDescription: 'Bad route' });
+    return;
   }
+  request.origin.custom.domainName = target;
+  request.headers.host = [{ key: 'Host', value: target }];
   callback(null, request);
 };

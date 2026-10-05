@@ -11,10 +11,14 @@ export function readSource(name) {
 // Loads function/route.js with a stub for the 'cloudfront' module.
 // route.js is an ES module for the CloudFront runtime; here we swap the import line for the stub
 // and evaluate the rest unchanged.
-export function loadRoute({ store = {}, attribute, updateThrows = false, getThrows = false } = {}) {
+export function loadRoute({ store = {}, attribute, suffix = '.example.net', updateThrows = false, getThrows = false } = {}) {
   let src = readSource('route.js');
   if (attribute) {
     src = src.replace(/const ROUTE_ATTRIBUTE = '[^']*';/, `const ROUTE_ATTRIBUTE = '${attribute}';`);
+  }
+  // Tests use .example.net by default; pass suffix: null to keep the constant that ships in route.js.
+  if (suffix !== null) {
+    src = src.replace(/const BACKEND_SUFFIX = '[^']*';/, `const BACKEND_SUFFIX = '${suffix}';`);
   }
   if (!src.includes("import cf from 'cloudfront';")) throw new Error('import line not found');
   src = src.replace("import cf from 'cloudfront';", 'const cf = __cf;');

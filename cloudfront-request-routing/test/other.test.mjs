@@ -30,6 +30,16 @@ test('edge: unknown or missing key answers 404, no fall-through', async () => {
   }
 });
 
+test('edge: a known key on a non-custom origin answers 500 and never passes the request on', async () => {
+  for (const origin of [{ s3: { domainName: 'bucket.example.net' } }, undefined]) {
+    const ev = edgeEvent({ 'x-backend': [{ key: 'X-Backend', value: 'route-a' }] });
+    ev.Records[0].cf.request.origin = origin;
+    const { out } = await run(loadEdge(), ev);
+    assert.equal(out.status, '500');
+    assert.equal(out.uri, undefined);
+  }
+});
+
 test('probe: returns the raw Host value and never an origin', () => {
   const handler = new Function(`${readSource('probe.js')}\nreturn handler;`)();
   const res = handler({ request: { headers: { host: { value: 'Example.COM:443' } } } });

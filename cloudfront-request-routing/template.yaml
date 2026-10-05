@@ -315,6 +315,11 @@ Resources:
         // 'x-backend' (a request header) lets the sample work on the *.cloudfront.net domain.
         const ROUTE_ATTRIBUTE = '${RouteAttribute}';
 
+        // Allow-list for backend domains: a stored value must also end with this suffix, so a mistaken or
+        // malicious write to the store cannot send traffic to an arbitrary host. The default fits the sample's
+        // test origins (Lambda function URLs). Set it to your own domain suffix. '' disables the check.
+        const BACKEND_SUFFIX = '.lambda-url.us-east-1.on.aws';
+
         // updateRequestOrigin() rejects a domain name with a colon or an IP address.
         const DOMAIN = /^(?!\d+(\.\d+){3}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
@@ -336,7 +341,7 @@ Resources:
             return reply(404, 'Not Found');
           }
           const backend = await kvsHandle.get(host);
-          if (!DOMAIN.test(backend)) {
+          if (!DOMAIN.test(backend) || !backend.endsWith(BACKEND_SUFFIX)) {
             return reply(500, 'Bad route');   // fail closed; never fall back to the default origin
           }
 
