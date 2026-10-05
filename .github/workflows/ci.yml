@@ -62,3 +62,7 @@ jobs:
       - name: verify.sh against the local mock (tests the script, not CloudFront)
         working-directory: cloudfront-request-routing
         run: test/verify-mock.sh
+
+      - name: teardown.sh guards against a fake aws CLI
+        working-directory: cloudfront-request-routing
+        run: test/teardown-test.sh

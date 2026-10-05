@@ -9,9 +9,10 @@ import { loadRoute, readSource } from '../helpers.mjs';
 const [port, edgePort, writeLog] = [Number(process.argv[2]), Number(process.argv[3]), process.argv[4]];
 const CACHE_KEY = process.env.CACHE_KEY_ATTRIBUTE || 'x-backend';
 const DELAY = Number(process.env.PROPAGATION_MS || 3000);
+const SFX = '.lambda-url.us-east-1.on' + '.aws';   // the suffix route.js ships with
 const SEED = {
-  'route-a': 'origin-a.example.net', 'route-b': 'origin-b.example.net', 'bad-colon': 'example.net:8443',
-  'bad-ip': '192.0.2.10', 'bad-upper': 'Origin-A.example.net',
+  'route-a': `origin-a${SFX}`, 'route-b': `origin-b${SFX}`, 'bad-colon': 'example.net:8443',
+  'bad-ip': '192.0.2.10', 'bad-upper': 'Origin-A.example.net', 'bad-suffix': 'origin-a.example.net',
 };
 const cache = new Map();
 let n = 0;
@@ -49,7 +50,7 @@ function viewerRequest(req, url) {
   if (path.startsWith('/probe/')) {
     return { status: 200, headers: { 'x-seen-host': req.headers.host, 'cache-control': 'no-store' }, body: '' };
   }
-  const { handler, calls } = loadRoute({ store: store() });
+  const { handler, calls } = loadRoute({ store: store(), suffix: null });
   return handler({ request: { method: 'GET', uri: path, headers: cfHeaders(req.headers) } }).then((res) => {
     if (res.statusCode) return { status: res.statusCode, headers: {}, body: '' };
     const o = calls.updates[0].domainName;
@@ -75,7 +76,7 @@ http.createServer(async (req, res) => {
 }).listen(port, '127.0.0.1');
 
 // Mock of the Lambda@Edge variant on a second port.
-const edgeSrc = readSource('edge-origin-request.js');
+const edgeSrc = readSource('edge-origin-request.js').replaceAll('.example.net', SFX);
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const m = { exports: {} };

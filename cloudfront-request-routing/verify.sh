@@ -47,7 +47,7 @@ if [ -z "$DOMAIN" ]; then
 fi
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 
-RUN="$(date +%s)$$"
+RUN="r$(date +%s)p$$"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/verify.XXXXXX")" || exit 2
 trap 'rm -rf "$TMP"' EXIT
 REQ_N=0
@@ -57,6 +57,31 @@ MACHINE=""
 if [ "$ROUTE_ATTRIBUTE" = "host" ]; then KEY_A="$ALIAS_A"; KEY_B="$ALIAS_B"; else KEY_A="route-a"; KEY_B="route-b"; fi
 
 log() { printf '%s\n' "$*" >> "$RESULTS_FILE"; }
+
+# awscall DESCRIPTION AWS_ARGS...  runs the AWS CLI with stdout and stderr captured in temp files.
+# Only the description, the exit code and the error CODE (for example AccessDeniedException) are logged:
+# AWS error messages can contain account ids and IAM ARNs, so the message text is never written.
+# On success the output is left in $AWS_OUT for the caller (it is not logged).
+AWS_OUT="$TMP/aws.out"
+awscall() {
+  local desc=$1 rc code; shift
+  aws "$@" > "$AWS_OUT" 2> "$TMP/aws.err"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "# aws $desc: ok"
+  else
+    code=$(sed -n 's/.*(\([A-Za-z0-9]*\)).*/\1/p' "$TMP/aws.err" | head -1)
+    log "# aws $desc: FAILED exit=$rc error-code=${code:-unknown} (message withheld on purpose)"
+  fi
+  return "$rc"
+}
+
+# redact_results FILE  last line of defence: mask 12-digit numbers and ARNs in the results file.
+redact_results() {
+  sed -E -e 's/arn:aws[a-z-]*:[^[:space:]"'"'"',;)]*/arn:aws:REDACTED/g' \
+    -e 's/(^|[^0-9])[0-9]{12}([^0-9]|$)/\1REDACTED12\2/g' \
+    -e 's/(^|[^0-9])[0-9]{12}([^0-9]|$)/\1REDACTED12\2/g' "$1" > "$1.redacted" && mv "$1.redacted" "$1"
+}
 
 # ------------------------------------------------------------------ request helpers
 # req NAME CURL_ARGS...   sends one request, appends raw request/response to the results file
@@ -130,7 +155,7 @@ need_route_keys() {
   echo "domain: $DOMAIN   route attribute: $ROUTE_ATTRIBUTE   cache key attribute: $CACHE_KEY_ATTRIBUTE"
   echo "alias a: ${ALIAS_A:-(none)}   alias b: ${ALIAS_B:-(none)}   edge domain: ${EDGE_DOMAIN:-(none)}"
   echo "curl: $(curl --version | head -1)"
-  command -v aws >/dev/null 2>&1 && echo "aws cli: $(aws --version 2>&1 | head -1)"
+  command -v aws >/dev/null 2>&1 && echo "aws cli: $(aws --version 2>/dev/null | grep -o '^aws-cli/[0-9.]*' | head -1)"
   echo "uname: $(uname -sr)"
 } >> "$RESULTS_FILE"
 
@@ -248,8 +273,9 @@ if [ -n "$t4_skip" ]; then
 else
   kvs_put() { # key value
     local etag
-    etag=$(aws cloudfront-keyvaluestore describe-key-value-store --region "$REGION" --kvs-arn "$KVS_ARN" --query ETag --output text 2>> "$RESULTS_FILE") || return 1
-    aws cloudfront-keyvaluestore put-key --region "$REGION" --kvs-arn "$KVS_ARN" --key "$1" --value "$2" --if-match "$etag" >> "$RESULTS_FILE" 2>&1
+    awscall "describe-key-value-store" cloudfront-keyvaluestore describe-key-value-store --region "$REGION" --kvs-arn "$KVS_ARN" --query ETag --output text || return 1
+    etag=$(cat "$AWS_OUT")
+    awscall "put-key $1" cloudfront-keyvaluestore put-key --region "$REGION" --kvs-arn "$KVS_ARN" --key "$1" --value "$2" --if-match "$etag"
   }
   fn_stamp() {
     [ -n "$FUNCTION_NAME" ] && aws cloudfront describe-function --region "$REGION" --name "$FUNCTION_NAME" --stage LIVE \
@@ -273,13 +299,13 @@ else
   }
   stamp_before=$(fn_stamp)
   if ! kvs_put t4-probe "$ORIGIN_A_HOST"; then
-    emit T4 INCONCLUSIVE "put-key failed (see results file; the AWS CLI needs SigV4A support/awscrt and permission cloudfront-keyvaluestore:PutKey)"
+    emit T4 INCONCLUSIVE "put-key failed ($(grep 'FAILED' "$RESULTS_FILE" | tail -1 | sed -n 's/.*error-code=\([A-Za-z0-9]*\).*/\1/p')): needs AWS CLI v2 with SigV4A and permission cloudfront-keyvaluestore:PutKey/DescribeKeyValueStore"
   elif ! poll_for origin-a 120; then
     emit T4 INCONCLUSIVE "baseline key t4-probe not visible after 120s (last status $R_CODE); cannot time an update"
   else
     create_s=$POLL_SECONDS
     if ! kvs_put t4-probe "$ORIGIN_B_HOST"; then
-      emit T4 INCONCLUSIVE "update put-key failed (see results file)"
+      emit T4 INCONCLUSIVE "update put-key failed (error code in the results file)"
     else
       if poll_for origin-b "$T4_MAX"; then
         stamp_after=$(fn_stamp)
@@ -298,8 +324,10 @@ else
     fi
   fi
   # clean up the probe key (best effort)
-  etag=$(aws cloudfront-keyvaluestore describe-key-value-store --region "$REGION" --kvs-arn "$KVS_ARN" --query ETag --output text 2>/dev/null) &&
-    aws cloudfront-keyvaluestore delete-key --region "$REGION" --kvs-arn "$KVS_ARN" --key t4-probe --if-match "$etag" >> "$RESULTS_FILE" 2>&1
+  if awscall "describe-key-value-store (cleanup)" cloudfront-keyvaluestore describe-key-value-store --region "$REGION" --kvs-arn "$KVS_ARN" --query ETag --output text; then
+    etag=$(cat "$AWS_OUT")
+    awscall "delete-key t4-probe" cloudfront-keyvaluestore delete-key --region "$REGION" --kvs-arn "$KVS_ARN" --key t4-probe --if-match "$etag" || true
+  fi
 fi
 
 # ------------------------------------------------------------------ T6: inheritance and failure cases
@@ -343,6 +371,7 @@ fail_case() {
 fail_case T6c bad-colon 500 "A stored value with a colon (example.net:8443) is rejected and the request fails closed"
 fail_case T6d bad-ip 500 "A stored IP address is rejected and the request fails closed"
 fail_case T6e bad-upper 500 "A stored upper-case domain fails the allow-list pattern and the request fails closed"
+fail_case T6h bad-suffix 500 "A stored value that is a valid domain but outside the allowed backend suffix is rejected (suffix allow-list)"
 fail_case T6f no-such-route 404 "An unknown route key returns 404"
 hyp T6g "A request without the routing attribute returns 404 and never reaches the default origin" "status 404, no origin body"
 if [ "$ROUTE_ATTRIBUTE" = "x-backend" ]; then
@@ -438,7 +467,9 @@ echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC"
   echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC"
   echo "end (utc): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >> "$RESULTS_FILE"
+redact_results "$RESULTS_FILE"
 echo
 echo "Full raw requests and responses: $RESULTS_FILE"
-echo "Send that file back as described in the README. Review it first: it contains your distribution domain and test origin hosts, nothing secret."
+echo "Send that file back as described in the README. Review it first: it contains your distribution domain and test origin hosts."
+echo "AWS error text is never written to it, and 12-digit numbers and arn:aws... strings are masked, but check anyway."
 [ "$N_FAIL" -eq 0 ]

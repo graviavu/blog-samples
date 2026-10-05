@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
-# Minimal stand-in for the aws CLI, used only by the verify.sh mock test. Records KeyValueStore writes
-# for mock-edge.mjs and answers describe-key-value-store / describe-function.
+# Minimal stand-in for the aws CLI, used only by the mock tests. Never talks to AWS.
+#  - records KeyValueStore writes for mock-edge.mjs and answers describe-key-value-store / describe-function
+#  - FAKE_AWS_FAIL=1: every call fails with an AccessDenied message that contains an account id and an ARN
+#    (built at run time so no such literal is stored in the repository)
+#  - teardown tests: describe-stacks answers with $FAKE_STACK_TAG, every call is appended to $FAKE_CALLS
+[ -n "${FAKE_CALLS:-}" ] && echo "aws $*" >> "$FAKE_CALLS"
+
+if [ "${FAKE_AWS_FAIL:-0}" = 1 ]; then
+  acct="1234"; acct="${acct}56789012"
+  echo "An error occurred (AccessDeniedException) when calling the PutKey operation: User: arn:aws:iam::${acct}:user/someone is not authorized to perform: cloudfront-keyvaluestore:PutKey on resource: arn:aws:cloudfront::${acct}:key-value-store/abc" >&2
+  exit 254
+fi
+
 case "$*" in
   *describe-key-value-store*) echo "etag-1" ;;
   *describe-function*) echo "2026-01-01T00:00:00Z" ;;
+  *describe-stacks*)
+    [ "${FAKE_NO_STACK:-0}" = 1 ] && exit 255
+    case "$*" in
+      *Tags*) printf '%s\n' "${FAKE_STACK_TAG:-}" ;;
+    esac ;;
   *put-key*|*delete-key*)
     key=""; value=""; op=put
     while [ $# -gt 0 ]; do
@@ -14,3 +30,4 @@ case "$*" in
     echo '{"ItemCount": 1}' ;;
   --version) echo "aws-cli/fake" ;;
 esac
+exit 0
