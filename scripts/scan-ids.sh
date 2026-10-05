@@ -16,7 +16,7 @@ check() { # description, extended regex
   hits=$(printf '%s\n' $files | xargs grep -n -I -E -- "$2" 2>/dev/null || true)
   if [ -n "$hits" ]; then
     echo "FOUND $1:"
-    echo "$hits" | sed 's/^/  /'
+    printf '  %s\n' "${hits//$'\n'/$'\n  '}"
     status=1
   fi
 }
