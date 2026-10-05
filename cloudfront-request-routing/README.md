@@ -22,8 +22,9 @@ Main stack, `template.yaml` (us-east-1):
 | KeyValueStore | The route table: route key to backend domain name. Seeded by `seed-kvs.sh`. |
 | CloudFront Function (runtime 2.0) | `function/route.js`: normalizes the key, checks the table, calls `updateRequestOrigin()`. Unknown key gives 404, bad value gives 500, never a fall-through to the default origin. |
 | Cache policy and origin request policy | The routing attribute (`x-backend` or `host`) is in the cache key. The origin request policy forwards one harmless test header and not `Host`. |
-| Three Lambda functions with function URLs | **Public test endpoints** (default origin, backend A, backend B). Each returns JSON that echoes the Host it saw, the path, three test headers and its own name. |
-| Test-only behaviors `/control/*` and `/probe/*` | Optional (`EnableTestBehaviors`, default true). `/control/*` has a cache key with only the path (test T1). `/probe/*` shows the raw Host seen by a function (test T8). |
+| Three Lambda functions with function URLs | Test origins (default origin, backend A, backend B). Each returns JSON that echoes the Host it saw, the path, three test headers and its own name. **Backends A and B are public** (auth `NONE`). The default origin requires IAM auth and is reachable only through this distribution (origin access control). |
+| Response headers policy | Basic security headers (HSTS, nosniff, frame deny, no-referrer) on routed responses. |
+| Test-only behaviors `/control/*` and `/probe/*` | Optional. The template default for `EnableTestBehaviors` is **false**; `deploy.sh` sets it to true because `verify.sh` needs them. `/control/*` has a cache key with only the path (test T1a). `/probe/*` shows the raw Host seen by a function (test T8). Without them T1a and T8 report INCONCLUSIVE. |
 | Log groups, one IAM role | Three log groups (3-day retention) and one role that can only write to them. No wildcard permissions. No S3 buckets. |
 
 Optional second stack, `template-lambda-edge.yaml`: the Lambda@Edge origin request variant from the post, with its own
@@ -45,18 +46,39 @@ certificate are optional parameters, are never committed, and cost nothing extra
 
 ### Differences from the code in the post
 
-`function/route.js` is the post's function with three small changes, all marked in the file:
+`function/route.js` is the post's function with four small changes, all marked in the file:
 (1) `ROUTE_ATTRIBUTE` chooses which request header is the key (`host` is the post's behavior);
 (2) a missing or empty attribute returns 404 instead of throwing;
-(3) an empty key after normalization returns 404. The template deploys exactly this file (`node scripts/check-function-sync.mjs`
+(3) an empty key after normalization returns 404;
+(4) a stored value must also end with `BACKEND_SUFFIX` (allow-list, see Safety notes). The template deploys exactly this file (`node scripts/check-function-sync.mjs`
 fails if they differ; `--write` regenerates the template block).
+
+## Before you deploy (mandatory)
+
+1. **Create an AWS Budgets alert** in the account you will use, before you create anything. Console: Billing and Cost Management,
+   Budgets, Create budget, Cost budget, set a small monthly amount you are comfortable losing, add an email alert at about
+   80 percent. Or with the CLI (the amount and address are examples; use your own):
+
+   ```bash
+   ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+   aws budgets create-budget --account-id "$ACCOUNT" \
+     --budget '{"BudgetName":"cfrouting-sample","BudgetLimit":{"Amount":"5","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}' \
+     --notifications-with-subscribers '[{"Notification":{"NotificationType":"ACTUAL","ComparisonOperator":"GREATER_THAN","Threshold":80,"ThresholdType":"PERCENTAGE"},"Subscribers":[{"SubscriptionType":"EMAIL","Address":"you@example.com"}]}]'
+   ```
+
+   A budget alert is a warning, not a cap: billing data arrives with a delay of hours, so it will not stop a flood of requests.
+2. **The stack should live for hours, not days.** Deploy, run `./verify.sh`, run `./teardown.sh` immediately, and check the leftover report.
+3. Anyone who learns the distribution domain can send it requests, and you pay for them (see the next section).
 
 ## Estimated cost
 
-Qualitatively: **pennies for a short test**. CloudFront Functions and KeyValueStore have free tiers, Lambda cost for a
-few hundred requests is negligible, and idle resources cost almost nothing. Things that are billed per use: CloudFront
-requests and data transfer, function invocations, KeyValueStore reads and API calls (the T4 test makes a handful),
-CloudWatch Logs. Delete the stack when you are done. **Check current pricing** before you start:
+**A short, idle test usually costs little, but a flood of requests costs money.** CloudFront bills requests and data transfer,
+CloudFront Function invocations and KeyValueStore reads are billed per use (beyond the free tiers), and so are Lambda invocations for
+requests that reach a test origin. **Requests that the function answers with a 404 or 500 at the edge are still billed** as CloudFront
+requests plus a function invocation. Anyone who finds the `*.cloudfront.net` name can generate that traffic, which is why the budget
+alert and a quick teardown are mandatory. There are also small standing items while the stack exists (CloudWatch Logs with 3-day
+retention, the KeyValueStore). The T4 test makes a handful of KeyValueStore API calls (non-read API calls are billed per request).
+No amounts are quoted here because they change. **Check current pricing** before you start:
 [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/pay-as-you-go/),
 [Lambda pricing](https://aws.amazon.com/lambda/pricing/). No numbers are quoted here because they change.
 
@@ -79,13 +101,16 @@ cd cloudfront-request-routing
 DEPLOY_EDGE=true ./deploy.sh     # optional: also deploy the Lambda@Edge stack (needed for T7)
 ```
 
-`deploy.sh` runs `aws cloudformation deploy`, then `seed-kvs.sh`, then writes `deploy.env` for `verify.sh`.
+`deploy.sh` runs `aws cloudformation deploy` (with `EnableTestBehaviors=true`, which `verify.sh` needs), then `seed-kvs.sh`, then writes
+`deploy.env` (shell-quoted with `printf %q`) for `verify.sh` and `teardown.sh`. It rejects alias names that are not lower-case letters,
+digits, dots and hyphens.
 It reads these optional environment variables: `STACK_NAME`, `NAME_PREFIX`, `ROUTE_ATTRIBUTE`, `CACHE_KEY_ATTRIBUTE`,
 `ALIAS_A`, `ALIAS_B`, `CERT_ARN`, `COST_TAG_KEY`, `ENABLE_TEST_BEHAVIORS`.
 
 ### Option B: console
 
-1. CloudFormation console, region us-east-1, **Create stack**, upload `template.yaml`. Keep the default parameters. Acknowledge
+1. CloudFormation console, region us-east-1, **Create stack**, upload `template.yaml`. Keep the default parameters, except set
+   `EnableTestBehaviors` to `true` if you will run `verify.sh` (the template default is false). Acknowledge
    that the stack creates an IAM role. Wait for `CREATE_COMPLETE`.
 2. Open the stack **Outputs**. Note `DistributionDomain`, `RouteStoreArn`, `OriginAHost`, `OriginBHost`.
 3. Seed the route table. Console: CloudFront, **Functions**, **KeyValueStores**, open `cfrouting-routes`, **Add key value pair**
@@ -98,6 +123,7 @@ It reads these optional environment variables: `STACK_NAME`, `NAME_PREFIX`, `ROU
    | `bad-colon` | `example.net:8443` |
    | `bad-ip` | `192.0.2.10` |
    | `bad-upper` | `Origin-A.example.net` |
+   | `bad-suffix` | `origin-a.example.net` |
 
    Or with the CLI: `STACK_NAME=<your stack> ./seed-kvs.sh`. The equivalent raw commands are:
 
@@ -135,6 +161,7 @@ It prints PASS, FAIL or INCONCLUSIVE for each test with its hypothesis and expec
 minutes for a fresh stack to answer). It writes every raw request, header and body to `verify-results-<time>.txt`.
 Safe to run: it only sends GET requests to your distribution and, in T4, writes and deletes one key (`t4-probe`) in your own
 route table. It never publishes or changes the function or the distribution. Typical run time is a few minutes.
+Viewer requests must use HTTPS (`https-only`); plain `http://` gets a 403.
 
 A first run also exercises the "no alias" path. For the Host-based run, redeploy with
 `ROUTE_ATTRIBUTE=host CACHE_KEY_ATTRIBUTE=host ALIAS_A=... ALIAS_B=... CERT_ARN=... ./deploy.sh` and run `./verify.sh` again.
@@ -144,8 +171,10 @@ To see the cache-key hazard on the default behavior itself, redeploy with `CACHE
 ## How to send back the results
 
 1. Open the newest `verify-results-*.txt` and check it. It contains your distribution domain, the test origin hosts and the
-   response headers (CloudFront request ids, edge location). It contains no credentials and no account id. Remove anything
-   you do not want to share.
+   response headers (CloudFront request ids, edge location). `verify.sh` never writes AWS CLI error text to it (only the error code,
+   for example `AccessDeniedException`), because those messages can contain account ids and IAM ARNs, and as a last step it masks
+   any 12-digit number and any `arn:aws...` string. It contains no credentials. Masking is a safety net, not a guarantee: look
+   through the file, and remove anything you do not want to share.
 2. Send the whole file (not only the summary lines) to the blog author. The raw headers and bodies are what let others check the claims.
 3. Do not post results with an alias domain you want to keep private.
 
@@ -155,8 +184,11 @@ To see the cache-key hazard on the default behavior itself, redeploy with `CACHE
 ./teardown.sh
 ```
 
-It deletes the optional Lambda@Edge stack, then the main stack, then checks for leftovers by name prefix (distributions, functions,
-KeyValueStores, policies, Lambda functions, log groups, stacks) and exits non-zero if any remain.
+It prints the stack names and asks you to type `yes` (use `./teardown.sh --yes` to skip the question). It refuses to delete a stack that
+does not carry the tag `sample=cloudfront-request-routing`, and values you set explicitly in the environment (`STACK_NAME`, `NAME_PREFIX`,
+`EDGE_STACK_NAME`, `EDGE_NAME_PREFIX`) win over `deploy.env`. It deletes the optional Lambda@Edge stack, then the main stack, then checks for
+leftovers by name prefix (distributions, functions, KeyValueStores, policies, origin access controls, Lambda functions, log groups, stacks)
+and exits non-zero if any remain.
 
 - **Deleting a CloudFront distribution takes many minutes** (CloudFormation disables it, waits for the change to deploy everywhere,
   then deletes it). Expect 10 to 30 minutes. The script waits.
@@ -170,9 +202,24 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
 
 ## Safety notes
 
-- **The three test endpoints are public** (Lambda function URLs with auth `NONE`). They echo only non-secret request data: the Host header,
-  path, query string, three test headers, the origin name and a request id. They have no access to anything else and are deleted by
-  teardown. Do not put real backends, credentials or secrets in this sample. Do not send private data through it.
+- **Backends A and B are public endpoints** (Lambda function URLs with auth `NONE`). Anyone who learns their URL can call them directly,
+  and you pay for those calls. They echo only non-secret request data: the Host header, path, query string, three test headers, the
+  origin name and a request id. They have no access to anything else and are deleted by teardown. Do not put real backends, credentials
+  or secrets in this sample. Do not send private data through it.
+- **What is locked down, and what is not.** The default origin uses function URL auth `AWS_IAM` with a CloudFront origin access control
+  (type `lambda`, SigV4 `always`); its resource policy lets only `cloudfront.amazonaws.com` invoke it, only on behalf of this
+  distribution (`SourceArn`). A and B are not locked because the origin switch is done by `updateRequestOrigin()` in the function, and I
+  could not confirm from the official documentation while writing this that the helper can carry origin access control settings for a
+  function URL origin (the documentation pages were not reachable from the build environment). I did not guess the field names. A
+  possible follow-up once confirmed: set `AuthType: AWS_IAM` on A and B, grant `cloudfront.amazonaws.com` invoke with the same
+  `SourceArn`, and pass the origin access control settings in the function. Until then the public exposure above applies. T6a will also show
+  whether a routed request inherits the default origin's signing settings without breaking (the template does not rely on it).
+  The template itself has only been checked with cfn-lint, not deployed.
+- **TLS.** Viewers must use HTTPS. With the default `*.cloudfront.net` certificate CloudFront does not let you set a minimum TLS version;
+  `MinimumProtocolVersion: TLSv1.2_2021` applies only when you bring an alias and a certificate. Backends are reached over TLS 1.2 only.
+- **Backend allow-list.** Besides the domain pattern, `route.js` accepts a stored value only if it ends with `BACKEND_SUFFIX` (default
+  `.lambda-url.us-east-1.on.aws`, which fits this sample's test origins). For your own backends set it to your own suffix. An empty string
+  turns the suffix check off.
 - **No open proxy.** The function treats the request value only as a key. It forwards to a domain name only if the key is in the
   KeyValueStore *and* the stored value matches a strict pattern (no port, no IP address, lower-case). Anything else is a 404 or 500 generated
   at the edge. Test T6 checks this. Restrict who can write to the store: whoever can edit it decides where traffic goes.
@@ -193,7 +240,7 @@ The post: [Route to many backends with CloudFront alone](https://blog.ar-logs.co
 | T1c | Which Host does the backend see when the function sets `hostHeader` and the attribute is in the cache key? Does the origin request policy reach the backend? | "Which Host the backend then sees ... is not yet confirmed by a test (T1)" | nothing |
 | T4 | Is a changed KeyValueStore value live at the edge without republishing, and how many seconds does it take (from one vantage point)? | "AWS says updates reach the edge in a few seconds (not yet confirmed by a test)" | AWS CLI v2 |
 | T6a, T6b | Does a routed request work with the settings inherited from the default custom origin, including its custom header? | "settings you omit are inherited from the origin the behavior would have used" | nothing |
-| T6c to T6g | Bad stored values (colon, IP address, upper case), unknown key and missing key: do they fail closed with no fall-through to the default origin? | "fail closed; never fall back to the default origin" | header routing |
+| T6c to T6h | Bad stored values (colon, IP address, upper case, valid domain outside the allowed suffix), unknown key and missing key: do they fail closed with no fall-through to the default origin? | "fail closed; never fall back to the default origin" | header routing |
 | T7 | Does the Lambda@Edge origin request sample retarget the origin, pass TLS validation, set the Host the backend sees, and avoid fall-through? | "Whether TLS validation and the Host value work as the sample assumes is not yet confirmed (T7)" | optional edge stack |
 | T8 | Can the Host value in the function event carry upper case, a port or a trailing dot (probe function)? | "Whether the real value can carry a port or a trailing dot is not yet confirmed (T8)" | `/probe/*` behavior |
 | T8b | With Host routing, do those variants still route? | the normalization in the sample | alias + certificate |
@@ -214,11 +261,13 @@ date, parameters, the machine-readable lines, and the conclusion for each claim.
 cd cloudfront-request-routing
 node --test test/*.test.mjs          # unit tests for the function code with a stub for the 'cloudfront' module
 node scripts/check-function-sync.mjs # templates embed exactly function/*.js
-test/verify-mock.sh                  # runs verify.sh against a local mock (tests the script, not CloudFront)
+test/verify-mock.sh                  # runs verify.sh against a local mock (tests the script, not CloudFront), including result redaction
+test/teardown-test.sh                # teardown.sh guards (tag check, confirmation, env precedence) with a fake aws CLI
 cfn-lint template.yaml template-lambda-edge.yaml   # pip install cfn-lint
 shellcheck *.sh test/*.sh ../scripts/*.sh
 ```
 
 The unit tests cover: unknown host (404), valid route, bad backend value with colon or IP (500), header normalization
-(case, port, trailing dot), crafted hosts that must not reach another key, and errors that must not fall through to the default origin.
+(case, port, trailing dot), crafted hosts that must not reach another key, the backend suffix allow-list, and errors that must not
+fall through to the default origin. The Lambda@Edge variant answers 500 if the origin is not a custom origin.
 CI (`.github/workflows/ci.yml` at the repository root) runs all of the above plus a scan for account ids and keys.
