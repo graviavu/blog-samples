@@ -44,11 +44,12 @@ Parameters:
     Description: Optional ARN of a us-east-1 ACM certificate covering both alias domains. Never commit it.
   EnableTestBehaviors:
     Type: String
-    Default: 'true'
+    Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      Adds two test-only path behaviors, /control/* (cache key without any attribute, test T1) and /probe/*
-      (shows the raw Host value, test T8). Set false for a pure single-behavior distribution.
+      Adds two test-only path behaviors, /control/* (cache key without any attribute, test T1a) and /probe/*
+      (shows the raw Host value, test T8). Default false: a single-behavior distribution. deploy.sh sets true
+      for the verify run. verify.sh reports INCONCLUSIVE for T1a and T8 when this is false.
   CostTagKey:
     Type: String
     Default: project
@@ -111,7 +112,10 @@ Resources:
       Tags:
         - {Key: sample, Value: cloudfront-request-routing}
 
-  # Each origin below is a PUBLIC test endpoint: function URL with auth NONE. It echoes only non-secret
+  # Origins A and B below are PUBLIC test endpoints: function URL with auth NONE. They stay public because the
+  # origin switch done by the function (updateRequestOrigin) was not confirmed to carry origin access control for a
+  # function URL (see README, Safety notes). Only the default origin is locked to this distribution.
+  # Each of A and B is a PUBLIC test endpoint: function URL with auth NONE. It echoes only non-secret
   # request data (Host, path, query, three test headers, its own name, request id). Deleted with the stack.
   OriginA:
     Type: AWS::Lambda::Function
@@ -271,21 +275,32 @@ Resources:
     Type: AWS::Lambda::Url
     Properties:
       TargetFunctionArn: !GetAtt OriginDefault.Arn
-      AuthType: NONE
+      AuthType: AWS_IAM   # the default origin is NOT public: only this distribution may invoke it (OAC)
+  # Only CloudFront, and only this distribution, may invoke the default origin.
   OriginDefaultPermissionUrl:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginDefault
       Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+      FunctionUrlAuthType: AWS_IAM
   OriginDefaultPermissionInvoke:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginDefault
       Action: lambda:InvokeFunction
-      Principal: '*'
-      InvokedViaFunctionUrl: true
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  DefaultOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${NamePrefix}-default-origin'
+        Description: Signs requests to the default Lambda function URL origin (SigV4)
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
 
   # ---------------------------------------------------------------- route table and function
   # The route table. Seed it with seed-kvs.sh (CloudFormation cannot write items without an S3 import file).
@@ -429,6 +444,26 @@ Resources:
           HeaderBehavior: whitelist
           Headers: [x-test-marker]
 
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${NamePrefix}-security-headers'
+        Comment: Basic security headers on every routed response
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+
   # ---------------------------------------------------------------- distribution
   Distribution:
     Type: AWS::CloudFront::Distribution
@@ -439,6 +474,8 @@ Resources:
         HttpVersion: http2
         PriceClass: PriceClass_100
         Aliases: !If [HasAliases, [!Ref AliasDomainA, !Ref AliasDomainB], !Ref 'AWS::NoValue']
+        # Note: MinimumProtocolVersion applies only with your own certificate (alias). The default
+        # *.cloudfront.net certificate cannot enforce TLS 1.2: CloudFront keeps its default minimum there.
         ViewerCertificate: !If
           - HasAliases
           - AcmCertificateArn: !Ref CertificateArn
@@ -450,6 +487,7 @@ Resources:
           # and its custom header for every backend it picks (test T6).
           - Id: default
             DomainName: !Select [2, !Split ['/', !GetAtt OriginDefaultUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt DefaultOriginAccessControl.Id
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               HTTPSPort: 443
@@ -461,10 +499,11 @@ Resources:
         # The single catch-all behavior. Every route is a KeyValueStore entry, not a behavior.
         DefaultCacheBehavior:
           TargetOriginId: default
-          ViewerProtocolPolicy: redirect-to-https
+          ViewerProtocolPolicy: https-only
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
           CachePolicyId: !Ref RouteCachePolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
           OriginRequestPolicyId: !Ref RouteOriginRequestPolicy
           FunctionAssociations:
             - EventType: viewer-request
@@ -474,17 +513,18 @@ Resources:
           - TestBehaviors
           - - PathPattern: /control/*
               TargetOriginId: default
-              ViewerProtocolPolicy: redirect-to-https
+              ViewerProtocolPolicy: https-only
               AllowedMethods: [GET, HEAD]
               CachedMethods: [GET, HEAD]
               CachePolicyId: !Ref ControlCachePolicy
+              ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
               OriginRequestPolicyId: !Ref RouteOriginRequestPolicy
               FunctionAssociations:
                 - EventType: viewer-request
                   FunctionARN: !GetAtt RouteFunction.FunctionARN
             - PathPattern: /probe/*
               TargetOriginId: default
-              ViewerProtocolPolicy: redirect-to-https
+              ViewerProtocolPolicy: https-only
               AllowedMethods: [GET, HEAD]
               CachedMethods: [GET, HEAD]
               CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # AWS managed CachingDisabled
