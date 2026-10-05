@@ -58,4 +58,22 @@ if grep -q "$acct" "$dir/redact.txt" || grep -q 'arn:aws:iam' "$dir/redact.txt" 
   echo "MOCK TEST FAIL [redact]: $(cat "$dir/redact.txt")"; fail=1
 fi
 
+# Interrupted run (TERM): the exit trap must leave a masked results file.
+node test/mock/mock-edge.mjs 18787 18788 "$FAKE_KVS_LOG" &
+mock_pid=$!
+sleep 1
+mkdir -p "$dir/bin"; cp test/mock/fake-aws "$dir/bin/aws"
+PATH="$dir/bin:$PATH" VERIFY_SCHEME=http RESULTS_FILE="$dir/results-term.txt" CF_DOMAIN=127.0.0.1:18787 \
+  KVS_ARN=fake ORIGIN_A_HOST=origin-a$SFX ORIGIN_B_HOST=origin-b$SFX READY_MAX=20 bash ./verify.sh > /dev/null 2>&1 &
+vpid=$!
+n=0; while [ ! -s "$dir/results-term.txt" ] && [ "$n" -lt 50 ]; do sleep 0.2; n=$((n + 1)); done
+echo "leaked $acct and arn:aws:iam::$acct:role/x" >> "$dir/results-term.txt"
+sleep 1
+kill -TERM "$vpid" 2>/dev/null
+wait "$vpid" 2>/dev/null
+kill "$mock_pid" 2>/dev/null; wait "$mock_pid" 2>/dev/null
+if grep -q "$acct" "$dir/results-term.txt" || grep -Eq 'arn:aws:iam' "$dir/results-term.txt"; then
+  echo "MOCK TEST FAIL [term]: interrupted run left an unmasked results file"; fail=1
+fi
+
 if [ "$fail" = 0 ]; then echo "verify-mock: ok"; else echo "verify-mock: FAILED"; exit 1; fi

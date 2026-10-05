@@ -52,7 +52,13 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 
 RUN="r$(date +%s)p$$"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/verify.XXXXXX")" || exit 2
-trap 'rm -rf "$TMP"' EXIT
+# On any exit (also Ctrl-C or kill) mask the results file before leaving, then remove the temp dir.
+finish() {
+  if [ -f "$RESULTS_FILE" ] && type redact_results >/dev/null 2>&1; then redact_results "$RESULTS_FILE"; fi
+  rm -rf "$TMP"
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
 REQ_N=0
 N_PASS=0; N_FAIL=0; N_INC=0
 MACHINE=""

@@ -56,7 +56,9 @@ fails if they differ; `--write` regenerates the template block).
 
 ## Before you deploy (mandatory)
 
-1. **Create an AWS Budgets alert** in the account you will use, before you create anything. Console: Billing and Cost Management,
+1. **Create an AWS Budgets alert** in the account you will use, before you create anything. `deploy.sh` enforces this: it runs
+   `aws budgets describe-budgets` and refuses to deploy if no budget exists or the check is not permitted (it fails closed and prints
+   only the error code). If you already have a budget somewhere the script cannot see, set `ACK_BUDGET=true` to confirm. Console: Billing and Cost Management,
    Budgets, Create budget, Cost budget, set a small monthly amount you are comfortable losing, add an email alert at about
    80 percent. Or with the CLI (the amount and address are examples; use your own):
 
@@ -99,7 +101,8 @@ No amounts are quoted here because they change. **Check current pricing** before
 ```bash
 cd cloudfront-request-routing
 ./deploy.sh                      # about 5 to 15 minutes; writes deploy.env (no secrets)
-DEPLOY_EDGE=true ./deploy.sh     # optional: also deploy the Lambda@Edge stack (needed for T7); forces PUBLIC test origins
+ORIGIN_AUTH=NONE DEPLOY_EDGE=true ./deploy.sh   # optional: also the Lambda@Edge stack (T7). Needs PUBLIC test origins, so it must
+                                                 # be asked for: ORIGIN_AUTH=NONE (or ACK_PUBLIC_ORIGINS=true, or --yes, or answer yes)
 ```
 
 `deploy.sh` runs `aws cloudformation deploy` (with `EnableTestBehaviors=true`, which `verify.sh` needs), then `seed-kvs.sh`, then writes
@@ -173,7 +176,7 @@ To see the cache-key hazard on the default behavior itself, redeploy with `CACHE
 
 1. Open the newest `verify-results-*.txt` and check it. It contains your distribution domain, the test origin hosts and the
    response headers (CloudFront request ids, edge location). `verify.sh` never writes AWS CLI error text to it (only the error code,
-   for example `AccessDeniedException`), because those messages can contain account ids and IAM ARNs, and as a last step it masks
+   for example `AccessDeniedException`), because those messages can contain account ids and IAM ARNs, and as a last step (also when you press Ctrl-C or the script is terminated, through an exit trap) it masks
    any 12-digit number and any `arn:aws...` string. It contains no credentials. Masking is a safety net, not a guarantee: look
    through the file, and remove anything you do not want to share.
 2. Send the whole file (not only the summary lines) to the blog author. The raw headers and bodies are what let others check the claims.
@@ -209,8 +212,11 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   requires for new function URLs). They echo only non-secret request data (Host header, path, query string, three test headers,
   origin name, request id) and are deleted by teardown. Do not put real backends, credentials or secrets in this sample.
   **Public mode:** with `OriginAuth=NONE` the three function URLs are public: anyone who learns a URL can call it directly and you pay for
-  those calls. `deploy.sh` forces this mode when you ask for the Lambda@Edge variant (`DEPLOY_EDGE=true`), because Lambda@Edge cannot sign
-  requests to an origin it retargets.
+  those calls. The Lambda@Edge variant (`DEPLOY_EDGE=true`) needs this mode, because Lambda@Edge cannot sign requests to an origin it
+  retargets, so `deploy.sh` refuses unless you set `ORIGIN_AUTH=NONE` (or `ACK_PUBLIC_ORIGINS=true`, `--yes`, or type `yes`).
+  If you want to limit abuse of public origins, you can set reserved concurrency on the three Lambda functions in the console. It is
+  optional and not in the template: a new account's total concurrency quota is small (it can be as low as 10), and reserved
+  concurrency is carved out of it, so a careless value can throttle or block your other functions.
 - **How the lock works, and what is and is not documented.** `route.js` passes
   `originAccessControlConfig: { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' }` on every
   `updateRequestOrigin()` call. The AWS documentation for `updateRequestOrigin()` lists these properties and lists Lambda function URLs as a
@@ -232,7 +238,12 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   `MinimumProtocolVersion: TLSv1.2_2021` applies only when you bring an alias and a certificate. Backends are reached over TLS 1.2 only.
 - **Backend allow-list.** Besides the domain pattern, `route.js` accepts a stored value only if it ends with `BACKEND_SUFFIX` (default
   `.lambda-url.us-east-1.on.aws`, which fits this sample's test origins). For your own backends set it to your own suffix. An empty string
-  turns the suffix check off.
+  turns the suffix check off. **The suffix limits the kind of host in a region, not its owner:** any account's Lambda function URL in
+  that region ends with the same suffix and would match, so it narrows what a bad store entry can point at but does not prove the
+  backend is yours. Use your own domain suffix for real backends.
+- **OAC signing applies to every route.** `route.js` adds the Lambda OAC block (`originType: 'lambda'`, SigV4 `always`) to every
+  `updateRequestOrigin()` call. Anyone who points this function at non-Lambda backends (plain HTTP origins, S3, other services) must
+  remove that block or set the right `originType` per route, otherwise requests will be signed for the wrong kind of origin.
 - **No open proxy.** The function treats the request value only as a key. It forwards to a domain name only if the key is in the
   KeyValueStore *and* the stored value matches a strict pattern (no port, no IP address, lower-case). Anything else is a 404 or 500 generated
   at the edge. Test T6 checks this. Restrict who can write to the store: whoever can edit it decides where traffic goes.
@@ -276,6 +287,7 @@ cd cloudfront-request-routing
 node --test test/*.test.mjs          # unit tests for the function code with a stub for the 'cloudfront' module
 node scripts/check-function-sync.mjs # templates embed exactly function/*.js
 test/verify-mock.sh                  # runs verify.sh against a local mock (tests the script, not CloudFront), including result redaction
+test/deploy-test.sh                  # deploy.sh guards (budget check, public-origins confirmation) with a fake aws CLI
 test/teardown-test.sh                # teardown.sh guards (tag check, confirmation, env precedence) with a fake aws CLI
 cfn-lint template.yaml template-lambda-edge.yaml   # pip install cfn-lint
 shellcheck *.sh test/*.sh ../scripts/*.sh

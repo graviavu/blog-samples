@@ -154,9 +154,10 @@ Resources:
         HttpVersion: http2
         PriceClass: PriceClass_100
         Origins:
-          # The default origin's function URL requires IAM auth (the main stack's OAC) and this distribution
-          # has no OAC, so a request that reaches it is refused. That is intended: unknown keys get a 404 from
-          # the Lambda@Edge function and nothing falls through.
+          # This stack only works with the main stack deployed with OriginAuth=NONE (deploy.sh does that for
+          # DEPLOY_EDGE=true), so the default origin is a public echo endpoint too. Nothing is supposed to reach it:
+          # unknown keys get a 404 from the Lambda@Edge function itself and the request never falls through. (If the
+          # main stack were IAM-protected this distribution has no OAC, so every origin call would be refused.)
           - Id: default
             DomainName: !Ref DefaultOriginHost
             CustomOriginConfig:

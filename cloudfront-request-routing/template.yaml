@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Sample: CloudFront as a reverse proxy for many backends without a distribution change per route.
-  One catch-all behavior, a CloudFront Function plus KeyValueStore route table, three tiny PUBLIC echo
-  test origins. Deploy in us-east-1. For testing only; delete with teardown.sh.
+  One catch-all behavior, a CloudFront Function plus KeyValueStore route table, three tiny echo
+  test origins (IAM-protected by default, public only with OriginAuth=NONE). Deploy in us-east-1. For testing only; delete with teardown.sh.
 
 Rules:
   RegionIsUsEast1:
@@ -75,7 +75,7 @@ Conditions:
   TestBehaviors: !Equals [!Ref EnableTestBehaviors, 'true']
 
 Resources:
-  # ---------------------------------------------------------------- test origins (PUBLIC echo endpoints)
+  # ---------------------------------------------------------------- test origins (echo endpoints; IAM-protected unless OriginAuth=NONE)
   OriginRole:
     Type: AWS::IAM::Role
     Properties:
@@ -574,10 +574,10 @@ Outputs:
     Description: ARN of the KeyValueStore (used by seed-kvs.sh and verify.sh)
     Value: !GetAtt RouteStore.Arn
   OriginAHost:
-    Description: Host of the public test origin A (a KeyValueStore value)
+    Description: Host of the test origin A (a KeyValueStore value)
     Value: !Select [2, !Split ['/', !GetAtt OriginAUrl.FunctionUrl]]
   OriginBHost:
-    Description: Host of the public test origin B (a KeyValueStore value)
+    Description: Host of the test origin B (a KeyValueStore value)
     Value: !Select [2, !Split ['/', !GetAtt OriginBUrl.FunctionUrl]]
   OriginAuth:
     Value: !Ref OriginAuth

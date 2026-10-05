@@ -3,6 +3,6 @@
   "private": true,
   "description": "Unit tests for the CloudFront request routing sample. No dependencies.",
   "scripts": {
-    "test": "node --test test/*.test.mjs && node scripts/check-function-sync.mjs && test/verify-mock.sh && test/teardown-test.sh"
+    "test": "node --test test/*.test.mjs && node scripts/check-function-sync.mjs && test/verify-mock.sh && test/deploy-test.sh && test/teardown-test.sh"
   }
 }
