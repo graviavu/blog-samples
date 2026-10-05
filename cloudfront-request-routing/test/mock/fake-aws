@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Minimal stand-in for the aws CLI, used only by the verify.sh mock test. Records KeyValueStore writes
+# for mock-edge.mjs and answers describe-key-value-store / describe-function.
+case "$*" in
+  *describe-key-value-store*) echo "etag-1" ;;
+  *describe-function*) echo "2026-01-01T00:00:00Z" ;;
+  *put-key*|*delete-key*)
+    key=""; value=""; op=put
+    while [ $# -gt 0 ]; do
+      case "$1" in --key) key=$2; shift ;; --value) value=$2; shift ;; delete-key) op=delete ;; esac
+      shift
+    done
+    echo "$(( $(date +%s) * 1000 )) $op $key $value" >> "$FAKE_KVS_LOG"
+    echo '{"ItemCount": 1}' ;;
+  --version) echo "aws-cli/fake" ;;
+esac
