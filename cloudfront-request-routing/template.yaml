@@ -50,6 +50,15 @@ Parameters:
       Adds two test-only path behaviors, /control/* (cache key without any attribute, test T1a) and /probe/*
       (shows the raw Host value, test T8). Default false: a single-behavior distribution. deploy.sh sets true
       for the verify run. verify.sh reports INCONCLUSIVE for T1a and T8 when this is false.
+  OriginAuth:
+    Type: String
+    Default: AWS_IAM
+    AllowedValues: [AWS_IAM, NONE]
+    Description: >-
+      AWS_IAM (default): the three test origins are IAM-protected and reachable only through this distribution
+      (origin access control). NONE: public test origins. The optional Lambda@Edge stack needs NONE, because
+      Lambda@Edge cannot sign requests to a retargeted origin; deploy.sh sets it for DEPLOY_EDGE=true. NONE is also the
+      documented fallback if the OAC plus function-based origin selection combination does not work (README).
   CostTagKey:
     Type: String
     Default: project
@@ -61,6 +70,7 @@ Conditions:
     - !Not [!Equals [!Ref AliasDomainA, '']]
     - !Not [!Equals [!Ref AliasDomainB, '']]
     - !Not [!Equals [!Ref CertificateArn, '']]
+  OriginsPublic: !Equals [!Ref OriginAuth, NONE]
   KeyNone: !Equals [!Ref CacheKeyAttribute, none]
   TestBehaviors: !Equals [!Ref EnableTestBehaviors, 'true']
 
@@ -112,17 +122,15 @@ Resources:
       Tags:
         - {Key: sample, Value: cloudfront-request-routing}
 
-  # Origins A and B below are PUBLIC test endpoints: function URL with auth NONE. They stay public because the
-  # origin switch done by the function (updateRequestOrigin) was not confirmed to carry origin access control for a
-  # function URL (see README, Safety notes). Only the default origin is locked to this distribution.
-  # Each of A and B is a PUBLIC test endpoint: function URL with auth NONE. It echoes only non-secret
+  # Each origin below is a test endpoint: a function URL with IAM auth (OriginAuth=AWS_IAM, default) reachable only
+  # through this distribution, or public with OriginAuth=NONE. It echoes only non-secret
   # request data (Host, path, query, three test headers, its own name, request id). Deleted with the stack.
   OriginA:
     Type: AWS::Lambda::Function
     DependsOn: LogsOriginA
     Properties:
       FunctionName: !Sub '${NamePrefix}-origin-a'
-      Description: PUBLIC test echo endpoint, origin A (sample cloudfront-request-routing)
+      Description: Test echo endpoint, origin A (sample cloudfront-request-routing)
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt OriginRole.Arn
@@ -159,28 +167,33 @@ Resources:
     Type: AWS::Lambda::Url
     Properties:
       TargetFunctionArn: !GetAtt OriginA.Arn
-      AuthType: NONE
+      AuthType: !Ref OriginAuth
+  # With AWS_IAM only CloudFront, and only this distribution, may invoke the function (two statements are required).
+  # With NONE (public test origin) anyone may.
   OriginAPermissionUrl:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginA
       Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
+      FunctionUrlAuthType: !Ref OriginAuth
   OriginAPermissionInvoke:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginA
       Action: lambda:InvokeFunction
-      Principal: '*'
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
       InvokedViaFunctionUrl: true
+
 
   OriginB:
     Type: AWS::Lambda::Function
     DependsOn: LogsOriginB
     Properties:
       FunctionName: !Sub '${NamePrefix}-origin-b'
-      Description: PUBLIC test echo endpoint, origin B (sample cloudfront-request-routing)
+      Description: Test echo endpoint, origin B (sample cloudfront-request-routing)
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt OriginRole.Arn
@@ -217,28 +230,33 @@ Resources:
     Type: AWS::Lambda::Url
     Properties:
       TargetFunctionArn: !GetAtt OriginB.Arn
-      AuthType: NONE
+      AuthType: !Ref OriginAuth
+  # With AWS_IAM only CloudFront, and only this distribution, may invoke the function (two statements are required).
+  # With NONE (public test origin) anyone may.
   OriginBPermissionUrl:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginB
       Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
+      FunctionUrlAuthType: !Ref OriginAuth
   OriginBPermissionInvoke:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginB
       Action: lambda:InvokeFunction
-      Principal: '*'
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
       InvokedViaFunctionUrl: true
+
 
   OriginDefault:
     Type: AWS::Lambda::Function
     DependsOn: LogsOriginDefault
     Properties:
       FunctionName: !Sub '${NamePrefix}-origin-default'
-      Description: PUBLIC test echo endpoint, default origin (sample cloudfront-request-routing)
+      Description: Test echo endpoint, default origin (sample cloudfront-request-routing)
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt OriginRole.Arn
@@ -275,23 +293,25 @@ Resources:
     Type: AWS::Lambda::Url
     Properties:
       TargetFunctionArn: !GetAtt OriginDefault.Arn
-      AuthType: AWS_IAM   # the default origin is NOT public: only this distribution may invoke it (OAC)
-  # Only CloudFront, and only this distribution, may invoke the default origin.
+      AuthType: !Ref OriginAuth
+  # With AWS_IAM only CloudFront, and only this distribution, may invoke the function (two statements are required).
+  # With NONE (public test origin) anyone may.
   OriginDefaultPermissionUrl:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginDefault
       Action: lambda:InvokeFunctionUrl
-      Principal: cloudfront.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
-      FunctionUrlAuthType: AWS_IAM
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
+      FunctionUrlAuthType: !Ref OriginAuth
   OriginDefaultPermissionInvoke:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OriginDefault
       Action: lambda:InvokeFunction
-      Principal: cloudfront.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+      Principal: !If [OriginsPublic, '*', cloudfront.amazonaws.com]
+      SourceArn: !If [OriginsPublic, !Ref 'AWS::NoValue', !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}']
+      InvokedViaFunctionUrl: true
   DefaultOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
@@ -362,7 +382,15 @@ Resources:
 
           cf.updateRequestOrigin({
             domainName: backend,
-            hostHeader: backend   // the backend sees its own name, not the viewer's host
+            hostHeader: backend,  // the backend sees its own name, not the viewer's host
+            // Sign the request to the backend (Lambda function URL with IAM auth) with CloudFront origin access
+            // control. Passed on every call so nothing depends on what the default origin is configured with.
+            originAccessControlConfig: {
+              enabled: true,
+              signingBehavior: 'always',
+              signingProtocol: 'sigv4',
+              originType: 'lambda'
+            }
           });
           return request;
         }
@@ -551,6 +579,8 @@ Outputs:
   OriginBHost:
     Description: Host of the public test origin B (a KeyValueStore value)
     Value: !Select [2, !Split ['/', !GetAtt OriginBUrl.FunctionUrl]]
+  OriginAuth:
+    Value: !Ref OriginAuth
   OriginDefaultHost:
     Description: Host of the default origin
     Value: !Select [2, !Split ['/', !GetAtt OriginDefaultUrl.FunctionUrl]]

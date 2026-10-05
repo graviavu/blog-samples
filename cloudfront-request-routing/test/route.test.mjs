@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadRoute, event } from './helpers.mjs';
 
+// Origin access control settings for a Lambda function URL origin, as documented for updateRequestOrigin().
+const OAC = { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' };
+
 const STORE = {
   'shop.example.com': 'origin-a.example.net',
   'blog.example.com': 'origin-b.example.net',
@@ -19,7 +22,7 @@ test('valid route: updates the origin and hostHeader and returns the request', a
   const ev = host('shop.example.com');
   const res = await handler(ev);
   assert.equal(res, ev.request);
-  assert.deepEqual(calls.updates, [{ domainName: 'origin-a.example.net', hostHeader: 'origin-a.example.net' }]);
+  assert.deepEqual(calls.updates, [{ domainName: 'origin-a.example.net', hostHeader: 'origin-a.example.net', originAccessControlConfig: OAC }]);
 });
 
 test('two hosts route to two different backends', async () => {
@@ -150,5 +153,20 @@ test('the request value is only ever used as a key, never as the origin', async 
   const { handler, calls } = loadRoute({ store: { 'route-a': 'origin-a.example.net' } });
   const res = await handler(event('x-backend', 'attacker.example.org'));
   assert.equal(res.statusCode, 404);
+  assert.equal(calls.updates.length, 0);
+});
+
+test('originAccessControlConfig is passed on every call and is always the same', async () => {
+  const { handler, calls } = loadRoute({ store: STORE, attribute: 'host' });
+  for (const h of ['shop.example.com', 'blog.example.com', 'SHOP.example.com:443']) await handler(host(h));
+  assert.equal(calls.updates.length, 3);
+  for (const u of calls.updates) assert.deepEqual(u.originAccessControlConfig, OAC);
+  // a distinct object each time is fine, but the values must never depend on the request or the store
+  assert.deepEqual(Object.keys(calls.updates[0]).sort(), ['domainName', 'hostHeader', 'originAccessControlConfig']);
+});
+
+test('the OAC config does not weaken the allow-list: rejected values never reach updateRequestOrigin', async () => {
+  const { handler, calls } = loadRoute({ store: STORE, attribute: 'host', suffix: '.corp.example.net' });
+  assert.equal((await handler(host('shop.example.com'))).statusCode, 500);
   assert.equal(calls.updates.length, 0);
 });

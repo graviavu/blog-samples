@@ -38,7 +38,15 @@ async function handler(event) {
 
   cf.updateRequestOrigin({
     domainName: backend,
-    hostHeader: backend   // the backend sees its own name, not the viewer's host
+    hostHeader: backend,  // the backend sees its own name, not the viewer's host
+    // Sign the request to the backend (Lambda function URL with IAM auth) with CloudFront origin access
+    // control. Passed on every call so nothing depends on what the default origin is configured with.
+    originAccessControlConfig: {
+      enabled: true,
+      signingBehavior: 'always',
+      signingProtocol: 'sigv4',
+      originType: 'lambda'
+    }
   });
   return request;
 }
