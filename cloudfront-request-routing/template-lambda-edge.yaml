@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL second stack for the cloudfront-request-routing sample: the Lambda@Edge origin request variant
+  from the post, with its own distribution. Needs the main stack's outputs. Deploy in us-east-1.
+  Lambda@Edge replicas are removed by AWS some time after the distribution is deleted, so stack deletion can
+  fail at the function and need a retry later (see README).
+
+Rules:
+  RegionIsUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: Lambda@Edge functions must be created in us-east-1.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cfrouting-edge
+    AllowedPattern: '^[a-z][a-z0-9-]{0,19}$'
+  OriginAHost:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]+\.[a-z]+$'
+    Description: Output OriginAHost of the main stack
+  OriginBHost:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]+\.[a-z]+$'
+    Description: Output OriginBHost of the main stack
+  DefaultOriginHost:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]+\.[a-z]+$'
+    Description: Output OriginDefaultHost of the main stack
+  ForwardViewerHost:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Forward the viewer Host header to the origin request event (the post's sample assumes this when it
+      routes on Host). Leave false for the x-backend tests on the *.cloudfront.net domain.
+  CostTagKey:
+    Type: String
+    Default: project
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9:_./-]{0,127}$'
+
+Conditions:
+  ForwardHost: !Equals [!Ref ForwardViewerHost, 'true']
+
+Resources:
+  # No policies: the function needs no AWS access. It has no CloudWatch logging on purpose
+  # (Lambda@Edge logs go to every region, which would need a wildcard).
+  EdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, edgelambda.amazonaws.com]
+            Action: sts:AssumeRole
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+
+  # SOURCE: function/edge-origin-request.js (edit the file, then run: node scripts/check-function-sync.mjs --write)
+  EdgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin-request'
+      Description: Lambda@Edge origin request routing sample (cloudfront-request-routing)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt EdgeRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+
+          // Placeholder route table. Lambda@Edge does not support environment variables,
+          // so the table lives in the code package or in a data source the function calls.
+          const ROUTES = {
+            'route-a': '${OriginAHost}',
+            'route-b': '${OriginBHost}',
+          };
+
+          // 'host' is the post's example; 'x-backend' works on the *.cloudfront.net domain.
+          // The attribute must be forwarded to the origin request event (cache key or origin request policy).
+          const ROUTE_ATTRIBUTE = 'x-backend';
+
+          exports.handler = (event, context, callback) => {
+            const request = event.Records[0].cf.request;
+            const attribute = request.headers[ROUTE_ATTRIBUTE];
+            const key = attribute && attribute[0] ? attribute[0].value.toLowerCase().split(':')[0].replace(/\.$/, '') : '';
+            const target = Object.prototype.hasOwnProperty.call(ROUTES, key) ? ROUTES[key] : undefined;
+
+            if (!target) {
+              // Unknown key: answer here, do not fall through to the default origin.
+              callback(null, { status: '404', statusDescription: 'Not Found' });
+              return;
+            }
+            if (request.origin.custom) {
+              request.origin.custom.domainName = target;
+              request.headers.host = [{ key: 'Host', value: target }];
+            }
+            callback(null, request);
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+
+  EdgeVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref EdgeFunction
+
+  EdgeCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-cache-key'
+        Comment: x-backend is part of the cache key and reaches the origin request event
+        MinTTL: 0
+        DefaultTTL: 60
+        MaxTTL: 300
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [x-backend]
+
+  EdgeOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${NamePrefix}-origin-request'
+        Comment: Forwards x-test-marker, and the viewer Host only when ForwardViewerHost is true
+        CookiesConfig: {CookieBehavior: none}
+        QueryStringsConfig: {QueryStringBehavior: none}
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: !If [ForwardHost, [x-test-marker, host], [x-test-marker]]
+
+  EdgeDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${NamePrefix} cloudfront-request-routing Lambda@Edge variant'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: default
+            DomainName: !Ref DefaultOriginHost
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 10
+            OriginCustomHeaders:
+              - HeaderName: x-origin-marker
+                HeaderValue: from-default-origin
+        DefaultCacheBehavior:
+          TargetOriginId: default
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !Ref EdgeCachePolicy
+          OriginRequestPolicyId: !Ref EdgeOriginRequestPolicy
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref EdgeVersion
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+
+Outputs:
+  EdgeDistributionDomain:
+    Description: Domain name of the Lambda@Edge variant (test T7)
+    Value: !GetAtt EdgeDistribution.DomainName
+  ForwardViewerHost:
+    Value: !Ref ForwardViewerHost

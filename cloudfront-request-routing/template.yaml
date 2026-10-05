@@ -1,0 +1,519 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Sample: CloudFront as a reverse proxy for many backends without a distribution change per route.
+  One catch-all behavior, a CloudFront Function plus KeyValueStore route table, three tiny PUBLIC echo
+  test origins. Deploy in us-east-1. For testing only; delete with teardown.sh.
+
+Rules:
+  RegionIsUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: Deploy this sample in us-east-1 (the optional Lambda@Edge stack requires it).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cfrouting
+    AllowedPattern: '^[a-z][a-z0-9-]{0,19}$'
+    Description: Prefix for resource names. Use a different one for a second copy of the stack.
+  RouteAttribute:
+    Type: String
+    Default: x-backend
+    AllowedValues: [x-backend, host]
+    Description: >-
+      Request attribute the function uses as the route key. x-backend is a request header and works on the
+      *.cloudfront.net domain. host is the post's worked example and needs two alias domains (see README).
+  CacheKeyAttribute:
+    Type: String
+    Default: x-backend
+    AllowedValues: [x-backend, host, none]
+    Description: >-
+      Header added to the cache key of the default behavior. Use the same attribute as RouteAttribute.
+      none reproduces the shared-cache-entry hazard on the default behavior (test T1).
+  AliasDomainA:
+    Type: String
+    Default: ''
+    Description: Optional alias domain name for route A (Host-based tests). Needs AliasDomainB and CertificateArn.
+  AliasDomainB:
+    Type: String
+    Default: ''
+    Description: Optional alias domain name for route B (Host-based tests).
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ARN of a us-east-1 ACM certificate covering both alias domains. Never commit it.
+  EnableTestBehaviors:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Adds two test-only path behaviors, /control/* (cache key without any attribute, test T1) and /probe/*
+      (shows the raw Host value, test T8). Set false for a pure single-behavior distribution.
+  CostTagKey:
+    Type: String
+    Default: project
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9:_./-]{0,127}$'
+    Description: Tag key for your cost allocation tag. The value is always cloudfront-request-routing.
+
+Conditions:
+  HasAliases: !And
+    - !Not [!Equals [!Ref AliasDomainA, '']]
+    - !Not [!Equals [!Ref AliasDomainB, '']]
+    - !Not [!Equals [!Ref CertificateArn, '']]
+  KeyNone: !Equals [!Ref CacheKeyAttribute, none]
+  TestBehaviors: !Equals [!Ref EnableTestBehaviors, 'true']
+
+Resources:
+  # ---------------------------------------------------------------- test origins (PUBLIC echo endpoints)
+  OriginRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !GetAtt LogsOriginA.Arn
+                  - !GetAtt LogsOriginB.Arn
+                  - !GetAtt LogsOriginDefault.Arn
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+
+  LogsOriginA:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-origin-a'
+      RetentionInDays: 3
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+  LogsOriginB:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-origin-b'
+      RetentionInDays: 3
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+  LogsOriginDefault:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-origin-default'
+      RetentionInDays: 3
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+
+  # Each origin below is a PUBLIC test endpoint: function URL with auth NONE. It echoes only non-secret
+  # request data (Host, path, query, three test headers, its own name, request id). Deleted with the stack.
+  OriginA:
+    Type: AWS::Lambda::Function
+    DependsOn: LogsOriginA
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin-a'
+      Description: PUBLIC test echo endpoint, origin A (sample cloudfront-request-routing)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OriginRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Environment:
+        Variables:
+          ORIGIN_NAME: origin-a
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            const h = event.headers || {};
+            const body = {
+              origin: process.env.ORIGIN_NAME,
+              host: h.host,
+              path: event.rawPath,
+              query: event.rawQueryString,
+              xBackend: h['x-backend'],
+              xTestMarker: h['x-test-marker'],
+              xOriginMarker: h['x-origin-marker'],
+              requestId: context.awsRequestId,
+              nowEpoch: Math.floor(Date.now() / 1000)
+            };
+            return {
+              statusCode: 200,
+              headers: { 'content-type': 'application/json', 'x-origin-name': process.env.ORIGIN_NAME },
+              body: JSON.stringify(body)
+            };
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+  OriginAUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OriginA.Arn
+      AuthType: NONE
+  OriginAPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginA
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+  OriginAPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginA
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  OriginB:
+    Type: AWS::Lambda::Function
+    DependsOn: LogsOriginB
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin-b'
+      Description: PUBLIC test echo endpoint, origin B (sample cloudfront-request-routing)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OriginRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Environment:
+        Variables:
+          ORIGIN_NAME: origin-b
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            const h = event.headers || {};
+            const body = {
+              origin: process.env.ORIGIN_NAME,
+              host: h.host,
+              path: event.rawPath,
+              query: event.rawQueryString,
+              xBackend: h['x-backend'],
+              xTestMarker: h['x-test-marker'],
+              xOriginMarker: h['x-origin-marker'],
+              requestId: context.awsRequestId,
+              nowEpoch: Math.floor(Date.now() / 1000)
+            };
+            return {
+              statusCode: 200,
+              headers: { 'content-type': 'application/json', 'x-origin-name': process.env.ORIGIN_NAME },
+              body: JSON.stringify(body)
+            };
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+  OriginBUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OriginB.Arn
+      AuthType: NONE
+  OriginBPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginB
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+  OriginBPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginB
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  OriginDefault:
+    Type: AWS::Lambda::Function
+    DependsOn: LogsOriginDefault
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin-default'
+      Description: PUBLIC test echo endpoint, default origin (sample cloudfront-request-routing)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OriginRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Environment:
+        Variables:
+          ORIGIN_NAME: default
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            const h = event.headers || {};
+            const body = {
+              origin: process.env.ORIGIN_NAME,
+              host: h.host,
+              path: event.rawPath,
+              query: event.rawQueryString,
+              xBackend: h['x-backend'],
+              xTestMarker: h['x-test-marker'],
+              xOriginMarker: h['x-origin-marker'],
+              requestId: context.awsRequestId,
+              nowEpoch: Math.floor(Date.now() / 1000)
+            };
+            return {
+              statusCode: 200,
+              headers: { 'content-type': 'application/json', 'x-origin-name': process.env.ORIGIN_NAME },
+              body: JSON.stringify(body)
+            };
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+  OriginDefaultUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OriginDefault.Arn
+      AuthType: NONE
+  OriginDefaultPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginDefault
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+  OriginDefaultPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginDefault
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  # ---------------------------------------------------------------- route table and function
+  # The route table. Seed it with seed-kvs.sh (CloudFormation cannot write items without an S3 import file).
+  RouteStore:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: !Sub '${NamePrefix}-routes'
+      Comment: Route table for the cloudfront-request-routing sample (key = route key, value = backend domain name)
+
+  # SOURCE: function/route.js (edit the file, then run: node scripts/check-function-sync.mjs --write)
+  RouteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${NamePrefix}-route'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Route by KeyValueStore lookup and updateRequestOrigin (sample)
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt RouteStore.Arn
+      FunctionCode: !Sub |
+        import cf from 'cloudfront';
+
+        const kvsHandle = cf.kvs();
+
+        // Which request attribute names the route. 'host' is the post's worked example;
+        // 'x-backend' (a request header) lets the sample work on the *.cloudfront.net domain.
+        const ROUTE_ATTRIBUTE = '${RouteAttribute}';
+
+        // updateRequestOrigin() rejects a domain name with a colon or an IP address.
+        const DOMAIN = /^(?!\d+(\.\d+){3}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+        function reply(statusCode, statusDescription) {
+          return { statusCode: statusCode, statusDescription: statusDescription };
+        }
+
+        async function handler(event) {
+          const request = event.request;
+          const attribute = request.headers[ROUTE_ATTRIBUTE];
+          if (!attribute || !attribute.value) {
+            return reply(404, 'Not Found');
+          }
+          // Normalize the route key: lowercase, no port, no trailing dot.
+          const host = attribute.value.toLowerCase().split(':')[0].replace(/\.$/, '');
+
+          // The key comes from the request; the value is a backend domain name from the store.
+          if (!host || !(await kvsHandle.exists(host))) {
+            return reply(404, 'Not Found');
+          }
+          const backend = await kvsHandle.get(host);
+          if (!DOMAIN.test(backend)) {
+            return reply(500, 'Bad route');   // fail closed; never fall back to the default origin
+          }
+
+          cf.updateRequestOrigin({
+            domainName: backend,
+            hostHeader: backend   // the backend sees its own name, not the viewer's host
+          });
+          return request;
+        }
+
+  # SOURCE: function/probe.js (test only; no key value store)
+  ProbeFunction:
+    Type: AWS::CloudFront::Function
+    Condition: TestBehaviors
+    Properties:
+      Name: !Sub '${NamePrefix}-probe'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Test only. Returns the raw Host value seen by a function (test T8).
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        // Test-only function: answers with the Host value exactly as the function event shows it.
+        // It never routes anywhere and has no key value store.
+        function handler(event) {
+          var host = event.request.headers.host;
+          return {
+            statusCode: 200,
+            statusDescription: 'OK',
+            headers: {
+              'cache-control': { value: 'no-store' },
+              'x-seen-host': { value: host ? host.value : '(none)' },
+              'x-seen-multivalue': { value: host && host.multiValue ? JSON.stringify(host.multiValue) : '(none)' }
+            }
+          };
+        }
+
+  # ---------------------------------------------------------------- policies
+  RouteCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-cache-key'
+        Comment: Default behavior. The routing attribute is part of the cache key (unless CacheKeyAttribute is none).
+        MinTTL: 0
+        DefaultTTL: 60
+        MaxTTL: 300
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig:
+            HeaderBehavior: !If [KeyNone, none, whitelist]
+            Headers: !If [KeyNone, !Ref 'AWS::NoValue', [!Ref CacheKeyAttribute]]
+
+  # Control for test T1: same TTLs, nothing but the path in the cache key.
+  ControlCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: TestBehaviors
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-cache-key-control'
+        Comment: Test only. Cache key is the path alone, so two routes on one path share an entry.
+        MinTTL: 0
+        DefaultTTL: 60
+        MaxTTL: 300
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  # Headers in the cache key are forwarded as well. This adds only x-test-marker, a harmless test header.
+  # Host is not forwarded, which is what a Lambda function URL origin needs.
+  RouteOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${NamePrefix}-origin-request'
+        Comment: Forwards the x-test-marker test header, no cookies, no query strings
+        CookiesConfig: {CookieBehavior: none}
+        QueryStringsConfig: {QueryStringBehavior: none}
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [x-test-marker]
+
+  # ---------------------------------------------------------------- distribution
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${NamePrefix} cloudfront-request-routing sample'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Aliases: !If [HasAliases, [!Ref AliasDomainA, !Ref AliasDomainB], !Ref 'AWS::NoValue']
+        ViewerCertificate: !If
+          - HasAliases
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          # The default origin: a custom origin. The function inherits its protocol, port and TLS settings
+          # and its custom header for every backend it picks (test T6).
+          - Id: default
+            DomainName: !Select [2, !Split ['/', !GetAtt OriginDefaultUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 10
+            OriginCustomHeaders:
+              - HeaderName: x-origin-marker
+                HeaderValue: from-default-origin
+        # The single catch-all behavior. Every route is a KeyValueStore entry, not a behavior.
+        DefaultCacheBehavior:
+          TargetOriginId: default
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !Ref RouteCachePolicy
+          OriginRequestPolicyId: !Ref RouteOriginRequestPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RouteFunction.FunctionARN
+        # Test-only behaviors (EnableTestBehaviors). Remove them for a pure single-behavior distribution.
+        CacheBehaviors: !If
+          - TestBehaviors
+          - - PathPattern: /control/*
+              TargetOriginId: default
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: !Ref ControlCachePolicy
+              OriginRequestPolicyId: !Ref RouteOriginRequestPolicy
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt RouteFunction.FunctionARN
+            - PathPattern: /probe/*
+              TargetOriginId: default
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # AWS managed CachingDisabled
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt ProbeFunction.FunctionARN
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - {Key: sample, Value: cloudfront-request-routing}
+        - {Key: !Ref CostTagKey, Value: cloudfront-request-routing}
+
+Outputs:
+  DistributionDomain:
+    Description: Domain name to test (no alias needed)
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution
+  RouteStoreArn:
+    Description: ARN of the KeyValueStore (used by seed-kvs.sh and verify.sh)
+    Value: !GetAtt RouteStore.Arn
+  OriginAHost:
+    Description: Host of the public test origin A (a KeyValueStore value)
+    Value: !Select [2, !Split ['/', !GetAtt OriginAUrl.FunctionUrl]]
+  OriginBHost:
+    Description: Host of the public test origin B (a KeyValueStore value)
+    Value: !Select [2, !Split ['/', !GetAtt OriginBUrl.FunctionUrl]]
+  OriginDefaultHost:
+    Description: Host of the default origin
+    Value: !Select [2, !Split ['/', !GetAtt OriginDefaultUrl.FunctionUrl]]
+  RouteAttribute:
+    Value: !Ref RouteAttribute
+  CacheKeyAttribute:
+    Value: !Ref CacheKeyAttribute
+  AliasDomainA:
+    Value: !Ref AliasDomainA
+  AliasDomainB:
+    Value: !Ref AliasDomainB
