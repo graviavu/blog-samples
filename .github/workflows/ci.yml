@@ -1,0 +1,78 @@
+name: ci
+
+# Only pull_request and push to main. No secrets are used. Never pull_request_target.
+# This file runs the checks of the cloudfront-time-window-caching sample. When another sample is added, add its steps
+# (or move to a matrix over the sample folders).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # cfn-lint is installed into a throwaway venv; PyPI wheels are not hash-pinned.
+  CFN_LINT_VERSION: "1.57.1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: lint, unit tests, shellcheck, secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Secret and account id scan
+        run: scripts/scan-ids.sh
+
+      - name: Unit tests (node, no dependencies)
+        working-directory: cloudfront-time-window-caching
+        run: |
+          node --version
+          node --test test/*.test.mjs
+
+      - name: Templates contain the function code
+        working-directory: cloudfront-time-window-caching
+        run: node scripts/check-function-sync.mjs
+
+      - name: Install cfn-lint (pinned version, throwaway venv)
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/cfn-venv"
+          "${RUNNER_TEMP}/cfn-venv/bin/pip" install --quiet "cfn-lint==${CFN_LINT_VERSION}"
+
+      - name: cfn-lint
+        working-directory: cloudfront-time-window-caching
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint template.yaml template-lambda-edge.yaml"
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x scripts/*.sh cloudfront-time-window-caching/*.sh cloudfront-time-window-caching/test/*.sh cloudfront-time-window-caching/test/mock/fake-aws
+
+      - name: verify.sh against the local mock with a faster clock (tests the script, not CloudFront; about 3 minutes)
+        working-directory: cloudfront-time-window-caching
+        run: test/verify-mock.sh
+
+      - name: deploy.sh guards (budget check, validation, two-phase update) against a fake aws CLI
+        working-directory: cloudfront-time-window-caching
+        run: test/deploy-test.sh
+
+      - name: teardown.sh guards against a fake aws CLI
+        working-directory: cloudfront-time-window-caching
+        run: test/teardown-test.sh
+
+      - name: seed-kvs.sh validation against a fake aws CLI
+        working-directory: cloudfront-time-window-caching
+        run: test/seed-test.sh
