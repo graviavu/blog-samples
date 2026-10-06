@@ -4,6 +4,10 @@ import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+export function variants() {
+  return JSON.parse(readFileSync(join(root, 'function', 'variants.json'), 'utf8'));
+}
+
 export function readSource(name) {
   return readFileSync(join(root, 'function', name), 'utf8');
 }
@@ -11,10 +15,15 @@ export function readSource(name) {
 // Loads function/route.js with a stub for the 'cloudfront' module.
 // route.js is an ES module for the CloudFront runtime; here we swap the import line for the stub
 // and evaluate the rest unchanged.
-export function loadRoute({ store = {}, attribute, suffix = '.example.net', updateThrows = false, getThrows = false } = {}) {
+export function loadRoute({ store = {}, attribute, suffix = '.example.net', variant, updateThrows = false, getThrows = false } = {}) {
   let src = readSource('route.js');
   if (attribute) {
     src = src.replace(/const ROUTE_ATTRIBUTE = '[^']*';/, `const ROUTE_ATTRIBUTE = '${attribute}';`);
+  }
+  if (variant) {
+    const v = variants()[variant];
+    src = src.replace(/const SEND_HOST_HEADER = (true|false);/, `const SEND_HOST_HEADER = ${v.sendHostHeader};`)
+      .replace(/const OAC_MODE = '[^']*';/, `const OAC_MODE = '${v.oacMode}';`);
   }
   // Tests use .example.net by default; pass suffix: null to keep the constant that ships in route.js.
   if (suffix !== null) {

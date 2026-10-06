@@ -50,6 +50,14 @@ Parameters:
       Adds two test-only path behaviors, /control/* (cache key without any attribute, test T1a) and /probe/*
       (shows the raw Host value, test T8). Default false: a single-behavior distribution. deploy.sh sets true
       for the verify run. verify.sh reports INCONCLUSIVE for T1a and T8 when this is false.
+  RouteVariant:
+    Type: String
+    Default: V1
+    AllowedValues: [V0, V1, V2, V3, V4, V5, V6]
+    Description: >-
+      Test variant of how the function calls updateRequestOrigin() (see function/variants.json and variants.sh).
+      V1 is the default and the only one to keep. Other values exist to find which field CloudFront rejects.
+      V0, V3 and V6 only work with OriginAuth=NONE (public origins); V1, V2, V4 and V5 need AWS_IAM.
   OriginAuth:
     Type: String
     Default: AWS_IAM
@@ -64,6 +72,16 @@ Parameters:
     Default: project
     AllowedPattern: '^[A-Za-z][A-Za-z0-9:_./-]{0,127}$'
     Description: Tag key for your cost allocation tag. The value is always cloudfront-request-routing.
+
+Mappings:
+  RouteVariants:
+    V0: {SendHostHeader: 'true', OacMode: 'none'}
+    V1: {SendHostHeader: 'true', OacMode: 'region'}
+    V2: {SendHostHeader: 'false', OacMode: 'region'}
+    V3: {SendHostHeader: 'false', OacMode: 'none'}
+    V4: {SendHostHeader: 'false', OacMode: 'noregion'}
+    V5: {SendHostHeader: 'false', OacMode: 'none'}
+    V6: {SendHostHeader: 'true', OacMode: 'off'}
 
 Conditions:
   HasAliases: !And
@@ -341,59 +359,94 @@ Resources:
         Runtime: cloudfront-js-2.0
         KeyValueStoreAssociations:
           - KeyValueStoreARN: !GetAtt RouteStore.Arn
-      FunctionCode: !Sub |
-        import cf from 'cloudfront';
+      FunctionCode:
+        Fn::Sub:
+          - |
+            import cf from 'cloudfront';
 
-        const kvsHandle = cf.kvs();
+            const kvsHandle = cf.kvs();
 
-        // Which request attribute names the route. 'host' is the post's worked example;
-        // 'x-backend' (a request header) lets the sample work on the *.cloudfront.net domain.
-        const ROUTE_ATTRIBUTE = '${RouteAttribute}';
+            // Which request attribute names the route. 'host' is the post's worked example;
+            // 'x-backend' (a request header) lets the sample work on the *.cloudfront.net domain.
+            const ROUTE_ATTRIBUTE = '${RouteAttribute}';
 
-        // Allow-list for backend domains: a stored value must also end with this suffix, so a mistaken or
-        // malicious write to the store cannot send traffic to an arbitrary host. The default fits the sample's
-        // test origins (Lambda function URLs). Set it to your own domain suffix. '' disables the check.
-        const BACKEND_SUFFIX = '.lambda-url.us-east-1.on.aws';
+            // Allow-list for backend domains: a stored value must also end with this suffix, so a mistaken or
+            // malicious write to the store cannot send traffic to an arbitrary host. The default fits the sample's
+            // test origins (Lambda function URLs). Set it to your own domain suffix. '' disables the check.
+            const BACKEND_SUFFIX = '.lambda-url.us-east-1.on.aws';
 
-        // updateRequestOrigin() rejects a domain name with a colon or an IP address.
-        const DOMAIN = /^(?!\d+(\.\d+){3}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+            // Region of the backend function URLs. It must match BACKEND_SUFFIX. The OAC config needs it
+            // (AWS's own select-origin sample passes `region` in originAccessControlConfig).
+            const OAC_REGION = 'us-east-1';
 
-        function reply(statusCode, statusDescription) {
-          return { statusCode: statusCode, statusDescription: statusDescription };
-        }
+            // Test variants. The template substitutes these two values from its RouteVariant parameter
+            // (see function/variants.json and variants.sh). The values in this file are the default variant V1.
+            //   SEND_HOST_HEADER: pass hostHeader to updateRequestOrigin()
+            //   OAC_MODE: 'region'   originAccessControlConfig with region (default)
+            //             'noregion' originAccessControlConfig without region
+            //             'off'      originAccessControlConfig { enabled: false }
+            //             'none'     no originAccessControlConfig (the origin's own OAC settings are inherited)
+            const SEND_HOST_HEADER = ${SendHostHeader};
+            const OAC_MODE = '${OacMode}';
 
-        async function handler(event) {
-          const request = event.request;
-          const attribute = request.headers[ROUTE_ATTRIBUTE];
-          if (!attribute || !attribute.value) {
-            return reply(404, 'Not Found');
-          }
-          // Normalize the route key: lowercase, no port, no trailing dot.
-          const host = attribute.value.toLowerCase().split(':')[0].replace(/\.$/, '');
-
-          // The key comes from the request; the value is a backend domain name from the store.
-          if (!host || !(await kvsHandle.exists(host))) {
-            return reply(404, 'Not Found');
-          }
-          const backend = await kvsHandle.get(host);
-          if (!DOMAIN.test(backend) || !backend.endsWith(BACKEND_SUFFIX)) {
-            return reply(500, 'Bad route');   // fail closed; never fall back to the default origin
-          }
-
-          cf.updateRequestOrigin({
-            domainName: backend,
-            hostHeader: backend,  // the backend sees its own name, not the viewer's host
-            // Sign the request to the backend (Lambda function URL with IAM auth) with CloudFront origin access
-            // control. Passed on every call so nothing depends on what the default origin is configured with.
-            originAccessControlConfig: {
-              enabled: true,
-              signingBehavior: 'always',
-              signingProtocol: 'sigv4',
-              originType: 'lambda'
+            function oacConfig() {
+              if (OAC_MODE === 'none') {
+                return null;
+              }
+              if (OAC_MODE === 'off') {
+                return { enabled: false };
+              }
+              // Sign the request to the backend (Lambda function URL with IAM auth) with CloudFront origin access control.
+              const config = {
+                enabled: true,
+                signingBehavior: 'always',
+                signingProtocol: 'sigv4',
+                originType: 'lambda'
+              };
+              if (OAC_MODE === 'region') {
+                config.region = OAC_REGION;
+              }
+              return config;
             }
-          });
-          return request;
-        }
+
+            // updateRequestOrigin() rejects a domain name with a colon or an IP address.
+            const DOMAIN = /^(?!\d+(\.\d+){3}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+            function reply(statusCode, statusDescription) {
+              return { statusCode: statusCode, statusDescription: statusDescription };
+            }
+
+            async function handler(event) {
+              const request = event.request;
+              const attribute = request.headers[ROUTE_ATTRIBUTE];
+              if (!attribute || !attribute.value) {
+                return reply(404, 'Not Found');
+              }
+              // Normalize the route key: lowercase, no port, no trailing dot.
+              const host = attribute.value.toLowerCase().split(':')[0].replace(/\.$/, '');
+
+              // The key comes from the request; the value is a backend domain name from the store.
+              if (!host || !(await kvsHandle.exists(host))) {
+                return reply(404, 'Not Found');
+              }
+              const backend = await kvsHandle.get(host);
+              if (!DOMAIN.test(backend) || !backend.endsWith(BACKEND_SUFFIX)) {
+                return reply(500, 'Bad route');   // fail closed; never fall back to the default origin
+              }
+
+              const origin = { domainName: backend };
+              if (SEND_HOST_HEADER) {
+                origin.hostHeader = backend;   // the backend sees its own name, not the viewer's host
+              }
+              const oac = oacConfig();
+              if (oac) {
+                origin.originAccessControlConfig = oac;
+              }
+              cf.updateRequestOrigin(origin);
+              return request;
+            }
+          - SendHostHeader: !FindInMap [RouteVariants, !Ref RouteVariant, SendHostHeader]
+            OacMode: !FindInMap [RouteVariants, !Ref RouteVariant, OacMode]
 
   # SOURCE: function/probe.js (test only; no key value store)
   ProbeFunction:

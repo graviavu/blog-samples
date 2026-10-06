@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadRoute, event } from './helpers.mjs';
+import { loadRoute, event, variants } from './helpers.mjs';
 
 // Origin access control settings for a Lambda function URL origin, as documented for updateRequestOrigin().
-const OAC = { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' };
+const OAC = { enabled: true, region: 'us-east-1', signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' };
 
 const STORE = {
   'shop.example.com': 'origin-a.example.net',
@@ -170,3 +170,34 @@ test('the OAC config does not weaken the allow-list: rejected values never reach
   assert.equal((await handler(host('shop.example.com'))).statusCode, 500);
   assert.equal(calls.updates.length, 0);
 });
+
+test('default variant (V1) is what route.js ships: OAC with region, hostHeader set', async () => {
+  const { handler, calls } = loadRoute({ store: STORE, attribute: 'host' });
+  await handler(host('shop.example.com'));
+  assert.deepEqual(calls.updates[0].originAccessControlConfig, OAC);
+  assert.equal(calls.updates[0].originAccessControlConfig.region, 'us-east-1');
+  assert.equal(variants().V1.oacMode, 'region');
+  assert.equal(variants().V1.sendHostHeader, true);
+});
+
+for (const [name, v] of Object.entries(variants())) {
+  test(`variant ${name}: arguments to updateRequestOrigin match function/variants.json`, async () => {
+    const { handler, calls } = loadRoute({ store: STORE, attribute: 'host', variant: name });
+    const res = await handler(host('shop.example.com'));
+    assert.equal(res.method, 'GET');
+    const arg = calls.updates[0];
+    assert.equal(arg.domainName, 'origin-a.example.net');
+    assert.equal('hostHeader' in arg, v.sendHostHeader);
+    if (v.sendHostHeader) assert.equal(arg.hostHeader, 'origin-a.example.net');
+    const oac = arg.originAccessControlConfig;
+    if (v.oacMode === 'none') assert.equal('originAccessControlConfig' in arg, false);
+    if (v.oacMode === 'off') assert.deepEqual(oac, { enabled: false });
+    if (v.oacMode === 'region') assert.deepEqual(oac, OAC);
+    if (v.oacMode === 'noregion') {
+      assert.deepEqual(oac, { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' });
+    }
+    // every variant keeps the allow-list and the fail-closed behavior
+    assert.equal((await handler(host('bad-colon'))).statusCode, 500);
+    assert.equal(calls.updates.length, 1);
+  });
+}

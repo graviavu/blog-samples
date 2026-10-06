@@ -13,7 +13,11 @@ const write = process.argv.includes('--write');
 
 // file -> template -> [[text in function file, text in template]]
 const TARGETS = [
-  { template: 'template.yaml', file: 'route.js', subs: [["const ROUTE_ATTRIBUTE = 'x-backend';", "const ROUTE_ATTRIBUTE = '${RouteAttribute}';"]] },
+  { template: 'template.yaml', file: 'route.js', subs: [
+      ["const ROUTE_ATTRIBUTE = 'x-backend';", "const ROUTE_ATTRIBUTE = '${RouteAttribute}';"],
+      ['const SEND_HOST_HEADER = true;', 'const SEND_HOST_HEADER = ${SendHostHeader};'],
+      ["const OAC_MODE = 'region';", "const OAC_MODE = '${OacMode}';"],
+    ] },
   { template: 'template.yaml', file: 'probe.js', subs: [] },
   {
     template: 'template-lambda-edge.yaml', file: 'edge-origin-request.js',
@@ -27,7 +31,7 @@ for (const t of TARGETS) {
   const lines = readFileSync(tplPath, 'utf8').split('\n');
   const marker = lines.findIndex((l) => l.trim() === `# SOURCE: function/${t.file}` || l.trim().startsWith(`# SOURCE: function/${t.file} `));
   if (marker < 0) { console.error(`FAIL ${t.template}: no "# SOURCE: function/${t.file}" marker`); failed = true; continue; }
-  const start = lines.findIndex((l, i) => i > marker && /^\s+(FunctionCode|ZipFile): (!Sub )?\|\s*$/.test(l));
+  const start = lines.findIndex((l, i) => i > marker && (/^\s+(FunctionCode|ZipFile): (!Sub )?\|\s*$/.test(l) || /^\s+- \|\s*$/.test(l)));
   if (start < 0) { console.error(`FAIL ${t.template}: no literal code block after marker for ${t.file}`); failed = true; continue; }
   const indent = lines[start + 1].match(/^ */)[0].length;
   let end = start + 1;
@@ -53,4 +57,24 @@ for (const t of TARGETS) {
     failed = true;
   }
 }
-process.exit(failed ? 1 : 0);
+
+// ---- variants: function/variants.json is the one table; the template mapping and variants.sh must match it.
+import { readFileSync as rf } from 'node:fs';
+const variants = JSON.parse(rf(join(root, 'function', 'variants.json'), 'utf8'));
+let vfail = false;
+const tpl = rf(join(root, 'template.yaml'), 'utf8');
+for (const [name, v] of Object.entries(variants)) {
+  const line = `${name}: {SendHostHeader: '${v.sendHostHeader}', OacMode: '${v.oacMode}'}`;
+  if (!tpl.includes(line)) { console.error(`FAIL template.yaml Mappings lack: ${line}`); vfail = true; }
+  if (!tpl.includes(`      - ${name}\n`) && !new RegExp(`AllowedValues: \\[[^\\]]*\\b${name}\\b`).test(tpl)) { console.error(`FAIL template.yaml RouteVariant does not allow ${name}`); vfail = true; }
+}
+const sh = rf(join(root, 'variants.sh'), 'utf8');
+const m = sh.match(/# BEGIN variant table[^\n]*\n(?:VARIANT_TABLE=")([\s\S]*?)"\n# END variant table/);
+const want = Object.entries(variants).map(([n, v]) => `${n} ${v.originAuth}`).join('\n');
+if (!m || m[1].trim() !== want) { console.error('FAIL variants.sh variant table differs from function/variants.json. Expected:\n' + want); vfail = true; }
+for (const [name, v] of Object.entries(variants)) {
+  if (v.oacMode === 'none' && v.originAuth === 'AWS_IAM' && !['V5'].includes(name)) { /* allowed, documented inheritance case */ }
+  if (v.oacMode === 'off' && v.originAuth !== 'NONE') { console.error(`FAIL ${name}: oac off requires public origins`); vfail = true; }
+}
+if (!vfail) console.log(`ok   ${Object.keys(variants).length} variants consistent (variants.json, template mapping, variants.sh)`);
+process.exit(failed || vfail ? 1 : 0);

@@ -28,7 +28,17 @@ case "$*" in
     [ "${FAKE_NO_STACK:-0}" = 1 ] && exit 255
     case "$*" in
       *Tags*) printf '%s\n' "${FAKE_STACK_TAG:-}" ;;
+      *Parameters*) echo "NamePrefix RouteAttribute OriginAuth RouteVariant" ;;
     esac ;;
+  *update-stack*)
+    if [ "${FAKE_UPDATE_FAIL:-0}" = 1 ]; then
+      acct="1234"; acct="${acct}56789012"
+      echo "An error occurred (AccessDenied) when calling the UpdateStack operation: User: arn:aws:iam::${acct}:user/someone is not authorized" >&2
+      exit 254
+    fi
+    for arg in "$@"; do
+      case "$arg" in ParameterKey=RouteVariant,ParameterValue=*) echo "${arg##*=}" > "$FAKE_VARIANT_FILE" ;; esac
+    done ;;
   *put-key*|*delete-key*)
     key=""; value=""; op=put
     while [ $# -gt 0 ]; do

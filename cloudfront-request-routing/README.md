@@ -218,7 +218,7 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   optional and not in the template: a new account's total concurrency quota is small (it can be as low as 10), and reserved
   concurrency is carved out of it, so a careless value can throttle or block your other functions.
 - **How the lock works, and what is and is not documented.** `route.js` passes
-  `originAccessControlConfig: { enabled: true, signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' }` on every
+  `originAccessControlConfig: { enabled: true, region: 'us-east-1', signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' }` on every
   `updateRequestOrigin()` call. The AWS documentation for `updateRequestOrigin()` lists these properties and lists Lambda function URLs as a
   supported origin type, and says an OAC set on the call applies to the new origin (its only worked example is S3). The documentation
   also describes the Lambda function URL OAC setup (auth `AWS_IAM`, two permissions, HTTPS-only origin). **But AWS has no Lambda-specific
@@ -241,7 +241,7 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   turns the suffix check off. **The suffix limits the kind of host in a region, not its owner:** any account's Lambda function URL in
   that region ends with the same suffix and would match, so it narrows what a bad store entry can point at but does not prove the
   backend is yours. Use your own domain suffix for real backends.
-- **OAC signing applies to every route.** `route.js` adds the Lambda OAC block (`originType: 'lambda'`, SigV4 `always`) to every
+- **OAC signing applies to every route.** `route.js` adds the Lambda OAC block (`originType: 'lambda'`, SigV4 `always`, `region: 'us-east-1'`) to every
   `updateRequestOrigin()` call. Anyone who points this function at non-Lambda backends (plain HTTP origins, S3, other services) must
   remove that block or set the right `originType` per route, otherwise requests will be signed for the wrong kind of origin.
 - **No open proxy.** The function treats the request value only as a key. It forwards to a domain name only if the key is in the
@@ -251,6 +251,47 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   stack parameter you type yourself.
 - Do not run it in a production account. Delete it when done.
 - Not covered: an S3 (origin access control) default origin. The post's S3 inheritance question (part of T6) stays open.
+
+## If routed requests fail with 502 FunctionValidationError
+
+**What the first real run found.** After the first deployment, every routed request returned `502` with
+`x-cache: FunctionValidationError from cloudfront` and the body "The CloudFront function returned an invalid value for origin rewrite."
+(also on `/control/*`). The direct calls to all three function URLs were refused with 403 (the lock works), and the error-path tests
+(T6c to T6h: bad stored values, unknown key, missing key) passed. So CloudFront rejected the object that `route.js` passed to
+`updateRequestOrigin()`. The version deployed in that run passed `originAccessControlConfig` **without a `region` property** (and also
+`hostHeader`); AWS's own sample
+([select-origin-based-on-country](https://github.com/aws-samples/amazon-cloudfront-functions/blob/main/select-origin-based-on-country/index.js))
+passes `region` inside `originAccessControlConfig`. `route.js` now includes `region: 'us-east-1'` (constant `OAC_REGION`, next to
+`BACKEND_SUFFIX`). **Whether that is the fix is to be confirmed by `variants.sh`. Nothing is claimed fixed until a run reports it.**
+
+**Find the invalid field in one session, without redeploying.** `variants.sh` updates the existing stack in place, one variant at a
+time (parameter `RouteVariant`; the variants are defined in `function/variants.json`), waits for the update and for the function to be
+live, sends one routed request per backend, and prints a table with the status, the `x-cache` value and the origin seen:
+
+| Variant | `hostHeader` | `originAccessControlConfig` | Origins |
+|---|---|---|---|
+| V1 (default) | yes | `enabled`, `region`, `always`, `sigv4`, `lambda` | IAM |
+| V2 | no | same as V1 | IAM |
+| V4 | no | like V1 but without `region` (the first run's config) | IAM |
+| V5 | no | not passed (the default origin's OAC settings are inherited) | IAM |
+| V0 | yes | not passed (the post's code as written) | public |
+| V3 | no | not passed | public |
+| V6 | yes | `{ enabled: false }` | public |
+
+V0, V3 and V6 temporarily make the three test origins **public** and ask for the same consent as `deploy.sh` (`ORIGIN_AUTH=NONE`,
+`ACK_PUBLIC_ORIGINS=true`, `--yes`, or typing `yes`). At the end the script **restores V1 with IAM-protected origins**. It prints only AWS
+error codes, masks its results file like `verify.sh`, and ends with lines such as `VARIANT=V1 RESULT=PASS DETAIL=...`.
+
+```bash
+cd cloudfront-request-routing
+git pull                        # get this branch's template, which has the RouteVariant parameter
+./variants.sh --yes             # all variants, in place; or: ./variants.sh V1 V2 V4 V5   (IAM variants only, no consent needed)
+./verify.sh                     # then run the full verification again with the restored default
+```
+
+How to read it: if V0 or V3 pass, routing itself works and the problem is in the OAC settings; if V1 passes the `region` was missing;
+if only V2 passes `hostHeader` is the problem for signed origins; if every variant returns 502 the problem is not in these fields.
+If no IAM variant works but V0 or V3 do, use the fallback in Safety notes (public origins for the short life of the stack).
 
 ## What each test settles
 
@@ -287,6 +328,7 @@ cd cloudfront-request-routing
 node --test test/*.test.mjs          # unit tests for the function code with a stub for the 'cloudfront' module
 node scripts/check-function-sync.mjs # templates embed exactly function/*.js
 test/verify-mock.sh                  # runs verify.sh against a local mock (tests the script, not CloudFront), including result redaction
+test/variants-test.sh                # variants.sh against the mock (table, restore of V1, consent, error-code-only output)
 test/deploy-test.sh                  # deploy.sh guards (budget check, public-origins confirmation) with a fake aws CLI
 test/teardown-test.sh                # teardown.sh guards (tag check, confirmation, env precedence) with a fake aws CLI
 cfn-lint template.yaml template-lambda-edge.yaml   # pip install cfn-lint

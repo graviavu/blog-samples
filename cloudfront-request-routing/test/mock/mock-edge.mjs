@@ -50,9 +50,17 @@ function viewerRequest(req, url) {
   if (path.startsWith('/probe/')) {
     return { status: 200, headers: { 'x-seen-host': req.headers.host, 'cache-control': 'no-store' }, body: '' };
   }
-  const { handler, calls } = loadRoute({ store: store(), suffix: null });
+  // Variant under test (variants.sh): written by the fake aws CLI on update-stack. Default V1.
+  const variant = process.env.FAKE_VARIANT_FILE && existsSync(process.env.FAKE_VARIANT_FILE)
+    ? readFileSync(process.env.FAKE_VARIANT_FILE, 'utf8').trim() : 'V1';
+  const { handler, calls } = loadRoute({ store: store(), suffix: null, variant });
   return handler({ request: { method: 'GET', uri: path, headers: cfHeaders(req.headers) } }).then((res) => {
     if (res.statusCode) return { status: res.statusCode, headers: {}, body: '' };
+    // Pretend CloudFront rejects an OAC config without region (what the first real run suggested), when asked to.
+    const oacArg = calls.updates[0].originAccessControlConfig;
+    if (process.env.MOCK_REJECT_NO_REGION === '1' && oacArg && oacArg.enabled && !oacArg.region) {
+      return { status: 502, headers: { 'x-cache': 'FunctionValidationError from cloudfront' }, body: 'invalid value for origin rewrite' };
+    }
     const o = calls.updates[0].domainName;
     return echo(o.split('.')[0], req.headers, url, calls.updates[0].hostHeader);
   });
@@ -71,7 +79,7 @@ http.createServer(async (req, res) => {
     out = await viewerRequest(req, url);
     if (out.status === 200 && !url.pathname.startsWith('/probe/')) cache.set(ck, { out, exp: Date.now() + 60000 });
   }
-  res.writeHead(out.status, { ...out.headers, 'x-cache': xc, 'x-amz-cf-pop': 'MOCK1-C1' });
+  res.writeHead(out.status, { 'x-cache': xc, 'x-amz-cf-pop': 'MOCK1-C1', ...out.headers });
   res.end(out.body);
 }).listen(port, '127.0.0.1');
 

@@ -63,6 +63,10 @@ jobs:
         working-directory: cloudfront-request-routing
         run: test/verify-mock.sh
 
+      - name: variants.sh against the local mock and a fake aws CLI
+        working-directory: cloudfront-request-routing
+        run: test/variants-test.sh
+
       - name: deploy.sh guards (budget check, public origins) against a fake aws CLI
         working-directory: cloudfront-request-routing
         run: test/deploy-test.sh
