@@ -52,6 +52,6 @@ for bad in '$(touch x)' 'a b' '`id`' 'x;y' "it's"; do
   check "raw '$bad' writes nothing" "$([ -s "$FAKE_KVS_LOG" ] && echo 1 || echo 0)"
 done
 
-KVS_ARN='bad arn;x' rc=$(KVS_ARN='bad arn;x' seed); check "bad KVS_ARN rejected" "$([ "$rc" != 0 ] && echo 0 || echo 1)"
+rc=$(KVS_ARN='bad arn;x' seed); check "bad KVS_ARN rejected" "$([ "$rc" != 0 ] && echo 0 || echo 1)"
 
 if [ "$fail" = 0 ]; then echo "seed-test: ok"; else echo "seed-test: FAILED"; exit 1; fi

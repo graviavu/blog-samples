@@ -48,10 +48,10 @@ case "$EDGE_REWRITE_ERRORS" in true|false) ;; *) echo "EDGE_REWRITE_ERRORS must 
 for v in CLOSED_MIN_TTL EDGE_WINDOW_START_MIN EDGE_WINDOW_END_MIN EDGE_IN_TTL EDGE_OUT_TTL; do
   printf '%s' "${!v}" | grep -Eq '^[0-9]{1,5}$' || { echo "$v must be an integer" >&2; exit 1; }
 done
-[ "$CLOSED_MIN_TTL" -ge 600 ] && [ "$CLOSED_MIN_TTL" -le 3600 ] || { echo "CLOSED_MIN_TTL must be 600..3600" >&2; exit 1; }
-[ "$EDGE_WINDOW_START_MIN" -lt "$EDGE_WINDOW_END_MIN" ] && [ "$EDGE_WINDOW_END_MIN" -le 1440 ] || {
+{ [ "$CLOSED_MIN_TTL" -ge 600 ] && [ "$CLOSED_MIN_TTL" -le 3600 ]; } || { echo "CLOSED_MIN_TTL must be 600..3600" >&2; exit 1; }
+{ [ "$EDGE_WINDOW_START_MIN" -lt "$EDGE_WINDOW_END_MIN" ] && [ "$EDGE_WINDOW_END_MIN" -le 1440 ]; } || {
   echo "EDGE_WINDOW_START_MIN must be below EDGE_WINDOW_END_MIN (max 1440); a window across midnight is not supported" >&2; exit 1; }
-[ "$EDGE_IN_TTL" -le 3600 ] && [ "$EDGE_OUT_TTL" -le 3600 ] || { echo "edge TTLs must be at most 3600" >&2; exit 1; }
+{ [ "$EDGE_IN_TTL" -le 3600 ] && [ "$EDGE_OUT_TTL" -le 3600 ]; } || { echo "edge TTLs must be at most 3600" >&2; exit 1; }
 if [ -n "$(printf '%s' "${COST_TAG_KEY:-}" | tr -d 'A-Za-z0-9:_./-')" ]; then echo "bad COST_TAG_KEY" >&2; exit 1; fi
 
 params=("NamePrefix=$NAME_PREFIX" "SlotCarrier=$SLOT_CARRIER" "ClosedMinTtl=$CLOSED_MIN_TTL" "EnableTestBehaviors=$ENABLE_TEST_BEHAVIORS")

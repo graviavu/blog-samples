@@ -224,7 +224,7 @@ hyp T0 "The test origin is an IAM-protected Lambda function URL reachable only t
 if [ -z "$ORIGIN_HOST" ]; then
   emit T0 INCONCLUSIVE "not run: set ORIGIN_HOST (deploy.env has it)"
 else
-  [ "$SCHEME" = "https" ] && dport=443 || dport=80
+  if [ "$SCHEME" = "https" ]; then dport=443; else dport=80; fi
   if [ -n "${VERIFY_DIRECT_CONNECT:-}" ]; then   # test hook for the local mock only
     req "T0 direct call to the origin" "$SCHEME://$ORIGIN_HOST/t0/$RUN/none" --connect-to "$ORIGIN_HOST:$dport:$VERIFY_DIRECT_CONNECT"
   else

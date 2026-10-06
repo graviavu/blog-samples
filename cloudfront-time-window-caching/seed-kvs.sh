@@ -41,17 +41,17 @@ if [ -n "$raw" ]; then
   echo "WARNING: writing an unvalidated value (this is how to test the fail-closed path)." >&2
 else
   if [ -n "$starts_in" ] || [ -n "$length" ]; then
-    [ -n "$starts_in" ] && [ -n "$length" ] || { echo "--starts-in and --length go together" >&2; exit 2; }
+    { [ -n "$starts_in" ] && [ -n "$length" ]; } || { echo "--starts-in and --length go together" >&2; exit 2; }
     [ -z "$start_min$end_min" ] || { echo "use either --start-min/--end-min or --starts-in/--length" >&2; exit 2; }
     now_min=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
     start_min=$(( now_min + starts_in ))
     end_min=$(( start_min + length ))
   fi
   start_min=${start_min:-810}; end_min=${end_min:-1200}; slot=${slot:-5}; rev=${rev:-1}
-  [ "$start_min" -ge 0 ] && [ "$start_min" -le 1439 ] || { echo "start minute out of range 0..1439 ($start_min): too close to midnight UTC for a relative window? Try again after 00:00 UTC." >&2; exit 2; }
-  [ "$end_min" -ge 1 ] && [ "$end_min" -le 1440 ] || { echo "end minute out of range 1..1440 ($end_min): the window would cross 00:00 UTC, which part 1 does not support. Try again after 00:00 UTC." >&2; exit 2; }
+  { [ "$start_min" -ge 0 ] && [ "$start_min" -le 1439 ]; } || { echo "start minute out of range 0..1439 ($start_min): too close to midnight UTC for a relative window? Try again after 00:00 UTC." >&2; exit 2; }
+  { [ "$end_min" -ge 1 ] && [ "$end_min" -le 1440 ]; } || { echo "end minute out of range 1..1440 ($end_min): the window would cross 00:00 UTC, which part 1 does not support. Try again after 00:00 UTC." >&2; exit 2; }
   [ "$start_min" -lt "$end_min" ] || { echo "start must be below end (a window across midnight is not supported)" >&2; exit 2; }
-  [ "$slot" -ge 1 ] && [ "$slot" -le 3600 ] || { echo "slot seconds out of range 1..3600" >&2; exit 2; }
+  { [ "$slot" -ge 1 ] && [ "$slot" -le 3600 ]; } || { echo "slot seconds out of range 1..3600" >&2; exit 2; }
   [ "$rev" -le 999999 ] || { echo "rev out of range 0..999999" >&2; exit 2; }
   value=$(printf '{"startMin":%d,"endMin":%d,"slotSeconds":%d,"rev":%d}' "$start_min" "$end_min" "$slot" "$rev")
 fi
