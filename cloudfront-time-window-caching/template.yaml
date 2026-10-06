@@ -1,0 +1,618 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Sample: time-window caching on CloudFront without changing origins (part 1, a fixed window). One distribution,
+  a KeyValueStore window record, a CloudFront Function that adds a time slot to the cache key (Option A), cache
+  policies with different TTLs, and one test origin (an IAM-protected Lambda function URL reached only through
+  CloudFront origin access control). Deploy in us-east-1. For testing only; delete with teardown.sh.
+
+Rules:
+  RegionIsUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: Deploy this sample in us-east-1 (the optional Lambda@Edge stack requires it).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cftw
+    AllowedPattern: '^[a-z][a-z0-9-]{0,19}$'
+    Description: Prefix for resource names. Use a different one for a second copy of the stack.
+  SlotCarrier:
+    Type: String
+    Default: query
+    AllowedValues: [query, header]
+    Description: >-
+      How the slot reaches the cache key. query (the post's sketch): the query string parameter slot.
+      header: the request header x-cache-slot, added by the function. Either way the origin receives it.
+  ClosedMinTtl:
+    Type: Number
+    Default: 600
+    MinValue: 600
+    MaxValue: 3600
+    Description: >-
+      Minimum TTL of the window cache policy in seconds: the longest out-of-window lifetime (post, step 3).
+      Test T3 needs at least 600 so that the pre-open entry outlives the seeded window.
+  EnableTestBehaviors:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Adds test-only path behaviors /p-orig/*, /p-b/*, /p-m0/* (cache policies with different TTLs, tests T5, T9, T10)
+      and /legacy/* (the flawed first closed-period key, test T3d). Default false: a single-behavior distribution
+      with only Option A. deploy.sh sets true for the verify run; verify.sh reports INCONCLUSIVE for those tests when false.
+  TryDefaultAboveMax:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Needs EnableTestBehaviors=true. Adds the policy /p-defhi/* whose default TTL (60) is above its maximum TTL (20).
+      The post says the result is undocumented, and the CloudFront API may refuse to create such a policy.
+      Default false so a refusal cannot fail the stack; deploy.sh tries it in a second, harmless update (test T5e).
+  CostTagKey:
+    Type: String
+    Default: project
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9:_./-]{0,127}$'
+    Description: Tag key for your cost allocation tag. The value is always cloudfront-time-window-caching.
+
+Conditions:
+  CarrierQuery: !Equals [!Ref SlotCarrier, query]
+  TestBehaviors: !Equals [!Ref EnableTestBehaviors, 'true']
+  DefHi: !And
+    - !Equals [!Ref EnableTestBehaviors, 'true']
+    - !Equals [!Ref TryDefaultAboveMax, 'true']
+
+Resources:
+  # ---------------------------------------------------------------- test origin
+  OriginRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogsOrigin.Arn
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+  LogsOrigin:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-origin'
+      RetentionInDays: 3
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+
+  # The test origin: a function URL with IAM auth, reachable only through this distribution (origin access control).
+  # It answers fixed routes only and copies nothing from the request into its output except two booleans and the slot,
+  # and the slot only if it matches a strict pattern. Deleted with the stack.
+  # SOURCE: function/origin.js (edit the file, then run: node scripts/check-function-sync.mjs --write)
+  Origin:
+    Type: AWS::Lambda::Function
+    DependsOn: LogsOrigin
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin'
+      Description: Test origin with controllable cache headers (sample cloudfront-time-window-caching)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OriginRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          'use strict';
+
+          // Test origin for the cloudfront-time-window-caching sample (a Lambda function URL behind CloudFront OAC).
+          // It answers fixed test routes with controllable Cache-Control / Expires headers and a JSON body that carries a
+          // per-response unique id and a timestamp, so a cache hit is provable (the same id comes back) and the number of
+          // origin fetches in a burst is the number of distinct ids.
+          //
+          // Safety rules for this file: the route is the last path segment and must be an exact key of ROUTES; nothing
+          // from the request is copied into a header or the body, except two booleans and the slot value, and the slot
+          // value only if it matches a strict allow-list pattern. It holds no secrets and reads no data store.
+
+          const crypto = require('node:crypto');
+
+          const ROUTES = new Map();
+          const add = (name, spec) => ROUTES.set(name, spec);
+
+          add('none', {});                                              // no Cache-Control, no Expires
+          add('nostore', { cc: 'no-store' });
+          add('private', { cc: 'private' });
+          add('nocache', { cc: 'no-cache' });
+          add('public-nomax', { cc: 'public' });                        // public without max-age
+          add('maxage-0', { cc: 'public, max-age=0' });
+          add('maxage-5', { cc: 'public, max-age=5' });
+          add('maxage-30', { cc: 'public, max-age=30' });
+          add('maxage-3600', { cc: 'public, max-age=3600' });
+          add('smaxage-only', { cc: 'public, s-maxage=5' });            // s-maxage without max-age
+          add('both-5', { cc: 'public, max-age=0, s-maxage=5' });       // the post's worked example
+          add('both-14400', { cc: 'public, max-age=0, s-maxage=14400' });
+          add('expires-past', { expires: 'Thu, 01 Jan 1970 00:00:00 GMT' });                      // Expires only, in the past
+          add('maxage-expires', { cc: 'public, max-age=5', expires: 'Fri, 31 Dec 2100 23:59:59 GMT' }); // both: max-age wins
+          add('etag', { cc: 'public, max-age=5', etag: '"tw-fixed-etag"' });                       // conditional requests
+          add('slow', { cc: 'no-store', delayMs: 1000 });               // overlap for the request collapsing test
+          for (const code of [400, 403, 404, 500, 503]) {
+            add(`error-${code}`, { status: code });                                    // error without Cache-Control
+            add(`error-${code}-cc`, { status: code, cc: 'public, s-maxage=60' });      // error with Cache-Control
+          }
+
+          const SLOT = /^(w[0-9]{1,12}|f[0-9]{1,12}|(pre|post)-[0-9]{4}-[0-9]{2}-[0-9]{2}-r[0-9]{1,6}|closed-[0-9]{4}-[0-9]{2}-[0-9]{2})$/;
+
+          function slotOf(value) { // returns the value only if it matches the allow-list, never anything else
+            return typeof value === 'string' && SLOT.test(value) ? value : null;
+          }
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          exports.handler = async (event) => {
+            const path = typeof event.rawPath === 'string' ? event.rawPath.slice(0, 300) : '';
+            const name = path.split('/').pop();
+            const spec = ROUTES.has(name) ? ROUTES.get(name) : null;
+            const h = event.headers || {};
+            const q = event.queryStringParameters || {};
+
+            if (!spec) {
+              return {
+                statusCode: 404,
+                headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+                body: JSON.stringify({ error: 'unknown route' }),
+              };
+            }
+
+            if (spec.delayMs) await sleep(spec.delayMs);
+
+            const headers = { 'content-type': 'application/json', 'x-sample-origin': 'cloudfront-time-window-caching' };
+            if (spec.cc) headers['cache-control'] = spec.cc;
+            if (spec.expires) headers.expires = spec.expires;
+            if (spec.etag) headers.etag = spec.etag;
+
+            // Conditional request: CloudFront sends If-None-Match when it revalidates an expired object that has an ETag.
+            if (spec.etag && h['if-none-match'] === spec.etag) {
+              return { statusCode: 304, headers };
+            }
+
+            const slot = slotOf(q.slot);
+            const slotHeader = slotOf(h['x-cache-slot']);
+            const body = {
+              id: crypto.randomUUID(),                 // unique per origin response
+              ts: new Date().toISOString(),
+              epoch: Date.now(),
+              route: name,                             // an exact ROUTES key, not request input
+              status: spec.status || 200,
+              sentCacheControl: spec.cc || null,
+              sawSlot: Object.prototype.hasOwnProperty.call(q, 'slot'),
+              slot,                                    // allow-listed value or null
+              slotInvalid: Object.prototype.hasOwnProperty.call(q, 'slot') && slot === null,
+              sawSlotHeader: typeof h['x-cache-slot'] === 'string',
+              slotHeader,
+              slotHeaderInvalid: typeof h['x-cache-slot'] === 'string' && slotHeader === null,
+            };
+            return { statusCode: spec.status || 200, headers, body: JSON.stringify(body) };
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+  OriginUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Origin.Arn
+      AuthType: AWS_IAM
+  # Only CloudFront, and only this distribution, may invoke the function. Two statements are required for new function URLs.
+  OriginPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Origin
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+      FunctionUrlAuthType: AWS_IAM
+  OriginPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Origin
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+      InvokedViaFunctionUrl: true
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${NamePrefix}-origin'
+        Description: Signs requests to the test Lambda function URL origin (SigV4)
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------- window record and functions
+  # The window record. Seed it with seed-kvs.sh (CloudFormation cannot write items without an S3 import file).
+  WindowStore:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: !Sub '${NamePrefix}-window'
+      Comment: Window record for the cloudfront-time-window-caching sample (key window, JSON value)
+
+  # SOURCE: function/slot.js (edit the file, then run: node scripts/check-function-sync.mjs --write)
+  SlotFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${NamePrefix}-slot'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Option A, adds a time slot to the cache key from the KeyValueStore window (sample)
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt WindowStore.Arn
+      FunctionCode: !Sub |
+        import cf from 'cloudfront'; // runtime 2.0
+
+        // Option A of the post: a viewer request function adds a time slot to the cache key.
+        // SOURCE OF TRUTH. The template embeds this file (node scripts/check-function-sync.mjs --write regenerates it).
+        //
+        // KVS key "window", JSON value, UTC minutes since midnight, startMin < endMin (same UTC day):
+        //   {"startMin": 810, "endMin": 1200, "slotSeconds": 5, "rev": 1}
+        //
+        // Slot values (the cache key part): 'w<n>' in the window (n = epoch / slotSeconds, so no slot is ever reused),
+        // 'pre-<UTC date>-r<rev>' before the open and 'post-<UTC date>-r<rev>' after the close, so a pre-open entry
+        // can never be served after the close. 'f<n>' is the fail-closed slot (see below).
+        //
+        // Differences from the sketch in the post, on purpose:
+        //  - The record is validated. A missing key, unreadable JSON, wrong types, out-of-range numbers or
+        //    startMin >= endMin (a window across 00:00 UTC is not supported in part 1) FAIL CLOSED: the request gets a
+        //    short fallback slot ('f<n>', FALLBACK_SLOT_SECONDS long), so data is never older than that and the origin
+        //    load is bounded. The post's sketch returned the request unchanged, which would share one cache key (fail-open).
+        //  - The slot goes into the query string 'slot' or into the request header 'x-cache-slot', chosen by CARRIER.
+        //    Whatever the viewer sent under that name is replaced, so a viewer cannot pick its own cache key.
+        //    The cache policy lists only that one name, so the viewer's other query strings stay out of the key.
+
+        const kvs = cf.kvs();
+
+        const CARRIER = '${SlotCarrier}'; // 'query' or 'header' (the template fills this in from SlotCarrier)
+        const HEADER_NAME = 'x-cache-slot';
+        const FALLBACK_SLOT_SECONDS = 5;
+
+        function isInt(v, lo, hi) {
+          return typeof v === 'number' && isFinite(v) && Math.floor(v) === v && v >= lo && v <= hi;
+        }
+
+        function parseWindow(w) {
+          if (!w || typeof w !== 'object') return null;
+          const rev = w.rev === undefined ? 0 : w.rev;
+          if (!isInt(w.startMin, 0, 1439) || !isInt(w.endMin, 1, 1440) || !isInt(w.slotSeconds, 1, 3600) || !isInt(rev, 0, 999999)) {
+            return null;
+          }
+          if (w.startMin >= w.endMin) return null; // equal, or across midnight: unsupported
+          return { startMin: w.startMin, endMin: w.endMin, slotSeconds: w.slotSeconds, rev: rev };
+        }
+
+        function slotFor(w, now) {
+          const ms = now.getTime();
+          if (w === null) return 'f' + Math.floor(ms / (FALLBACK_SLOT_SECONDS * 1000));
+          const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+          if (minute >= w.startMin && minute < w.endMin) {
+            return 'w' + Math.floor(ms / (w.slotSeconds * 1000));
+          }
+          const phase = minute < w.startMin ? 'pre' : 'post';
+          return phase + '-' + now.toISOString().slice(0, 10) + '-r' + w.rev;
+        }
+
+        async function handler(event) {
+          const request = event.request;
+          let w = null;
+          try {
+            w = parseWindow(await kvs.get('window', { format: 'json' }));
+          } catch (e) {
+            w = null; // key missing, store unavailable or value is not JSON: fail closed
+          }
+          const slot = slotFor(w, new Date());
+          if (!request.querystring) request.querystring = {};
+          if (CARRIER === 'header') {
+            delete request.querystring.slot;
+            request.headers[HEADER_NAME] = { value: slot };
+          } else {
+            delete request.headers[HEADER_NAME];
+            request.querystring.slot = { value: slot };
+          }
+          return request;
+        }
+
+  # SOURCE: function/slot-legacy.js (test only; the flawed first closed-period key)
+  LegacySlotFunction:
+    Type: AWS::CloudFront::Function
+    Condition: TestBehaviors
+    Properties:
+      Name: !Sub '${NamePrefix}-slot-legacy'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Test only. The flawed closed-<date> key from the first draft (test T3d). Do not use.
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt WindowStore.Arn
+      FunctionCode: !Sub |
+        import cf from 'cloudfront'; // runtime 2.0
+
+        // TEST ONLY (EnableTestBehaviors). The FIRST version of the closed-period key from the post: 'closed-<date>',
+        // identical before the open and after the close. It exists to reproduce the flaw the post describes (test T3d):
+        // an entry cached before the open is still served after the close. Do not use this for anything real.
+        // SOURCE OF TRUTH. The template embeds this file. The window check is copied from slot.js.
+
+        const kvs = cf.kvs();
+
+        const CARRIER = '${SlotCarrier}'; // 'query' or 'header' (the template fills this in from SlotCarrier)
+        const HEADER_NAME = 'x-cache-slot';
+        const FALLBACK_SLOT_SECONDS = 5;
+
+        function isInt(v, lo, hi) {
+          return typeof v === 'number' && isFinite(v) && Math.floor(v) === v && v >= lo && v <= hi;
+        }
+
+        function parseWindow(w) {
+          if (!w || typeof w !== 'object') return null;
+          if (!isInt(w.startMin, 0, 1439) || !isInt(w.endMin, 1, 1440) || !isInt(w.slotSeconds, 1, 3600)) return null;
+          if (w.startMin >= w.endMin) return null;
+          return { startMin: w.startMin, endMin: w.endMin, slotSeconds: w.slotSeconds };
+        }
+
+        function slotFor(w, now) {
+          const ms = now.getTime();
+          if (w === null) return 'f' + Math.floor(ms / (FALLBACK_SLOT_SECONDS * 1000));
+          const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+          if (minute >= w.startMin && minute < w.endMin) {
+            return 'w' + Math.floor(ms / (w.slotSeconds * 1000));
+          }
+          return 'closed-' + now.toISOString().slice(0, 10); // the flaw: no pre/post phase, no rev
+        }
+
+        async function handler(event) {
+          const request = event.request;
+          let w = null;
+          try {
+            w = parseWindow(await kvs.get('window', { format: 'json' }));
+          } catch (e) {
+            w = null;
+          }
+          const slot = slotFor(w, new Date());
+          if (!request.querystring) request.querystring = {};
+          if (CARRIER === 'header') {
+            delete request.querystring.slot;
+            request.headers[HEADER_NAME] = { value: slot };
+          } else {
+            delete request.headers[HEADER_NAME];
+            request.querystring.slot = { value: slot };
+          }
+          return request;
+        }
+
+  # ---------------------------------------------------------------- cache policies
+  # Window policy (post, step 3): the slot is in the cache key and the minimum TTL is the longest closed-period
+  # lifetime. A minimum above 0 also beats no-store from the origins. Only the slot is in the key.
+  WindowCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-window'
+        Comment: Option A. The slot (query string slot or header x-cache-slot) is the only addition to the cache key.
+        MinTTL: !Ref ClosedMinTtl
+        DefaultTTL: !Ref ClosedMinTtl
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: !If
+            - CarrierQuery
+            - QueryStringBehavior: whitelist
+              QueryStrings: [slot]
+            - QueryStringBehavior: none
+          HeadersConfig: !If
+            - CarrierQuery
+            - HeaderBehavior: none
+            - HeaderBehavior: whitelist
+              Headers: [x-cache-slot]
+
+  # The policies below differ only in their TTLs. Nothing but the path is in their cache key. Used by tests T5, T9, T10.
+  # Equivalent of the managed policy UseOriginCacheControlHeaders: minimum 0, default 0, maximum 31,536,000 (post, policy A).
+  TtlOrigPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: TestBehaviors
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-ttl-orig'
+        Comment: Test only. Same TTLs as the managed policy UseOriginCacheControlHeaders (min 0, default 0, max 31536000).
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  # The post's policy B: minimum 30, default 60, maximum 3,600.
+  TtlBPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: TestBehaviors
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-ttl-b'
+        Comment: Test only. The post's policy B (min 30, default 60, max 3600).
+        MinTTL: 30
+        DefaultTTL: 60
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  # Small values with a minimum of 0, so that the cap and the default are visible within a minute or two.
+  TtlM0Policy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: TestBehaviors
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-ttl-m0'
+        Comment: Test only. Minimum 0, default 20, maximum 60.
+        MinTTL: 0
+        DefaultTTL: 20
+        MaxTTL: 60
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  # Default TTL above the maximum TTL: undocumented (post, test T5e). CloudFront may refuse to create it.
+  TtlDefHiPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: DefHi
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-ttl-defhi'
+        Comment: Test only. Minimum 0, default 60, maximum 20 (default above maximum).
+        MinTTL: 0
+        DefaultTTL: 60
+        MaxTTL: 20
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${NamePrefix}-security-headers'
+        Comment: Basic security headers on every response
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+
+  # ---------------------------------------------------------------- distribution
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${NamePrefix} cloudfront-time-window-caching sample'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        # Note: the default *.cloudfront.net certificate cannot enforce TLS 1.2: CloudFront keeps its default minimum there.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: origin
+            DomainName: !Select [2, !Split ['/', !GetAtt OriginUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 10
+        # The default behavior is Option A: the slot function, and the window cache policy.
+        DefaultCacheBehavior:
+          TargetOriginId: origin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !Ref WindowCachePolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SlotFunction.FunctionARN
+        # Test-only behaviors (EnableTestBehaviors). None of them has the slot function, except /legacy/*.
+        CacheBehaviors: !If
+          - TestBehaviors
+          - - PathPattern: /p-orig/*
+              TargetOriginId: origin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: !Ref TtlOrigPolicy
+              ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            - PathPattern: /p-b/*
+              TargetOriginId: origin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: !Ref TtlBPolicy
+              ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            - PathPattern: /p-m0/*
+              TargetOriginId: origin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: !Ref TtlM0Policy
+              ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            - PathPattern: /legacy/*
+              TargetOriginId: origin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: !Ref WindowCachePolicy
+              ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt LegacySlotFunction.FunctionARN
+            - !If
+              - DefHi
+              - PathPattern: /p-defhi/*
+                TargetOriginId: origin
+                ViewerProtocolPolicy: https-only
+                AllowedMethods: [GET, HEAD]
+                CachedMethods: [GET, HEAD]
+                CachePolicyId: !Ref TtlDefHiPolicy
+                ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+              - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+Outputs:
+  DistributionDomain:
+    Description: Domain name to test (no alias needed)
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution
+  WindowStoreArn:
+    Description: ARN of the KeyValueStore (used by seed-kvs.sh and verify.sh)
+    Value: !GetAtt WindowStore.Arn
+  OriginHost:
+    Description: Host of the test origin function URL (used by verify.sh for the direct-call lock test and by the optional edge stack)
+    Value: !Select [2, !Split ['/', !GetAtt OriginUrl.FunctionUrl]]
+  OriginFunctionName:
+    Description: Name of the test origin function (the optional edge stack grants its own distribution access to it)
+    Value: !Ref Origin
+  SlotCarrier:
+    Value: !Ref SlotCarrier
+  EnableTestBehaviors:
+    Value: !Ref EnableTestBehaviors
+  ClosedMinTtl:
+    Value: !Ref ClosedMinTtl

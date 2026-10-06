@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL second stack for the cloudfront-time-window-caching sample: Option B, a Lambda@Edge origin-response
+  function that rewrites Cache-Control by a fixed UTC window constant, with its own distribution in front of the
+  main stack's test origin. No data store. Deploy in us-east-1. Lambda@Edge replicas are removed by AWS some time
+  after the distribution is deleted, so stack deletion can fail at the function and need a retry hours later (see README).
+
+Rules:
+  RegionIsUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: Lambda@Edge functions must be created in us-east-1.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cftw-edge
+    AllowedPattern: '^[a-z][a-z0-9-]{0,19}$'
+  OriginHost:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]+\.[a-z]+$'
+    Description: Output OriginHost of the main stack (the Lambda function URL host)
+  OriginFunctionName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_-]{1,64}$'
+    Description: Output OriginFunctionName of the main stack. This stack adds permissions for its own distribution on that function.
+  WindowStartMin:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1439
+    Description: Window start, UTC minutes since midnight, inclusive. The default 0 to 1440 means the whole UTC day is in the window.
+  WindowEndMin:
+    Type: Number
+    Default: 1440
+    MinValue: 1
+    MaxValue: 1440
+    Description: Window end, UTC minutes since midnight, exclusive. Must be above WindowStartMin (deploy.sh checks).
+  InTtl:
+    Type: Number
+    Default: 15
+    MinValue: 0
+    MaxValue: 3600
+    Description: s-maxage in seconds inside the window.
+  OutTtl:
+    Type: Number
+    Default: 45
+    MinValue: 0
+    MaxValue: 3600
+    Description: s-maxage in seconds outside the window.
+  RewriteErrors:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      false (the post's advice): status 400 and above are not rewritten. true: errors get the rewritten header too,
+      to test whether that makes them cacheable for the full lifetime (test T9).
+  CostTagKey:
+    Type: String
+    Default: project
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9:_./-]{0,127}$'
+
+Resources:
+  # No policies: the function needs no AWS access. It has no CloudWatch logging on purpose
+  # (Lambda@Edge logs go to every region, which would need a wildcard).
+  EdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, edgelambda.amazonaws.com]
+            Action: sts:AssumeRole
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+  # SOURCE: function/edge-origin-response.js (edit the file, then run: node scripts/check-function-sync.mjs --write)
+  EdgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-origin-response'
+      Description: Lambda@Edge origin-response Cache-Control rewrite (sample cloudfront-time-window-caching)
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt EdgeRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+
+          // Option B of the post (optional second stack): a Lambda@Edge origin-response function rewrites Cache-Control
+          // by a fixed UTC window. SOURCE OF TRUTH. The template embeds this file; the five constants below are filled
+          // in from stack parameters at deploy time (Lambda@Edge has no environment variables). There is no data store:
+          // to change the window you deploy a new function version, which is the limit the post names.
+          //
+          // Runs only on cache misses. Errors (status 400 and above) are not rewritten unless REWRITE_ERRORS is true,
+          // which exists to test whether a rewritten header makes an error cacheable for the full lifetime (test T9).
+
+          const WINDOW_START_MIN = ${WindowStartMin};   // UTC minutes since midnight, inclusive
+          const WINDOW_END_MIN = ${WindowEndMin};  // exclusive; start < end, same UTC day
+          const IN_TTL = ${InTtl};            // s-maxage inside the window, seconds
+          const OUT_TTL = ${OutTtl};           // s-maxage outside the window, seconds
+          const REWRITE_ERRORS = ${RewriteErrors}; // also rewrite status 400 and above
+
+          exports.handler = async (event) => {
+            const response = event.Records[0].cf.response;
+            const status = Number(response.status);
+            if (status >= 400 && !REWRITE_ERRORS) return response;
+
+            const now = new Date();
+            const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+            const inWindow = minute >= WINDOW_START_MIN && minute < WINDOW_END_MIN;
+            const ttl = inWindow ? IN_TTL : OUT_TTL;
+            response.headers['cache-control'] = [
+              { key: 'Cache-Control', value: 'public, max-age=0, s-maxage=' + ttl },
+            ];
+            return response;
+          };
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+  EdgeVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref EdgeFunction
+
+  # Policies with minimum 0 and a maximum above the longest TTL, as the post says, so CloudFront does not clamp the rewrite.
+  EdgeD0Policy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-d0'
+        Comment: Minimum 0, default 0, maximum 3600. Only the path is in the cache key.
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  EdgeD60Policy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${NamePrefix}-d60'
+        Comment: Minimum 0, default 60, maximum 3600. Shows whether the default TTL or the rewritten header decides.
+        MinTTL: 0
+        DefaultTTL: 60
+        MaxTTL: 3600
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+          HeadersConfig: {HeaderBehavior: none}
+
+  EdgeSecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${NamePrefix}-security-headers'
+        Comment: Basic security headers on every response
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+
+  # Origin access control for this distribution, and permission on the main stack's origin function for this distribution only.
+  EdgeOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${NamePrefix}-origin'
+        Description: Signs requests to the test Lambda function URL origin (SigV4)
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  EdgeOriginPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginFunctionName
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${EdgeDistribution}'
+      FunctionUrlAuthType: AWS_IAM
+  EdgeOriginPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginFunctionName
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${EdgeDistribution}'
+      InvokedViaFunctionUrl: true
+
+  EdgeDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${NamePrefix} cloudfront-time-window-caching Lambda@Edge variant'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: origin
+            DomainName: !Ref OriginHost
+            OriginAccessControlId: !GetAtt EdgeOriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: origin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !Ref EdgeD0Policy
+          ResponseHeadersPolicyId: !Ref EdgeSecurityHeadersPolicy
+          LambdaFunctionAssociations:
+            - EventType: origin-response
+              LambdaFunctionARN: !Ref EdgeVersion
+        CacheBehaviors:
+          - PathPattern: /d60/*
+            TargetOriginId: origin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref EdgeD60Policy
+            ResponseHeadersPolicyId: !Ref EdgeSecurityHeadersPolicy
+            LambdaFunctionAssociations:
+              - EventType: origin-response
+                LambdaFunctionARN: !Ref EdgeVersion
+      Tags:
+        - {Key: sample, Value: cloudfront-time-window-caching}
+        - {Key: !Ref CostTagKey, Value: cloudfront-time-window-caching}
+
+Outputs:
+  EdgeDistributionDomain:
+    Description: Domain name of the Lambda@Edge variant (tests T2 and T9)
+    Value: !GetAtt EdgeDistribution.DomainName
+  WindowStartMin:
+    Value: !Ref WindowStartMin
+  WindowEndMin:
+    Value: !Ref WindowEndMin
+  InTtl:
+    Value: !Ref InTtl
+  OutTtl:
+    Value: !Ref OutTtl
+  RewriteErrors:
+    Value: !Ref RewriteErrors
