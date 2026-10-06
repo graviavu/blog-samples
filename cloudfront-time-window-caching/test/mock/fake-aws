@@ -45,7 +45,7 @@ case "$*" in
       case "$1" in --key) key=$2; shift ;; --value) value=$2; shift ;; delete-key) op=delete ;; esac
       shift
     done
-    echo "$(( $(date +%s) * 1000 )) $op $key $value" >> "${FAKE_KVS_LOG:-/dev/null}"
+    echo "$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000') $op $key $value" >> "${FAKE_KVS_LOG:-/dev/null}"
     echo '1' ;;
   --version) echo "aws-cli/fake" ;;
 esac
