@@ -1,0 +1,13 @@
+# local deployment state and results (may contain your distribution domain)
+deploy.env
+verify-results-*.txt
+*.env
+.env*
+
+# tooling
+node_modules/
+.venv/
+venv/
+__pycache__/
+.DS_Store
+*.log

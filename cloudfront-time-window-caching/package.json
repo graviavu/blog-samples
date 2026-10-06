@@ -1,0 +1,8 @@
+{
+  "name": "cloudfront-time-window-caching-sample",
+  "private": true,
+  "description": "Unit tests for the CloudFront time-window caching sample. No dependencies.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs && node scripts/check-function-sync.mjs && test/verify-mock.sh && test/deploy-test.sh && test/teardown-test.sh && test/seed-test.sh"
+  }
+}
