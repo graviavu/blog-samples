@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Minimal stand-in for the aws CLI, used only by the mock tests. Never talks to AWS.
+#  - records KeyValueStore writes for mock-edge.mjs ("<epoch ms> put|delete <key> <value>") and answers
+#    describe-key-value-store / describe-function
+#  - FAKE_AWS_FAIL=1: every call fails with an AccessDenied message that contains an account id and an ARN
+#    (built at run time so no such literal is stored in the repository)
+#  - deploy/teardown tests: every call is appended to $FAKE_CALLS; describe-stacks answers with $FAKE_STACK_TAG for the
+#    sample tag and with "fake-<OutputKey>" for outputs; FAKE_DEPLOY_FAIL_ON=<text> makes "cloudformation deploy" fail
+#    when its arguments contain that text (a refused policy update)
+[ -n "${FAKE_CALLS:-}" ] && echo "aws $*" >> "$FAKE_CALLS"
+
+if [ "${FAKE_AWS_FAIL:-0}" = 1 ]; then
+  acct="1234"; acct="${acct}56789012"
+  echo "An error occurred (AccessDeniedException) when calling the PutKey operation: User: arn:aws:iam::${acct}:user/someone is not authorized to perform: cloudfront-keyvaluestore:PutKey on resource: arn:aws:cloudfront::${acct}:key-value-store/abc" >&2
+  exit 254
+fi
+
+case "$*" in
+  *get-caller-identity*)
+    acct="1234"; acct="${acct}56789012"; echo "$acct" ;;
+  *describe-budgets*)
+    if [ "${FAKE_BUDGETS_DENIED:-0}" = 1 ]; then
+      acct="1234"; acct="${acct}56789012"
+      echo "An error occurred (AccessDeniedException) when calling the DescribeBudgets operation: User: arn:aws:iam::${acct}:user/someone is not authorized" >&2
+      exit 254
+    fi
+    echo "${FAKE_BUDGETS:-1}" ;;
+  *"cloudformation deploy"*)
+    if [ -n "${FAKE_DEPLOY_FAIL_ON:-}" ] && case "$*" in *"$FAKE_DEPLOY_FAIL_ON"*) true ;; *) false ;; esac; then
+      echo "Failed to create/update the stack." >&2
+      exit 1
+    fi ;;
+  *describe-stack-events*) printf 'SomePolicy\tfake reason\n' ;;
+  *describe-key-value-store*) echo "etag-1" ;;
+  *describe-function*) echo "2026-01-01T00:00:00Z" ;;
+  *describe-stacks*)
+    [ "${FAKE_NO_STACK:-0}" = 1 ] && exit 255
+    case "$*" in
+      *Tags*) printf '%s\n' "${FAKE_STACK_TAG:-}" ;;
+      *OutputKey*) k=$(printf '%s' "$*" | sed -n "s/.*OutputKey=='\([A-Za-z]*\)'.*/\1/p"); echo "fake-$k" ;;
+    esac ;;
+  *put-key*|*delete-key*)
+    key=""; value=""; op=put
+    while [ $# -gt 0 ]; do
+      case "$1" in --key) key=$2; shift ;; --value) value=$2; shift ;; delete-key) op=delete ;; esac
+      shift
+    done
+    echo "$(( $(date +%s) * 1000 )) $op $key $value" >> "${FAKE_KVS_LOG:-/dev/null}"
+    echo '1' ;;
+  --version) echo "aws-cli/fake" ;;
+esac
+exit 0
