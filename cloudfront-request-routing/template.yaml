@@ -376,8 +376,9 @@ Resources:
             // test origins (Lambda function URLs). Set it to your own domain suffix. '' disables the check.
             const BACKEND_SUFFIX = '.lambda-url.us-east-1.on.aws';
 
-            // Region of the backend function URLs. It must match BACKEND_SUFFIX. The OAC config needs it
-            // (AWS's own select-origin sample passes `region` in originAccessControlConfig).
+            // Region of the backend function URLs. It must match BACKEND_SUFFIX. The repo default (variant V2) sends it in
+            // originAccessControlConfig. The AWS parameter list for originAccessControlConfig shows no `region` field, and variant V4
+            // (without region) also worked in our run, for a us-east-1 backend. Other Regions are untested.
             const OAC_REGION = 'us-east-1';
 
             // Test variants. The template substitutes these two values from its RouteVariant parameter

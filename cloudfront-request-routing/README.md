@@ -78,7 +78,8 @@ fails if they differ; `--write` regenerates the template block).
 ## Estimated cost
 
 **A short, idle test usually costs little, but a flood of requests costs money.** CloudFront bills requests and data transfer,
-CloudFront Function invocations and KeyValueStore reads are billed per use (beyond the free tiers), and so are Lambda invocations for
+CloudFront Function invocations and KeyValueStore reads are billed per use (beyond the free tiers; the function reads the store **twice per routed
+request**, `exists()` then `get()`, so read cost is about twice the request count), and so are Lambda invocations for
 requests that reach a test origin. **Requests that the function answers with a 404 or 500 at the edge are still billed** as CloudFront
 requests plus a function invocation. Anyone who finds the `*.cloudfront.net` name can generate that traffic, which is why the budget
 alert and a quick teardown are mandatory. There are also small standing items while the stack exists (CloudWatch Logs with 3-day
@@ -243,6 +244,14 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   turns the suffix check off. **The suffix limits the kind of host in a region, not its owner:** any account's Lambda function URL in
   that region ends with the same suffix and would match, so it narrows what a bad store entry can point at but does not prove the
   backend is yours. Use your own domain suffix for real backends.
+  **Caution:** the default suffix `.lambda-url.us-east-1.on.aws` admits **any customer's** function URL in that Region, not just yours. For
+  anything beyond this test sample, allow-list exact host names or a suffix you own.
+- **Never put a shared secret in the default origin's custom headers.** Test T6b showed that a custom header configured on the default origin
+  (`x-origin-marker`) is sent to every routed backend, because settings you do not pass to `updateRequestOrigin()` are inherited. Every backend
+  in the route table receives it.
+- **Limits of the evidence.** The `hostHeader` result is 2 of 3 combinations rejected (V0, V1) and 1 accepted (V6); other combinations were not
+  tried. The direct-call 403 test (T6i) was run under the default variant V2 only. Claims about other accounts, other Regions and S3 or other
+  origin types are untested.
 - **OAC signing applies to every route.** `route.js` adds the Lambda OAC block (`originType: 'lambda'`, SigV4 `always`, `region: 'us-east-1'`) to every
   `updateRequestOrigin()` call. Anyone who points this function at non-Lambda backends (plain HTTP origins, S3, other services) must
   remove that block or set the right `originType` per route, otherwise requests will be signed for the wrong kind of origin.
@@ -272,12 +281,13 @@ for route A and route B:
 | V6 | yes | `{ enabled: false }` | public | PASS |
 
 **What this shows (observed, one run):**
-- Every failing variant sent `hostHeader`; every variant without it passed. With `hostHeader`, CloudFront accepted the call only when OAC was
-  explicitly disabled (`{ enabled: false }`, V6). It rejected it with OAC enabled (V1) and with no OAC config passed (V0).
+- Both failing variants (V0, V1) sent `hostHeader`; all four variants without it passed. Of the three combinations that contain `hostHeader`,
+  two were rejected (V0: no OAC config; V1: OAC enabled with region) and one was accepted (V6: OAC explicitly disabled with `{ enabled: false }`).
+  V0 passes no OAC config, so the default origin's OAC would be inherited; other combinations were not tried.
 - OAC for a Lambda function URL with function-based origin selection works with IAM-protected origins: with `region` (V2), without `region`
   (V4), and by inheriting the default origin's OAC (V5).
 - `hostHeader` was not needed: the backend echoed its own function URL host in the `host` field of the response. So the sample now sends no
-  `hostHeader`. `route.js` still passes `region: 'us-east-1'` (as AWS's own select-origin sample does), but this run shows it is not required.
+  `hostHeader`. `route.js` still passes `region: 'us-east-1'` in the repo default (V2); the AWS parameter list for `originAccessControlConfig` shows no `region` field and AWS's S3 select-origin sample on GitHub passes one, but variant V4 (without `region`) also worked in this run, for a us-east-1 backend. Other Regions are untested.
 
 **What is NOT established:**
 - *Why* CloudFront rejects `hostHeader` together with an enabled (or inherited) OAC, and whether that is documented behavior. The
@@ -344,7 +354,7 @@ Both tests are now reported as MEASURED; the table gives the observations, which
 | T1a | PASS. With only the path in the cache key, route B received route A's body: `Miss` then `Hit`, same request id. | The shared-cache-entry hazard is real: two routes on one path share an entry unless the routing attribute is in the cache key. |
 | T1b | PASS. With `x-backend` in the cache key, route B got origin B's body (separate entries) and route A then hit its own entry. | Adding the routing attribute to the cache policy separates the routes (for this attribute, this setup). |
 | T1c | PASS. The backend saw its own function URL host (not the viewer's), `x-test-marker` arrived, and `x-backend` reached the origin. | Without `hostHeader`, the backend sees its own host name. Headers in the cache key and the origin request policy reach the backend. |
-| T4 | MEASURED: a changed KeyValueStore value was seen after 26 s (create took 21 s) at one POP (ORD56). The function's last-modified time was unchanged, so it was not republished. | A value change goes live without republishing the function. The delay was 26 s from one location: longer than the launch blog's "a few seconds", which is not an SLA. Not a global figure. |
+| T4 | MEASURED: creating the key took 21 s to become visible; a CHANGED value became visible after 26 s at one POP (ORD56). The function's last-modified time was unchanged, so it was not republished. While the value changed, the 22 polls returned: 404 five times, the old backend once, 404 twice more, the old backend 13 more times, then the new backend on poll 22. | A value change goes live without republishing the function, here after 26 s. Transient 404s appeared even after the old backend had already answered, for a key that already existed; we do not know why. One run, one POP, so it says nothing about the distribution of delays. The AWS launch blog says "a few seconds"; at this POP the delay was longer. Expect transient 404s when you change a live key. |
 | T6a | PASS. Routed request returned 200 from origin A over the OAC-signed, HTTPS-only origin. | OAC with function-based origin selection works (variant V2). |
 | T6b | PASS. The backend received the default origin's custom header `x-origin-marker`. | Settings not passed to `updateRequestOrigin()` are inherited from the default origin, including custom headers. |
 | T6c to T6e, T6h | PASS. A stored value with a colon, an IP address, upper case, or a valid domain outside the allowed suffix returned 500 with no origin reached. | The function fails closed on bad values and enforces the suffix allow-list. |
@@ -357,8 +367,8 @@ Both tests are now reported as MEASURED; the table gives the observations, which
 **What is NOT established (updated):**
 - Why CloudFront rejects `hostHeader` with OAC (variant run), and whether that is documented. Other regions, S3 or other OAC origin types,
   and non-OAC custom origins (for which the post's `hostHeader` example may still work).
-- The KeyValueStore propagation time: one measurement from one POP (26 s). A single number says nothing about the distribution of delays,
-  other POPs, or other times of day.
+- The KeyValueStore propagation time: one measurement from one POP (26 s for a changed value, 21 s for a new key), with transient 404s during the
+  change that we cannot explain. A single run says nothing about the distribution of delays, other POPs, or other times of day.
 - Host handling on an alias domain (T8b) and Host-based routing: `CacheKeyAttribute=host` forwards the viewer Host to the origin, which a
   Lambda function URL with IAM auth may refuse. Not tested.
 - Whether T8's normalization also holds for alias domains, for HTTP/2, or for other clients. On this domain it never reached the function raw,
