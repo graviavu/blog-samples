@@ -4,16 +4,16 @@
 #
 # For each variant it updates the stack's RouteVariant (and OriginAuth) parameters, waits for UPDATE_COMPLETE, waits for
 # the function to be live, sends one routed request per backend (x-backend: route-a / route-b) and prints a table:
-# variant, routed status, x-cache value, origin seen. At the end it RESTORES the default variant V1 with IAM-protected origins.
+# variant, routed status, x-cache value, origin seen. At the end it RESTORES the default variant V2 with IAM-protected origins.
 #
 # Variants are defined in function/variants.json (V0 to V6): which fields the function passes to updateRequestOrigin().
 # Variants V0, V3 and V6 make the three test origins PUBLIC (OriginAuth=NONE) while they run, so they need the same explicit
 # consent as deploy.sh: ORIGIN_AUTH=NONE, or ACK_PUBLIC_ORIGINS=true, or --yes, or an interactive yes.
 #
-# Usage:  ./variants.sh [--yes] [V1 V2 ...]      (default order: V1 V2 V4 V5 V0 V3 V6; IAM variants first)
+# Usage:  ./variants.sh [--yes] [V2 V4 ...]      (default order: V2 V4 V5 V1 V0 V3 V6; IAM variants first)
 # Environment: STACK_NAME / CF_DOMAIN (from deploy.env), AWS_REGION (us-east-1), WAIT_CAP (240 s), SETTLE (30 s),
 #              POLL_SLEEP (5 s), RESULTS_FILE.
-# Output: a table, lines  VARIANT=V1 RESULT=PASS|FAIL DETAIL=...  and a results file (masked like verify.sh's).
+# Output: a table, lines  VARIANT=V2 RESULT=PASS|FAIL DETAIL=...  and a results file (masked like verify.sh's).
 # Only AWS error CODES are printed or logged, never AWS error text.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -55,7 +55,8 @@ V6 NONE"
 
 auth_of() { printf '%s\n' "$VARIANT_TABLE" | awk -v v="$1" '$1 == v { print $2 }'; }
 
-variants="${requested:-V1 V2 V4 V5 V0 V3 V6}"
+DEFAULT_VARIANT=V2
+variants="${requested:-V2 V4 V5 V1 V0 V3 V6}"
 needs_public=0
 for v in $variants; do
   a=$(auth_of "$v")
@@ -146,23 +147,23 @@ wait_live() {
 restore_default() {
   [ "$RESTORED" = 1 ] && return 0
   RESTORED=1
-  if [ -n "$CURRENT_VARIANT" ] && [ "$CURRENT_VARIANT" != "V1/AWS_IAM" ]; then
+  if [ -n "$CURRENT_VARIANT" ] && [ "$CURRENT_VARIANT" != "$DEFAULT_VARIANT/AWS_IAM" ]; then
     echo
-    echo "Restoring the default variant V1 with IAM-protected origins (waits for the stack update)..."
+    echo "Restoring the default variant $DEFAULT_VARIANT with IAM-protected origins (waits for the stack update)..."
     # A stack update may still be running (for example after Ctrl-C): wait for it first.
     awscall "wait (pending update)" cloudformation wait stack-update-complete --region "$REGION" --stack-name "$STACK_NAME" || true
-    if set_variant V1 AWS_IAM; then
-      CURRENT_VARIANT="V1/AWS_IAM"
-      CURRENT_VARIANT_NAME=V1; wait_live || true
+    if set_variant "$DEFAULT_VARIANT" AWS_IAM; then
+      CURRENT_VARIANT="$DEFAULT_VARIANT/AWS_IAM"
+      CURRENT_VARIANT_NAME=$DEFAULT_VARIANT; wait_live || true
       probe "restored A" route-a "/variants/$RUN/restored/a"; ra="$P_CODE/${P_ORIGIN:-none}"
       probe "restored B" route-b "/variants/$RUN/restored/b"; rb="$P_CODE/${P_ORIGIN:-none}"
       if [ "$ra" = "200/origin-a" ] && [ "$rb" = "200/origin-b" ]; then fin=PASS; else fin=FAIL; fi
-      line="VARIANT=V1 RESULT=$fin DETAIL=restored default (IAM origins); routed-A=$ra routed-B=$rb"
+      line="VARIANT=$DEFAULT_VARIANT RESULT=$fin DETAIL=restored default (IAM origins); routed-A=$ra routed-B=$rb"
       echo "$line"; log "$line"; machine="$machine$line
 "
     else
       echo "RESTORE FAILED (error code ${LAST_CODE:-unknown}). The stack may still run a test variant with PUBLIC origins." >&2
-      echo "Run ./variants.sh V1 to restore, or delete the stack with ./teardown.sh." >&2
+      echo "Run ./variants.sh $DEFAULT_VARIANT to restore, or delete the stack with ./teardown.sh." >&2
       log "RESTORE FAILED error-code=${LAST_CODE:-unknown}"
     fi
   fi
@@ -189,13 +190,13 @@ if [ "$needs_public" = 1 ]; then
     printf 'Type yes to continue: '; read -r answer
     [ "$answer" = "yes" ] || { echo "Aborted."; RESTORED=1; exit 1; }
   else
-    echo "Refusing: set ORIGIN_AUTH=NONE (or ACK_PUBLIC_ORIGINS=true, or pass --yes), or run only V1 V2 V4 V5." >&2
+    echo "Refusing: set ORIGIN_AUTH=NONE (or ACK_PUBLIC_ORIGINS=true, or pass --yes), or run only V2 V4 V5 V1." >&2
     RESTORED=1; exit 1
   fi
 fi
 
 echo "variants.sh: in-place updates of stack $STACK_NAME; raw results go to $RESULTS_FILE"
-echo "The stack is restored to V1 (IAM origins) at the end."
+echo "The stack is restored to $DEFAULT_VARIANT (IAM origins) at the end."
 printf '\n%-8s %-9s %-34s %-9s %-34s %s\n' VARIANT STATUS-A X-CACHE-A STATUS-B X-CACHE-B ORIGINS
 n_pass=0; n_fail=0; first_ok=""
 for v in $variants; do

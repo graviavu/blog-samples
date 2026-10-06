@@ -250,7 +250,7 @@ if need_route_keys T1a; then
     fi
   fi
 
-  hyp T1c "When the function sets hostHeader, the backend sees its own name as Host, not the viewer's; headers in the cache key and the origin request policy reach the backend" \
+  hyp T1c "The function sends no hostHeader (CloudFront rejected it in the real run), so the backend sees its own function URL host, not the viewer's; headers in the cache key and the origin request policy reach the backend" \
     "echoed host equals the backend domain; x-test-marker arrives; the cache-key header arrives"
   if [ -z "${T1B_FIRST_HOST:-}" ]; then
     emit T1c INCONCLUSIVE "no response from T1b to inspect"

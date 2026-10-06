@@ -17,12 +17,12 @@ const STORE = {
 
 function host(value) { return event('host', value); }
 
-test('valid route: updates the origin and hostHeader and returns the request', async () => {
+test('valid route: updates the origin (OAC, no hostHeader) and returns the request', async () => {
   const { handler, calls } = loadRoute({ store: STORE, attribute: 'host' });
   const ev = host('shop.example.com');
   const res = await handler(ev);
   assert.equal(res, ev.request);
-  assert.deepEqual(calls.updates, [{ domainName: 'origin-a.example.net', hostHeader: 'origin-a.example.net', originAccessControlConfig: OAC }]);
+  assert.deepEqual(calls.updates, [{ domainName: 'origin-a.example.net', originAccessControlConfig: OAC }]);
 });
 
 test('two hosts route to two different backends', async () => {
@@ -162,7 +162,7 @@ test('originAccessControlConfig is passed on every call and is always the same',
   assert.equal(calls.updates.length, 3);
   for (const u of calls.updates) assert.deepEqual(u.originAccessControlConfig, OAC);
   // a distinct object each time is fine, but the values must never depend on the request or the store
-  assert.deepEqual(Object.keys(calls.updates[0]).sort(), ['domainName', 'hostHeader', 'originAccessControlConfig']);
+  assert.deepEqual(Object.keys(calls.updates[0]).sort(), ['domainName', 'originAccessControlConfig']);
 });
 
 test('the OAC config does not weaken the allow-list: rejected values never reach updateRequestOrigin', async () => {
@@ -171,13 +171,14 @@ test('the OAC config does not weaken the allow-list: rejected values never reach
   assert.equal(calls.updates.length, 0);
 });
 
-test('default variant (V1) is what route.js ships: OAC with region, hostHeader set', async () => {
+test('default variant (V2) is what route.js ships: OAC with region, no hostHeader', async () => {
   const { handler, calls } = loadRoute({ store: STORE, attribute: 'host' });
   await handler(host('shop.example.com'));
   assert.deepEqual(calls.updates[0].originAccessControlConfig, OAC);
   assert.equal(calls.updates[0].originAccessControlConfig.region, 'us-east-1');
-  assert.equal(variants().V1.oacMode, 'region');
-  assert.equal(variants().V1.sendHostHeader, true);
+  assert.equal(variants().V2.oacMode, 'region');
+  assert.equal(variants().V2.sendHostHeader, false);
+  assert.equal('hostHeader' in calls.updates[0], false);
 });
 
 for (const [name, v] of Object.entries(variants())) {

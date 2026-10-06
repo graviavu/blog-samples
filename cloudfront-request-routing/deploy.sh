@@ -8,7 +8,7 @@
 #   ROUTE_ATTRIBUTE (x-backend|host)  CACHE_KEY_ATTRIBUTE (x-backend|host|none)
 #   ALIAS_A ALIAS_B CERT_ARN        all three, for the Host-based tests (aliases: lower-case a-z 0-9 . -)
 #   COST_TAG_KEY (project)
-#   ROUTE_VARIANT (V1 default; see variants.sh, only for debugging)
+#   ROUTE_VARIANT (V2 default; see variants.sh, only for debugging)
 #   ORIGIN_AUTH (AWS_IAM|NONE; default AWS_IAM)
 #   ENABLE_TEST_BEHAVIORS (true here; the template default is false)
 #   DEPLOY_EDGE=true                also deploy the optional Lambda@Edge stack; needs PUBLIC origins, so also set

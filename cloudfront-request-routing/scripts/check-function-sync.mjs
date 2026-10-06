@@ -15,7 +15,7 @@ const write = process.argv.includes('--write');
 const TARGETS = [
   { template: 'template.yaml', file: 'route.js', subs: [
       ["const ROUTE_ATTRIBUTE = 'x-backend';", "const ROUTE_ATTRIBUTE = '${RouteAttribute}';"],
-      ['const SEND_HOST_HEADER = true;', 'const SEND_HOST_HEADER = ${SendHostHeader};'],
+      ['const SEND_HOST_HEADER = false;', 'const SEND_HOST_HEADER = ${SendHostHeader};'],
       ["const OAC_MODE = 'region';", "const OAC_MODE = '${OacMode}';"],
     ] },
   { template: 'template.yaml', file: 'probe.js', subs: [] },

@@ -16,13 +16,15 @@ const BACKEND_SUFFIX = '.lambda-url.us-east-1.on.aws';
 const OAC_REGION = 'us-east-1';
 
 // Test variants. The template substitutes these two values from its RouteVariant parameter
-// (see function/variants.json and variants.sh). The values in this file are the default variant V1.
-//   SEND_HOST_HEADER: pass hostHeader to updateRequestOrigin()
+// (see function/variants.json and variants.sh). The values in this file are the default variant V2.
+//   SEND_HOST_HEADER: pass hostHeader to updateRequestOrigin(). Default false: in the observed run CloudFront rejected
+//                     (502 FunctionValidationError) every call with hostHeader unless OAC was explicitly disabled,
+//                     and the backend saw its own host name without it.
 //   OAC_MODE: 'region'   originAccessControlConfig with region (default)
 //             'noregion' originAccessControlConfig without region
 //             'off'      originAccessControlConfig { enabled: false }
 //             'none'     no originAccessControlConfig (the origin's own OAC settings are inherited)
-const SEND_HOST_HEADER = true;
+const SEND_HOST_HEADER = false;
 const OAC_MODE = 'region';
 
 function oacConfig() {
@@ -72,7 +74,7 @@ async function handler(event) {
 
   const origin = { domainName: backend };
   if (SEND_HOST_HEADER) {
-    origin.hostHeader = backend;   // the backend sees its own name, not the viewer's host
+    origin.hostHeader = backend;   // variants only; see the note above
   }
   const oac = oacConfig();
   if (oac) {

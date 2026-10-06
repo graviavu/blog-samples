@@ -52,11 +52,12 @@ Parameters:
       for the verify run. verify.sh reports INCONCLUSIVE for T1a and T8 when this is false.
   RouteVariant:
     Type: String
-    Default: V1
+    Default: V2
     AllowedValues: [V0, V1, V2, V3, V4, V5, V6]
     Description: >-
       Test variant of how the function calls updateRequestOrigin() (see function/variants.json and variants.sh).
-      V1 is the default and the only one to keep. Other values exist to find which field CloudFront rejects.
+      V2 is the default and the only one to keep. Other values exist to find which field CloudFront rejects
+      (observed: hostHeader makes CloudFront reject the call unless OAC is explicitly disabled).
       V0, V3 and V6 only work with OriginAuth=NONE (public origins); V1, V2, V4 and V5 need AWS_IAM.
   OriginAuth:
     Type: String
@@ -380,8 +381,10 @@ Resources:
             const OAC_REGION = 'us-east-1';
 
             // Test variants. The template substitutes these two values from its RouteVariant parameter
-            // (see function/variants.json and variants.sh). The values in this file are the default variant V1.
-            //   SEND_HOST_HEADER: pass hostHeader to updateRequestOrigin()
+            // (see function/variants.json and variants.sh). The values in this file are the default variant V2.
+            //   SEND_HOST_HEADER: pass hostHeader to updateRequestOrigin(). Default false: in the observed run CloudFront rejected
+            //                     (502 FunctionValidationError) every call with hostHeader unless OAC was explicitly disabled,
+            //                     and the backend saw its own host name without it.
             //   OAC_MODE: 'region'   originAccessControlConfig with region (default)
             //             'noregion' originAccessControlConfig without region
             //             'off'      originAccessControlConfig { enabled: false }
@@ -436,7 +439,7 @@ Resources:
 
               const origin = { domainName: backend };
               if (SEND_HOST_HEADER) {
-                origin.hostHeader = backend;   // the backend sees its own name, not the viewer's host
+                origin.hostHeader = backend;   // variants only; see the note above
               }
               const oac = oacConfig();
               if (oac) {

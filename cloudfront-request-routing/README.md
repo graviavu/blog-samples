@@ -47,11 +47,13 @@ certificate are optional parameters, are never committed, and cost nothing extra
 
 ### Differences from the code in the post
 
-`function/route.js` is the post's function with four small changes, all marked in the file:
+`function/route.js` is the post's function with five small changes, all marked in the file:
 (1) `ROUTE_ATTRIBUTE` chooses which request header is the key (`host` is the post's behavior);
 (2) a missing or empty attribute returns 404 instead of throwing;
 (3) an empty key after normalization returns 404;
-(4) a stored value must also end with `BACKEND_SUFFIX` (allow-list, see Safety notes). The template deploys exactly this file (`node scripts/check-function-sync.mjs`
+(4) a stored value must also end with `BACKEND_SUFFIX` (allow-list, see Safety notes);
+(5) it does **not** pass `hostHeader` (the post's example does): in the observed run CloudFront rejected the call with `hostHeader`
+(see "Observed results" below), and the backend sees its own host name without it. The template deploys exactly this file (`node scripts/check-function-sync.mjs`
 fails if they differ; `--write` regenerates the template block).
 
 ## Before you deploy (mandatory)
@@ -221,11 +223,10 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
   `originAccessControlConfig: { enabled: true, region: 'us-east-1', signingBehavior: 'always', signingProtocol: 'sigv4', originType: 'lambda' }` on every
   `updateRequestOrigin()` call. The AWS documentation for `updateRequestOrigin()` lists these properties and lists Lambda function URLs as a
   supported origin type, and says an OAC set on the call applies to the new origin (its only worked example is S3). The documentation
-  also describes the Lambda function URL OAC setup (auth `AWS_IAM`, two permissions, HTTPS-only origin). **But AWS has no Lambda-specific
-  example of the combination "function-based origin selection plus OAC for a Lambda function URL", and the docs are ambiguous about how
-  the signing is bound when the origin is not defined in the distribution.** So this is unproven until the first deployment. Tests
-  **T6a** (routed call returns 200 from the right backend) and **T6i** (a direct, unsigned call to each function URL returns 403 while the
-  routed call through CloudFront returns 200) confirm or refute it. The template itself has only been checked with cfn-lint, not deployed.
+  also describes the Lambda function URL OAC setup (auth `AWS_IAM`, two permissions, HTTPS-only origin). **AWS has no Lambda-specific example of the combination "function-based origin selection plus OAC for a Lambda function URL", and
+  the docs are ambiguous about how the signing is bound when the origin is not defined in the distribution.** In one real run (see
+  "Observed results") it worked: a direct, unsigned call to each function URL returned 403 while the routed call through CloudFront
+  returned 200 from the right backend. Tests **T6a** and **T6i** repeat that check in the full verification.
 - **If T6a or T6i fails, fallback.** If the routed call fails (403 from the backend) the combination does not work as assumed. Then either
   (a) redeploy with `ORIGIN_AUTH=NONE` (public test origins) and accept the exposure for the short life of the stack, optionally also
   setting reserved concurrency on the three Lambda functions in the console to bound abuse, or (b) keep IAM auth only for backends defined
@@ -252,46 +253,57 @@ for names starting with `cfrouting`. If you changed `NamePrefix` or `STACK_NAME`
 - Do not run it in a production account. Delete it when done.
 - Not covered: an S3 (origin access control) default origin. The post's S3 inheritance question (part of T6) stays open.
 
-## If routed requests fail with 502 FunctionValidationError
+## Observed results of the variant run (run 2026-10-06, single run, one vantage point)
 
-**What the first real run found.** After the first deployment, every routed request returned `502` with
-`x-cache: FunctionValidationError from cloudfront` and the body "The CloudFront function returned an invalid value for origin rewrite."
-(also on `/control/*`). The direct calls to all three function URLs were refused with 403 (the lock works), and the error-path tests
-(T6c to T6h: bad stored values, unknown key, missing key) passed. So CloudFront rejected the object that `route.js` passed to
-`updateRequestOrigin()`. The version deployed in that run passed `originAccessControlConfig` **without a `region` property** (and also
-`hostHeader`); AWS's own sample
-([select-origin-based-on-country](https://github.com/aws-samples/amazon-cloudfront-functions/blob/main/select-origin-based-on-country/index.js))
-passes `region` inside `originAccessControlConfig`. `route.js` now includes `region: 'us-east-1'` (constant `OAC_REGION`, next to
-`BACKEND_SUFFIX`). **Whether that is the fix is to be confirmed by `variants.sh`. Nothing is claimed fixed until a run reports it.**
+The first deployment returned `502` with `x-cache: FunctionValidationError from cloudfront` on every routed request (body: "The CloudFront
+function returned an invalid value for origin rewrite."), while direct calls to the function URLs were refused with 403 and the error-path
+tests passed. `variants.sh` then ran seven variants of the `updateRequestOrigin()` call against the same stack, one backend request each
+for route A and route B:
 
-**Find the invalid field in one session, without redeploying.** `variants.sh` updates the existing stack in place, one variant at a
-time (parameter `RouteVariant`; the variants are defined in `function/variants.json`), waits for the update and for the function to be
-live, sends one routed request per backend, and prints a table with the status, the `x-cache` value and the origin seen:
+| Variant | `hostHeader` | `originAccessControlConfig` | Origins | Observed |
+|---|---|---|---|---|
+| V0 | yes | not passed | public | **FAIL**: 502 FunctionValidationError |
+| V1 | yes | `enabled`, `region`, `always`, `sigv4`, `lambda` | IAM | **FAIL**: 502 FunctionValidationError |
+| V2 (default now) | no | `enabled`, `region`, `always`, `sigv4`, `lambda` | IAM | PASS: 200 from the right backend (`Miss from cloudfront`) |
+| V3 | no | not passed | public | PASS |
+| V4 | no | like V2 but without `region` | IAM | PASS |
+| V5 | no | not passed (the default origin's OAC is inherited) | IAM | PASS |
+| V6 | yes | `{ enabled: false }` | public | PASS |
 
-| Variant | `hostHeader` | `originAccessControlConfig` | Origins |
-|---|---|---|---|
-| V1 (default) | yes | `enabled`, `region`, `always`, `sigv4`, `lambda` | IAM |
-| V2 | no | same as V1 | IAM |
-| V4 | no | like V1 but without `region` (the first run's config) | IAM |
-| V5 | no | not passed (the default origin's OAC settings are inherited) | IAM |
-| V0 | yes | not passed (the post's code as written) | public |
-| V3 | no | not passed | public |
-| V6 | yes | `{ enabled: false }` | public |
+**What this shows (observed, one run):**
+- Every failing variant sent `hostHeader`; every variant without it passed. With `hostHeader`, CloudFront accepted the call only when OAC was
+  explicitly disabled (`{ enabled: false }`, V6). It rejected it with OAC enabled (V1) and with no OAC config passed (V0).
+- OAC for a Lambda function URL with function-based origin selection works with IAM-protected origins: with `region` (V2), without `region`
+  (V4), and by inheriting the default origin's OAC (V5).
+- `hostHeader` was not needed: the backend echoed its own function URL host in the `host` field of the response. So the sample now sends no
+  `hostHeader`. `route.js` still passes `region: 'us-east-1'` (as AWS's own select-origin sample does), but this run shows it is not required.
 
-V0, V3 and V6 temporarily make the three test origins **public** and ask for the same consent as `deploy.sh` (`ORIGIN_AUTH=NONE`,
-`ACK_PUBLIC_ORIGINS=true`, `--yes`, or typing `yes`). At the end the script **restores V1 with IAM-protected origins**. It prints only AWS
-error codes, masks its results file like `verify.sh`, and ends with lines such as `VARIANT=V1 RESULT=PASS DETAIL=...`.
+**What is NOT established:**
+- *Why* CloudFront rejects `hostHeader` together with an enabled (or inherited) OAC, and whether that is documented behavior. The
+  `updateRequestOrigin()` documentation describes `hostHeader` for custom origins; I found nothing that says it conflicts with OAC.
+  Treat it as an observation, not a rule.
+- Other regions, S3 or other OAC origin types, non-OAC custom origins (for which the post's `hostHeader` example may still be fine), and
+  whether the result is stable over time or across edge locations.
+- Whether `hostHeader` is needed when the viewer `Host` header is forwarded to the origin (for example `CacheKeyAttribute=host`): the
+  forwarded viewer Host would then reach the Lambda function URL and may be refused. Not tested yet.
+- The default route was restored to V2 after this run; the full verification (`verify.sh`) has not yet been run against V2.
+
+**Troubleshooting 502 FunctionValidationError ("invalid value for origin rewrite").** Remove `hostHeader` from the call first (`ROUTE_VARIANT=V2`, the
+default). To find the offending field on your own stack without redeploying, `variants.sh` updates the stack in place, one variant at a time
+(parameter `RouteVariant`, table in `function/variants.json`), waits for the update and for the function to be live, sends one routed request per
+backend, prints a table of status, `x-cache` and origin seen, and **restores V2 with IAM-protected origins at the end**. V0, V3 and V6 temporarily
+make the three test origins **public** and ask for the same consent as `deploy.sh` (`ORIGIN_AUTH=NONE`, `ACK_PUBLIC_ORIGINS=true`, `--yes`, or typing
+`yes`). It prints only AWS error codes, masks its results file like `verify.sh`, and ends with lines such as `VARIANT=V2 RESULT=PASS DETAIL=...`.
 
 ```bash
 cd cloudfront-request-routing
-git pull                        # get this branch's template, which has the RouteVariant parameter
-./variants.sh --yes             # all variants, in place; or: ./variants.sh V1 V2 V4 V5   (IAM variants only, no consent needed)
-./verify.sh                     # then run the full verification again with the restored default
+git pull                        # the template has the RouteVariant parameter
+./variants.sh V2                # put the stack on the default variant (IAM origins, no consent needed); then ./verify.sh
+./variants.sh --yes             # all variants in place (V0, V3, V6 make the origins public while they run)
 ```
 
-How to read it: if V0 or V3 pass, routing itself works and the problem is in the OAC settings; if V1 passes the `region` was missing;
-if only V2 passes `hostHeader` is the problem for signed origins; if every variant returns 502 the problem is not in these fields.
-If no IAM variant works but V0 or V3 do, use the fallback in Safety notes (public origins for the short life of the stack).
+Read the table: if V3 or V6 pass but IAM variants fail, routing works and the problem is in the OAC settings (fallback in Safety notes); if every
+variant returns 502 the problem is not in these fields.
 
 ## What each test settles
 
@@ -302,7 +314,7 @@ The post: [Route to many backends with CloudFront alone](https://blog.ar-logs.co
 |---|---|---|---|
 | T1a | With only the path in the cache key, do two routes on the same path share one cache entry? (the documented default key) | "Neither the viewer Host nor the chosen backend is in [the cache key]" | `/control/*` behavior |
 | T1b | Does adding the routing attribute to the cache policy separate the routes? Rerun with `CACHE_KEY_ATTRIBUTE=none` to see the hazard. | "Add the Host header (or the attribute you route on) to the cache policy" | nothing |
-| T1c | Which Host does the backend see when the function sets `hostHeader` and the attribute is in the cache key? Does the origin request policy reach the backend? | "Which Host the backend then sees ... is not yet confirmed by a test (T1)" | nothing |
+| T1c | Which Host does the backend see when the function sends no `hostHeader` (it was rejected in the variant run) and the attribute is in the cache key? Does the origin request policy reach the backend? | "Which Host the backend then sees ... is not yet confirmed by a test (T1)" | nothing |
 | T4 | Is a changed KeyValueStore value live at the edge without republishing, and how many seconds does it take (from one vantage point)? | "AWS says updates reach the edge in a few seconds (not yet confirmed by a test)" | AWS CLI v2 |
 | T6i | With IAM-protected origins, is a direct unsigned call to each function URL refused (403) while the routed call through CloudFront works (OAC with function-based origin selection)? | not in the post; confirms the sample's lock-down | `OriginAuth=AWS_IAM` |
 | T6a, T6b | Does a routed request work (including the OAC signing) with the settings inherited from the default custom origin, including its custom header? | "settings you omit are inherited from the origin the behavior would have used" | nothing |
@@ -318,7 +330,7 @@ prerequisite). Limits: T4 times a single vantage point, not a global measurement
 
 ## Results
 
-*Not run yet.* The deployment test results will be added here after the stack has been deployed and `verify.sh` has been run:
+*Full verification not run yet on the current default (V2).* The variant run is reported above. The `verify.sh` results will be added here after the stack has been deployed and `verify.sh` has been run:
 date, parameters, the machine-readable lines, and the conclusion for each claim.
 
 ## Development (no AWS needed)
@@ -328,7 +340,7 @@ cd cloudfront-request-routing
 node --test test/*.test.mjs          # unit tests for the function code with a stub for the 'cloudfront' module
 node scripts/check-function-sync.mjs # templates embed exactly function/*.js
 test/verify-mock.sh                  # runs verify.sh against a local mock (tests the script, not CloudFront), including result redaction
-test/variants-test.sh                # variants.sh against the mock (table, restore of V1, consent, error-code-only output)
+test/variants-test.sh                # variants.sh against the mock (table, restore of V2, consent, error-code-only output)
 test/deploy-test.sh                  # deploy.sh guards (budget check, public-origins confirmation) with a fake aws CLI
 test/teardown-test.sh                # teardown.sh guards (tag check, confirmation, env precedence) with a fake aws CLI
 cfn-lint template.yaml template-lambda-edge.yaml   # pip install cfn-lint
