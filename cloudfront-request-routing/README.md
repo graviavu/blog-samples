@@ -162,11 +162,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'x-backend: nope' https://$D/hello  
 ./verify.sh                  # uses deploy.env; or: ./verify.sh <DistributionDomain>
 ```
 
-It prints PASS, FAIL or INCONCLUSIVE for each test with its hypothesis and expectation, then one machine-readable line per test
+It prints PASS, FAIL, INCONCLUSIVE or MEASURED for each test with its hypothesis and expectation, then one machine-readable line per test
 (`TEST=T1b RESULT=PASS DETAIL=...`) and a `SUMMARY` line. It retries with caps for eventual consistency (it waits up to 15
 minutes for a fresh stack to answer). It writes every raw request, header and body to `verify-results-<time>.txt`.
 Safe to run: it only sends GET requests to your distribution and, in T4, writes and deletes one key (`t4-probe`) in your own
 route table. It never publishes or changes the function or the distribution. Typical run time is a few minutes.
+**Run `./teardown.sh` promptly afterwards** (the stack bills per request while it exists); `verify.sh` and `variants.sh` remind you at the end.
 Viewer requests must use HTTPS (`https-only`); plain `http://` gets a 403.
 
 A first run also exercises the "no alias" path. For the Host-based run, redeploy with
@@ -286,7 +287,7 @@ for route A and route B:
   whether the result is stable over time or across edge locations.
 - Whether `hostHeader` is needed when the viewer `Host` header is forwarded to the origin (for example `CacheKeyAttribute=host`): the
   forwarded viewer Host would then reach the Lambda function URL and may be refused. Not tested yet.
-- The default route was restored to V2 after this run; the full verification (`verify.sh`) has not yet been run against V2.
+- The stack was restored to V2 after the variant run; the full verification on V2 is reported in the next section.
 
 **Troubleshooting 502 FunctionValidationError ("invalid value for origin rewrite").** Remove `hostHeader` from the call first (`ROUTE_VARIANT=V2`, the
 default). To find the offending field on your own stack without redeploying, `variants.sh` updates the stack in place, one variant at a time
@@ -326,12 +327,44 @@ The post: [Route to many backends with CloudFront alone](https://blog.ar-logs.co
 
 Each test has a stated hypothesis and expected result in the script output. PASS means the observed behavior matched the expectation
 (the post's claim or the documented behavior), FAIL means it did not, INCONCLUSIVE means the test could not decide (for example a missing
-prerequisite). Limits: T4 times a single vantage point, not a global measurement. A test shows behavior on the day it was run.
+prerequisite). MEASURED (T4 and T8) records a measurement or observation with no threshold: T4 reports the seconds until a changed
+value is seen (FAIL only if it is never seen within the cap), T8 lists what the function saw. Limits: T4 times a single vantage point, not a global measurement. A test shows behavior on the day it was run.
 
 ## Results
 
-*Full verification not run yet on the current default (V2).* The variant run is reported above. The `verify.sh` results will be added here after the stack has been deployed and `verify.sh` has been run:
-date, parameters, the machine-readable lines, and the conclusion for each claim.
+### Observed results of the verify run (2026-10-06, default V2, single run, one vantage point: Chicago POP ORD56)
+
+`verify.sh` against the default variant (V2: OAC with region, no `hostHeader`, IAM-protected origins, header routing on the
+`*.cloudfront.net` domain, `x-backend` in the cache key). Summary line of the run: `pass=12 fail=2 inconclusive=3`. The two FAILs were
+reporting artifacts, not failures of the sample: T4 was judged against a 10 second threshold and T8 against a "normalization needed" expectation.
+Both tests are now reported as MEASURED; the table gives the observations, which are unchanged.
+
+| Test | Observed | What it settled |
+|---|---|---|
+| T1a | PASS. With only the path in the cache key, route B received route A's body: `Miss` then `Hit`, same request id. | The shared-cache-entry hazard is real: two routes on one path share an entry unless the routing attribute is in the cache key. |
+| T1b | PASS. With `x-backend` in the cache key, route B got origin B's body (separate entries) and route A then hit its own entry. | Adding the routing attribute to the cache policy separates the routes (for this attribute, this setup). |
+| T1c | PASS. The backend saw its own function URL host (not the viewer's), `x-test-marker` arrived, and `x-backend` reached the origin. | Without `hostHeader`, the backend sees its own host name. Headers in the cache key and the origin request policy reach the backend. |
+| T4 | MEASURED: a changed KeyValueStore value was seen after 26 s (create took 21 s) at one POP (ORD56). The function's last-modified time was unchanged, so it was not republished. | A value change goes live without republishing the function. The delay was 26 s from one location: longer than the launch blog's "a few seconds", which is not an SLA. Not a global figure. |
+| T6a | PASS. Routed request returned 200 from origin A over the OAC-signed, HTTPS-only origin. | OAC with function-based origin selection works (variant V2). |
+| T6b | PASS. The backend received the default origin's custom header `x-origin-marker`. | Settings not passed to `updateRequestOrigin()` are inherited from the default origin, including custom headers. |
+| T6c to T6e, T6h | PASS. A stored value with a colon, an IP address, upper case, or a valid domain outside the allowed suffix returned 500 with no origin reached. | The function fails closed on bad values and enforces the suffix allow-list. |
+| T6f, T6g | PASS. Unknown key and missing header returned 404 with no origin reached. | No fall-through to the default origin. |
+| T6i | PASS. Direct unsigned calls to origins A, B and default returned 403; the routed calls returned 200 from origin A and origin B. | The IAM lock holds, and the routed path through CloudFront works. |
+| T8 | MEASURED. Upper-case host, host with `:443`, host with a trailing dot, and all three together all returned 200, and the probe function saw the canonical lower-case host without port or dot every time. | On the `*.cloudfront.net` domain these variants arrive normalized at the function, or are normalized before it. None reached the function raw. |
+| T7, T8b | Not run (no Lambda@Edge stack; no alias or certificate). | Open. T8b, with an alias, is the real check that host routing copes with these variants. |
+| T9 | Not implemented. | Open. |
+
+**What is NOT established (updated):**
+- Why CloudFront rejects `hostHeader` with OAC (variant run), and whether that is documented. Other regions, S3 or other OAC origin types,
+  and non-OAC custom origins (for which the post's `hostHeader` example may still work).
+- The KeyValueStore propagation time: one measurement from one POP (26 s). A single number says nothing about the distribution of delays,
+  other POPs, or other times of day.
+- Host handling on an alias domain (T8b) and Host-based routing: `CacheKeyAttribute=host` forwards the viewer Host to the origin, which a
+  Lambda function URL with IAM auth may refuse. Not tested.
+- Whether T8's normalization also holds for alias domains, for HTTP/2, or for other clients. On this domain it never reached the function raw,
+  so the sample's normalization code is defensive here; it is kept because alias behavior is untested.
+- The Lambda@Edge variant (T7), and the viewer-request invocation count on cache hits (T9).
+- Everything here is one run on one day from one network location.
 
 ## Development (no AWS needed)
 

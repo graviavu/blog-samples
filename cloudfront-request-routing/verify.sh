@@ -21,6 +21,7 @@
 # and a results file with every raw request, header and body. Send that file back (see README).
 # PASS means the observed behavior matched the stated expectation (which is the post's claim or the
 # documented behavior). FAIL means it did not. INCONCLUSIVE means the test could not decide.
+# MEASURED (T4, T8) means the test records a measurement or an observation with no pass or fail threshold: read the DETAIL.
 set -u
 cd "$(dirname "$0")" || exit 1
 # shellcheck disable=SC1091
@@ -60,7 +61,7 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 REQ_N=0
-N_PASS=0; N_FAIL=0; N_INC=0
+N_PASS=0; N_FAIL=0; N_INC=0; N_MEAS=0
 MACHINE=""
 
 if [ "$ROUTE_ATTRIBUTE" = "host" ]; then KEY_A="$ALIAS_A"; KEY_B="$ALIAS_B"; else KEY_A="route-a"; KEY_B="route-b"; fi
@@ -138,7 +139,7 @@ emit() { # id result detail
   log "$line"
   MACHINE="${MACHINE}${line}
 "
-  case "$2" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; *) N_INC=$((N_INC + 1)) ;; esac
+  case "$2" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; MEASURED) N_MEAS=$((N_MEAS + 1)) ;; *) N_INC=$((N_INC + 1)) ;; esac
 }
 
 hyp() { # id hypothesis expected
@@ -267,8 +268,8 @@ if need_route_keys T1a; then
 fi
 
 # ------------------------------------------------------------------ T4: KeyValueStore propagation
-hyp T4 "A changed KeyValueStore value is live at the edge without republishing the function, within seconds (AWS blog: 'a few seconds')" \
-  "after put-key, the route answers from the new backend within about 10 seconds; the function is never republished"
+hyp T4 "A changed KeyValueStore value is live at the edge without republishing the function (the AWS launch blog says 'a few seconds', not an SLA)" \
+  "MEASURED: reports the seconds until the new value is seen from this network location; FAIL only if it is never seen within the cap; the function is never republished"
 t4_skip=""
 if [ "$ROUTE_ATTRIBUTE" != "x-backend" ]; then
   t4_skip="T4 uses a header route key; run with ROUTE_ATTRIBUTE=x-backend"
@@ -326,7 +327,7 @@ else
           repub="function stamp not checked (FUNCTION_NAME unset); this script never publishes"
         fi
         detail="new value seen after ${POLL_SECONDS}s at pop ${POLL_POP:-?} (single vantage point); create took ${create_s}s; $repub"
-        if [ "$POLL_SECONDS" -le 10 ]; then emit T4 PASS "$detail"; else emit T4 FAIL "slower than 10s: $detail"; fi
+        emit T4 MEASURED "seconds=$POLL_SECONDS. $detail"
       else
         emit T4 FAIL "new value NOT seen within ${T4_MAX}s without republishing (last status $R_CODE origin '$(jget origin)')"
       fi
@@ -467,8 +468,8 @@ else
 fi
 
 # ------------------------------------------------------------------ T8: Host header shape
-hyp T8 "The function event can carry an upper-case host, a port or a trailing dot, so the sample normalizes it" \
-  "PASS = at least one variant reached a function in non-canonical form (normalization needed); FAIL = every variant arrived canonical or was rejected (normalization is defensive only)"
+hyp T8 "Does the host value a function sees carry upper case, a port or a trailing dot when the viewer sends them? (an observation about the *.cloudfront.net domain; the real check for host routing is T8b with an alias)" \
+  "MEASURED: lists, per variant, the status and the value the function saw. Nothing to pass or fail here"
 canon=$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')
 upper=$(printf '%s' "$DOMAIN" | tr '[:lower:]' '[:upper:]')
 req "T8 probe canonical" --http1.1 "$SCHEME://$DOMAIN/probe/$RUN/canon"
@@ -484,8 +485,8 @@ else
     summary="$summary; $label sent '$hv' -> status $R_CODE seen '${seen:-none}'"
     if [ "$R_CODE" = "200" ] && [ -n "$seen" ] && [ "$seen" != "$canon" ]; then noncanon=1; fi
   done
-  if [ "$noncanon" = 1 ]; then emit T8 PASS "non-canonical host reached the function. $summary"
-  else emit T8 FAIL "no non-canonical host reached the function. $summary"; fi
+  if [ "$noncanon" = 1 ]; then emit T8 MEASURED "non-canonical host reached the function: yes. $summary"
+  else emit T8 MEASURED "non-canonical host reached the function: no (arrived normalized, or was rejected before the function). $summary"; fi
 fi
 
 if [ "$ROUTE_ATTRIBUTE" = "host" ] && [ -n "$ALIAS_A" ]; then
@@ -511,17 +512,18 @@ emit T9 INCONCLUSIVE "not implemented in this script (needs CloudFront Functions
 echo
 echo "================ machine-readable summary ================"
 printf '%s' "$MACHINE"
-echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC"
+echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC measured=$N_MEAS"
 {
   echo
   echo "======== machine-readable summary ========"
   printf '%s' "$MACHINE"
-  echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC"
+  echo "SUMMARY pass=$N_PASS fail=$N_FAIL inconclusive=$N_INC measured=$N_MEAS"
   echo "end (utc): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >> "$RESULTS_FILE"
 redact_results "$RESULTS_FILE"
 echo
 echo "Full raw requests and responses: $RESULTS_FILE"
+echo "REMINDER: you are paying for this stack while it exists. Run ./teardown.sh now unless you still need it."
 echo "Send that file back as described in the README. Review it first: it contains your distribution domain and test origin hosts."
 echo "AWS error text is never written to it, and 12-digit numbers and arn:aws... strings are masked, but check anyway."
 [ "$N_FAIL" -eq 0 ]

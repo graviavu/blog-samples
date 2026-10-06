@@ -234,4 +234,5 @@ printf '%s' "$machine"
 echo "SUMMARY variants-pass=$n_pass variants-fail=$n_fail first-passing=${first_ok:-none}"
 log "SUMMARY variants-pass=$n_pass variants-fail=$n_fail first-passing=${first_ok:-none}"
 echo "Results file: $RESULTS_FILE (masked; review it, then send it back)."
+echo "REMINDER: you are paying for this stack while it exists. Run ./teardown.sh as soon as you are done."
 [ "$n_pass" -gt 0 ]
