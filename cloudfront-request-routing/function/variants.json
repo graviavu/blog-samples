@@ -1,0 +1,9 @@
+{
+  "V0": { "sendHostHeader": true,  "oacMode": "none",     "originAuth": "NONE",    "note": "post as written: no originAccessControlConfig, hostHeader set; public origins; observed: REJECTED" },
+  "V1": { "sendHostHeader": true,  "oacMode": "region",   "originAuth": "AWS_IAM", "note": "OAC config with region, hostHeader set; observed: REJECTED (502 FunctionValidationError)" },
+  "V2": { "sendHostHeader": false, "oacMode": "region",   "originAuth": "AWS_IAM", "note": "DEFAULT: OAC config with region, no hostHeader; observed: works" },
+  "V3": { "sendHostHeader": false, "oacMode": "none",     "originAuth": "NONE",    "note": "V0 without hostHeader; public origins" },
+  "V4": { "sendHostHeader": false, "oacMode": "noregion", "originAuth": "AWS_IAM", "note": "OAC config without region (the first deploy's config) and no hostHeader" },
+  "V5": { "sendHostHeader": false, "oacMode": "none",     "originAuth": "AWS_IAM", "note": "no OAC config, no hostHeader: rely on the default origin's OAC being inherited" },
+  "V6": { "sendHostHeader": true,  "oacMode": "off",      "originAuth": "NONE",    "note": "OAC explicitly disabled ({enabled:false}), hostHeader set; public origins" }
+}

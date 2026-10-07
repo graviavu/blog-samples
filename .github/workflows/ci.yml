@@ -1,0 +1,76 @@
+name: ci
+
+# Only pull_request and push to main. No secrets are used. Never pull_request_target.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # cfn-lint is installed into a throwaway venv; PyPI wheels are not hash-pinned.
+  CFN_LINT_VERSION: "1.57.1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: lint, unit tests, shellcheck, secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Secret and account id scan
+        run: scripts/scan-ids.sh
+
+      - name: Unit tests (node, no dependencies)
+        working-directory: cloudfront-request-routing
+        run: |
+          node --version
+          node --test test/*.test.mjs
+
+      - name: Templates contain the function code
+        working-directory: cloudfront-request-routing
+        run: node scripts/check-function-sync.mjs
+
+      - name: Install cfn-lint (pinned version, throwaway venv)
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/cfn-venv"
+          "${RUNNER_TEMP}/cfn-venv/bin/pip" install --quiet "cfn-lint==${CFN_LINT_VERSION}"
+
+      - name: cfn-lint
+        working-directory: cloudfront-request-routing
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint template.yaml template-lambda-edge.yaml"
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws
+
+      - name: verify.sh against the local mock (tests the script, not CloudFront)
+        working-directory: cloudfront-request-routing
+        run: test/verify-mock.sh
+
+      - name: variants.sh against the local mock and a fake aws CLI
+        working-directory: cloudfront-request-routing
+        run: test/variants-test.sh
+
+      - name: deploy.sh guards (budget check, public origins) against a fake aws CLI
+        working-directory: cloudfront-request-routing
+        run: test/deploy-test.sh
+
+      - name: teardown.sh guards against a fake aws CLI
+        working-directory: cloudfront-request-routing
+        run: test/teardown-test.sh
