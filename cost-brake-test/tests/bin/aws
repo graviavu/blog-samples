@@ -15,8 +15,28 @@ if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT%%:*}" ]; then
   n=$(( $(get "sig_$cmd" 0) + 1 )); put "sig_$cmd" "$n"
   if [ "$n" = "${STUB_SIG_AT##*:}" ]; then signal_main "$STUB_SIG"; fi
 fi
+# --- CloudFormation model -------------------------------------------------------------------------------------------
+# An accepted update-stack does NOT apply at once: the stack is UPDATE_IN_PROGRESS (describe-stacks already shows the new
+# parameter value, like the real API) for STUB_UPDATE_DELAY (2) more describe-stacks calls, or until "wait" is called.
+# Then it ends in UPDATE_COMPLETE, or - for the n-th update with STUB_WAIT_FAIL=n - in UPDATE_ROLLBACK_COMPLETE with the value
+# it had BEFORE that update, or - with STUB_ROLLBACK_FAILED=n - in UPDATE_ROLLBACK_FAILED. While a stack is *_IN_PROGRESS or
+# UPDATE_ROLLBACK_FAILED, update-stack is rejected like CloudFormation does. STUB_FOREIGN_UPDATE=n: just before the n-th
+# update-stack call somebody else starts an update (it settles after 2 polls and does not change RequestsPer5Min).
+stack_status() { get stack_status "${STUB_STACK_STATUS:-UPDATE_COMPLETE}"; }
+stack_settle() {   # one step of a running update
+  local left end
+  case "$(stack_status)" in *_IN_PROGRESS) ;; *) return 0 ;; esac
+  [ -e "$S/upd_left" ] || return 0   # in progress with no end (STUB_STACK_STATUS=UPDATE_IN_PROGRESS)
+  left="$(get upd_left 0)"
+  if [ "$left" -gt 0 ]; then put upd_left $((left - 1)); return 0; fi
+  rm -f "$S/upd_left"; end="$(get upd_end UPDATE_COMPLETE)"
+  case "$end" in UPDATE_ROLLBACK_COMPLETE) put threshold "$(get upd_old)" ;; esac
+  put stack_status "$end"
+}
+acct12() { printf '%s%s' 1234 56789012; }
 case "$svc $cmd" in
   "cloudformation describe-stacks")
+    stack_settle
     # Parameters come from the state file "threshold" (changed by update-stack). STUB_EXTRA_PARAMS=1 adds more parameters,
     # like a real stack: one NoEcho (the real API shows ****), one with an e-mail value, one number.
     extra=""
@@ -24,11 +44,19 @@ case "$svc $cmd" in
       extra=',{"ParameterKey":"AlertEmail","ParameterValue":"alerts@example.invalid"},{"ParameterKey":"ApiSecretToken","ParameterValue":"****"},{"ParameterKey":"MonthlyBudgetUsd","ParameterValue":"20"}'
     fi
     cat <<JSON
-{"Stacks":[{"StackStatus":"${STUB_STACK_STATUS:-UPDATE_COMPLETE}","Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"$(get threshold "${STUB_THRESHOLD-10000}")"}$extra],
+{"Stacks":[{"StackStatus":"$(stack_status)","Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"$(get threshold "${STUB_THRESHOLD-10000}")"}$extra],
 "Outputs":[{"OutputKey":"AlarmNames","OutputValue":"fake-stack-RequestsAlarm-X,fake-stack-BytesAlarm-Y"},{"OutputKey":"FunctionName","OutputValue":"$FN_NAME"}]}]}
 JSON
     ;;
   "cloudformation update-stack")
+    uc=$(( $(get upd_calls 0) + 1 )); put upd_calls "$uc"
+    if [ "$uc" = "${STUB_FOREIGN_UPDATE:-}" ]; then
+      put stack_status UPDATE_IN_PROGRESS; put upd_left 2; put upd_end UPDATE_COMPLETE; put upd_old "$(get threshold "${STUB_THRESHOLD-10000}")"
+    fi
+    case "$(stack_status)" in
+      *_IN_PROGRESS|UPDATE_ROLLBACK_FAILED)
+        echo "An error occurred (ValidationError) when calling the UpdateStack operation: Stack:arn:aws:cloudformation:us-east-1:$(acct12):stack/fake-stack/x is in $(stack_status) state and can not be updated." >&2; exit 254 ;;
+    esac
     # STUB_UPDATE_FAIL_FROM=n: the n-th and every later update-stack call fails (a restore that keeps failing).
     if [ -n "${STUB_UPDATE_FAIL_FROM:-}" ]; then
       un=$(( $(get n_upd 0) + 1 )); put n_upd "$un"
@@ -46,16 +74,41 @@ JSON
       [ "$on" = 1 ] || continue
       k="${x#ParameterKey=}"; k="${k%%,*}"; seen="$seen $k"
       if [ "$k" = RequestsPer5Min ]; then
-        case "$x" in *,ParameterValue=*) put threshold "${x##*,ParameterValue=}" ;; *) echo "stub: RequestsPer5Min needs a value" >&2; exit 254 ;; esac
+        case "$x" in *,ParameterValue=*) newv="${x##*,ParameterValue=}" ;; *) echo "stub: RequestsPer5Min needs a value" >&2; exit 254 ;; esac
       else
         case "$x" in "ParameterKey=$k,UsePreviousValue=true") ;; *) echo "stub: parameter $k must be UsePreviousValue=true, got: $x" >&2; exit 254 ;; esac
       fi
     done
     for k in $keys; do case " $seen " in *" $k "*) ;; *) echo "stub: parameter $k omitted (would reset to its default)" >&2; exit 254 ;; esac; done
+    old="$(get threshold "${STUB_THRESHOLD-10000}")"
+    if [ "$newv" = "$old" ]; then echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; fi
+    end=UPDATE_COMPLETE
+    if [ "$uc" = "${STUB_WAIT_FAIL:-}" ]; then end=UPDATE_ROLLBACK_COMPLETE; fi
+    if [ "$uc" = "${STUB_ROLLBACK_FAILED:-}" ]; then end=UPDATE_ROLLBACK_FAILED; fi
+    put upd_old "$old"; put threshold "$newv"; put upd_end "$end"; put upd_left "${STUB_UPDATE_DELAY:-2}"; put stack_status UPDATE_IN_PROGRESS
     echo '{"StackId":"stub"}' ;;
   "cloudformation wait")
-    if [ "${STUB_WAIT_FAIL:-0}" = 1 ]; then echo "Waiter StackUpdateComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi
+    # like the CLI waiter: poll until the update ends; UPDATE_COMPLETE is success, a rollback is a terminal failure
+    i=0
+    while case "$(stack_status)" in *_IN_PROGRESS) true ;; *) false ;; esac; do
+      i=$((i + 1)); if [ "$i" -gt 20 ]; then echo "Waiter StackUpdateComplete failed: Max attempts exceeded" >&2; exit 255; fi
+      stack_settle
+    done
+    st="$(stack_status)"
+    if [ "$st" != UPDATE_COMPLETE ]; then echo "Waiter StackUpdateComplete failed: Waiter encountered a terminal failure state: For expression \"Stacks[].StackStatus\" we matched expected path: \"$st\" at least once" >&2; exit 255; fi
     ;;
+  "cloudwatch get-metric-statistics")
+    # Requests sums per 5 minutes for the last 24 h. STUB_PEAK (default 4) is the highest; "none" = no datapoints;
+    # STUB_PEAK_FAIL=1 = AccessDenied. The call itself must be the one the README documents.
+    for want in "--namespace AWS/CloudFront" "--metric-name Requests" "--dimensions Name=DistributionId,Value=$D Name=Region,Value=Global" "--period 300" "--statistics Sum"; do
+      case " $* " in *" $want "*) ;; *) echo "stub: get-metric-statistics without '$want'" >&2; exit 254 ;; esac
+    done
+    span="$(jq -rn --arg a "$(arg --start-time "$@")" --arg b "$(arg --end-time "$@")" '($b | fromdateiso8601) - ($a | fromdateiso8601)' 2>/dev/null)" || span=bad
+    if [ "$span" != 86400 ]; then echo "stub: get-metric-statistics window is not 24 h (got $span)" >&2; exit 254; fi
+    if [ -n "${STUB_PEAK_FAIL:-}" ]; then echo "An error occurred (AccessDenied) when calling the GetMetricStatistics operation: User: arn:aws:sts::$(acct12):assumed-role/x is not authorized" >&2; exit 254; fi
+    pk="${STUB_PEAK-4}"
+    if [ "$pk" = none ]; then echo '{"Label":"Requests","Datapoints":[]}'
+    else echo "{\"Label\":\"Requests\",\"Datapoints\":[{\"Timestamp\":\"2026-10-08T10:00:00Z\",\"Sum\":1.0,\"Unit\":\"None\"},{\"Timestamp\":\"2026-10-08T10:05:00Z\",\"Sum\":$pk,\"Unit\":\"None\"},{\"Timestamp\":\"2026-10-08T10:10:00Z\",\"Sum\":2.0,\"Unit\":\"None\"}]}"; fi ;;
   "cloudfront get-distribution-config")
     en=$(get enabled "${STUB_INIT_ENABLED:-true}")
     case "$*" in
@@ -100,7 +153,12 @@ JSON
       case "$nm" in
         *RequestsAlarm*)
           a=$(get alarm "${STUB_ALARM_INIT:-OK}")
-          if [ "$a" = ALARM ]; then
+          # STUB_ALARM_HOLD_LOW=1: a tripped alarm only clears once RequestsPer5Min is high again (>= 1000), like the
+          # real alarm that keeps seeing the flooded window above a low threshold. STUB_ALARM_STUCK=1: it never clears.
+          hold=0
+          if [ "${STUB_ALARM_STUCK:-0}" = 1 ]; then hold=1; fi
+          if [ "${STUB_ALARM_HOLD_LOW:-0}" = 1 ] && [ "$(get threshold "${STUB_THRESHOLD-10000}")" -lt 1000 ]; then hold=1; fi
+          if [ "$a" = ALARM ] && [ "$hold" = 0 ]; then
             left=$(get alarm_ok_after 0)
             if [ "$left" -gt 0 ]; then put alarm_ok_after $((left - 1)); if [ "$left" = 1 ]; then put alarm OK; a=OK; fi; fi
           fi
