@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls the scripts make; anything else exits 99.
+. "$(dirname "$0")/stub-lib.sh"
+[ "$1" = "--region" ] && shift 2
+svc="$1"; cmd="$2"; shift 2
+D="${STUB_DIST:-EFAKETEST1234}"
+echo "$svc $cmd $*" >> "$S/calls.log"
+if [ -n "${STUB_FAIL_NTH:-}" ] && [ "$cmd" = "${STUB_FAIL_NTH%%:*}" ]; then
+  n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
+  if [ "$n" = "${STUB_FAIL_NTH##*:}" ]; then acct="$(printf '%s%s' 1234 56789012)"; echo "stub: simulated failure of $cmd (arn:aws:iam::$acct:role/x, account $acct, dist $D, host dfaketest.cloudfront.net)" >&2; exit 254; fi
+fi
+arg() { local k="$1"; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
+# STUB_SIG=INT|TERM and STUB_SIG_AT=<command>:<n>: signal the script during the n-th call of that command.
+if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT%%:*}" ]; then
+  n=$(( $(get "sig_$cmd" 0) + 1 )); put "sig_$cmd" "$n"
+  if [ "$n" = "${STUB_SIG_AT##*:}" ]; then signal_main "$STUB_SIG"; fi
+fi
+# --- CloudFormation model -------------------------------------------------------------------------------------------
+# An accepted update-stack does NOT apply at once: the stack is UPDATE_IN_PROGRESS (describe-stacks already shows the new
+# parameter value, like the real API) for STUB_UPDATE_DELAY (2) more describe-stacks calls, or until "wait" is called.
+# Then it ends in UPDATE_COMPLETE, or - for the n-th update with STUB_WAIT_FAIL=n - in UPDATE_ROLLBACK_COMPLETE with the value
+# it had BEFORE that update, or - with STUB_ROLLBACK_FAILED=n - in UPDATE_ROLLBACK_FAILED. While a stack is *_IN_PROGRESS or
+# UPDATE_ROLLBACK_FAILED, update-stack is rejected like CloudFormation does. STUB_FOREIGN_UPDATE=n: just before the n-th
+# update-stack call somebody else starts an update (it settles after 2 polls and does not change RequestsPer5Min).
+stack_status() { get stack_status "${STUB_STACK_STATUS:-UPDATE_COMPLETE}"; }
+stack_settle() {   # one step of a running update
+  local left end
+  case "$(stack_status)" in *_IN_PROGRESS) ;; *) return 0 ;; esac
+  [ -e "$S/upd_left" ] || return 0   # in progress with no end (STUB_STACK_STATUS=UPDATE_IN_PROGRESS)
+  left="$(get upd_left 0)"
+  if [ "$left" -gt 0 ]; then put upd_left $((left - 1)); return 0; fi
+  rm -f "$S/upd_left"; end="$(get upd_end UPDATE_COMPLETE)"
+  case "$end" in UPDATE_ROLLBACK_COMPLETE) put threshold "$(get upd_old)" ;; esac
+  put stack_status "$end"
+}
+acct12() { printf '%s%s' 1234 56789012; }
+case "$svc $cmd" in
+  "cloudformation describe-stacks")
+    stack_settle
+    # Parameters come from the state file "threshold" (changed by update-stack). STUB_EXTRA_PARAMS=1 adds more parameters,
+    # like a real stack: one NoEcho (the real API shows ****), one with an e-mail value, one number.
+    extra=""
+    if [ "${STUB_EXTRA_PARAMS:-0}" = 1 ]; then
+      extra=',{"ParameterKey":"AlertEmail","ParameterValue":"alerts@example.invalid"},{"ParameterKey":"ApiSecretToken","ParameterValue":"****"},{"ParameterKey":"MonthlyBudgetUsd","ParameterValue":"20"}'
+    fi
+    cat <<JSON
+{"Stacks":[{"StackStatus":"$(stack_status)","Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"$(get threshold "${STUB_THRESHOLD-10000}")"}$extra],
+"Outputs":[{"OutputKey":"AlarmNames","OutputValue":"fake-stack-RequestsAlarm-X,fake-stack-BytesAlarm-Y"},{"OutputKey":"FunctionName","OutputValue":"$FN_NAME"}]}]}
+JSON
+    ;;
+  "cloudformation update-stack")
+    uc=$(( $(get upd_calls 0) + 1 )); put upd_calls "$uc"
+    if [ "$uc" = "${STUB_FOREIGN_UPDATE:-}" ]; then
+      put stack_status UPDATE_IN_PROGRESS; put upd_left 2; put upd_end UPDATE_COMPLETE; put upd_old "$(get threshold "${STUB_THRESHOLD-10000}")"
+    fi
+    case "$(stack_status)" in
+      *_IN_PROGRESS|UPDATE_ROLLBACK_FAILED)
+        echo "An error occurred (ValidationError) when calling the UpdateStack operation: Stack:arn:aws:cloudformation:us-east-1:$(acct12):stack/fake-stack/x is in $(stack_status) state and can not be updated." >&2; exit 254 ;;
+    esac
+    # STUB_UPDATE_FAIL_FROM=n: the n-th and every later update-stack call fails (a restore that keeps failing).
+    if [ -n "${STUB_UPDATE_FAIL_FROM:-}" ]; then
+      un=$(( $(get n_upd 0) + 1 )); put n_upd "$un"
+      if [ "$un" -ge "$STUB_UPDATE_FAIL_FROM" ]; then echo "An error occurred (AccessDenied) when calling the UpdateStack operation: not authorized" >&2; exit 254; fi
+    fi
+    # Like CloudFormation: a parameter that is neither given nor UsePreviousValue would silently fall back to its template
+    # default, so the stub refuses anything but RequestsPer5Min with a value and every other parameter with UsePreviousValue=true.
+    case " $* " in *" --use-previous-template "*) ;; *) echo "stub: update-stack without --use-previous-template" >&2; exit 254 ;; esac
+    case " $* " in *" --capabilities CAPABILITY_IAM "*) ;; *) echo "stub: update-stack without --capabilities CAPABILITY_IAM" >&2; exit 254 ;; esac
+    if [ "${STUB_UPDATE_NOCHANGE:-0}" = 1 ]; then echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; fi
+    keys="DistributionId ActionOnTrip RequestsPer5Min"; [ "${STUB_EXTRA_PARAMS:-0}" = 1 ] && keys="$keys AlertEmail ApiSecretToken MonthlyBudgetUsd"
+    on=0; seen=""
+    for x in "$@"; do
+      case "$x" in --parameters) on=1; continue ;; --*) on=0 ;; esac
+      [ "$on" = 1 ] || continue
+      k="${x#ParameterKey=}"; k="${k%%,*}"; seen="$seen $k"
+      if [ "$k" = RequestsPer5Min ]; then
+        case "$x" in *,ParameterValue=*) newv="${x##*,ParameterValue=}" ;; *) echo "stub: RequestsPer5Min needs a value" >&2; exit 254 ;; esac
+      else
+        case "$x" in "ParameterKey=$k,UsePreviousValue=true") ;; *) echo "stub: parameter $k must be UsePreviousValue=true, got: $x" >&2; exit 254 ;; esac
+      fi
+    done
+    for k in $keys; do case " $seen " in *" $k "*) ;; *) echo "stub: parameter $k omitted (would reset to its default)" >&2; exit 254 ;; esac; done
+    old="$(get threshold "${STUB_THRESHOLD-10000}")"
+    if [ "$newv" = "$old" ]; then echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; fi
+    end=UPDATE_COMPLETE
+    if [ "$uc" = "${STUB_WAIT_FAIL:-}" ]; then end=UPDATE_ROLLBACK_COMPLETE; fi
+    if [ "$uc" = "${STUB_ROLLBACK_FAILED:-}" ]; then end=UPDATE_ROLLBACK_FAILED; fi
+    put upd_old "$old"; put threshold "$newv"; put upd_end "$end"; put upd_left "${STUB_UPDATE_DELAY:-2}"; put stack_status UPDATE_IN_PROGRESS
+    echo '{"StackId":"stub"}' ;;
+  "cloudformation wait")
+    # like the CLI waiter: poll until the update ends; UPDATE_COMPLETE is success, a rollback is a terminal failure
+    i=0
+    while case "$(stack_status)" in *_IN_PROGRESS) true ;; *) false ;; esac; do
+      i=$((i + 1)); if [ "$i" -gt 20 ]; then echo "Waiter StackUpdateComplete failed: Max attempts exceeded" >&2; exit 255; fi
+      stack_settle
+    done
+    st="$(stack_status)"
+    if [ "$st" != UPDATE_COMPLETE ]; then echo "Waiter StackUpdateComplete failed: Waiter encountered a terminal failure state: For expression \"Stacks[].StackStatus\" we matched expected path: \"$st\" at least once" >&2; exit 255; fi
+    ;;
+  "cloudwatch get-metric-statistics")
+    # Requests sums per 5 minutes for the last 24 h. STUB_PEAK (default 4) is the highest; "none" = no datapoints;
+    # STUB_PEAK_FAIL=1 = AccessDenied. The call itself must be the one the README documents.
+    for want in "--namespace AWS/CloudFront" "--metric-name Requests" "--dimensions Name=DistributionId,Value=$D Name=Region,Value=Global" "--period 300" "--statistics Sum"; do
+      case " $* " in *" $want "*) ;; *) echo "stub: get-metric-statistics without '$want'" >&2; exit 254 ;; esac
+    done
+    span="$(jq -rn --arg a "$(arg --start-time "$@")" --arg b "$(arg --end-time "$@")" '($b | fromdateiso8601) - ($a | fromdateiso8601)' 2>/dev/null)" || span=bad
+    if [ "$span" != 86400 ]; then echo "stub: get-metric-statistics window is not 24 h (got $span)" >&2; exit 254; fi
+    if [ -n "${STUB_PEAK_FAIL:-}" ]; then echo "An error occurred (AccessDenied) when calling the GetMetricStatistics operation: User: arn:aws:sts::$(acct12):assumed-role/x is not authorized" >&2; exit 254; fi
+    pk="${STUB_PEAK-4}"
+    if [ "$pk" = none ]; then echo '{"Label":"Requests","Datapoints":[]}'
+    else echo "{\"Label\":\"Requests\",\"Datapoints\":[{\"Timestamp\":\"2026-10-08T10:00:00Z\",\"Sum\":1.0,\"Unit\":\"None\"},{\"Timestamp\":\"2026-10-08T10:05:00Z\",\"Sum\":$pk,\"Unit\":\"None\"},{\"Timestamp\":\"2026-10-08T10:10:00Z\",\"Sum\":2.0,\"Unit\":\"None\"}]}"; fi ;;
+  "cloudfront get-distribution-config")
+    en=$(get enabled "${STUB_INIT_ENABLED:-true}")
+    case "$*" in
+      *"DistributionConfig.Enabled"*)
+        lag=$(get lag 0); if [ "$lag" -gt 0 ]; then put lag $((lag - 1)); en=$(get prev_enabled true); fi
+        if [ "$en" = true ]; then echo True; else echo False; fi ;;
+      *) echo "{\"ETag\":\"$(get etag ETAG1)\",\"DistributionConfig\":{\"Comment\":\"fake\",\"Enabled\":$en}}" ;;
+    esac ;;
+  "cloudfront get-distribution")
+    case "$*" in
+      *"Distribution.Status"*)
+        p=$(get pending 0)
+        if [ "$p" -gt 0 ]; then put pending $((p - 1)); echo InProgress; else echo Deployed; fi ;;
+      *) echo "{\"Distribution\":{\"DomainName\":\"dfaketest.cloudfront.net\",\"Status\":\"Deployed\",\"DistributionConfig\":{\"Aliases\":{\"Quantity\":1,\"Items\":[\"${STUB_ALIAS:-blog.fake-host.example}\"]}}}}" ;;
+    esac ;;
+  "lambda get-function-configuration")
+    if [ "$(arg --function-name "$@")" != "$FN_NAME" ]; then echo "stub: ResourceNotFoundException: function not found" >&2; exit 254; fi
+    case "$*" in *LoggingConfig.LogGroup*) echo "${STUB_LG_ANSWER-$LOG_GROUP_REAL}" ;; *) echo '{}' ;; esac ;;
+  "cloudfront update-distribution")
+    if [ "${STUB_PRECOND_ONCE:-0}" = 1 ] && [ "$(get precond_done 0)" = 0 ]; then
+      put precond_done 1; put etag ETAG2   # somebody else changed the config: our ETag is stale
+      echo "An error occurred (PreconditionFailed) when calling the UpdateDistribution operation: The If-Match version is missing or not valid" >&2; exit 254
+    fi
+    if [ "$(arg --if-match "$@")" != "$(get etag ETAG1)" ]; then echo "An error occurred (PreconditionFailed): stale ETag" >&2; exit 254; fi
+    f="$(arg --distribution-config "$@")"; f="${f#file://}"
+    set_enabled "$(jq -r '.Enabled' "$f")"; put pending 2; echo '{}' ;;
+  "cloudwatch set-alarm-state")
+    st="$(arg --state-value "$@")"
+    put alarm "$st"; put reason "$(arg --state-reason "$@")"
+    if [ "$st" = ALARM ]; then lambda_runs; fi
+    case "${STUB_INT:-0}" in 1|INT) signal_main INT ;; TERM) signal_main TERM ;; READER) signal_main READER ;; esac ;;
+  "cloudwatch describe-alarms")
+    # --alarm-names takes several names. The requests alarm keeps its state in files; the bytes alarm is
+    # STUB_BYTES_ALARM (default OK) with reason STUB_BYTES_REASON.
+    names=""; on=0
+    for x in "$@"; do
+      case "$x" in --alarm-names) on=1; continue ;; --*) on=0 ;; esac
+      if [ "$on" = 1 ]; then names="$names $x"; fi
+    done
+    out=""
+    for nm in $names; do
+      case "$nm" in
+        *RequestsAlarm*)
+          a=$(get alarm "${STUB_ALARM_INIT:-OK}")
+          # STUB_ALARM_HOLD_LOW=1: a tripped alarm only clears once RequestsPer5Min is high again (>= 1000), like the
+          # real alarm that keeps seeing the flooded window above a low threshold. STUB_ALARM_STUCK=1: it never clears.
+          hold=0
+          if [ "${STUB_ALARM_STUCK:-0}" = 1 ]; then hold=1; fi
+          if [ "${STUB_ALARM_HOLD_LOW:-0}" = 1 ] && [ "$(get threshold "${STUB_THRESHOLD-10000}")" -lt 1000 ]; then hold=1; fi
+          if [ "$a" = ALARM ] && [ "$hold" = 0 ]; then
+            left=$(get alarm_ok_after 0)
+            if [ "$left" -gt 0 ]; then put alarm_ok_after $((left - 1)); if [ "$left" = 1 ]; then put alarm OK; a=OK; fi; fi
+          fi
+          r="$(get reason "${STUB_ALARM_REASON:-none}")" ;;
+        *) a="${STUB_BYTES_ALARM:-OK}"; r="${STUB_BYTES_REASON:-none}" ;;
+      esac
+      out="$out${out:+,}{\"AlarmName\":\"$nm\",\"StateValue\":\"$a\",\"StateReason\":\"$r\"}"
+    done
+    echo "{\"MetricAlarms\":[$out]}" ;;
+  "cloudwatch describe-alarm-history")
+    # Real CloudWatch answers in the caller's local offset; default -05:00 (the offset seen on the real run).
+    off="${STUB_TS_OFFSET:--05:00}"
+    case "$off" in Z) osec=0 ;; *) sign=1; [ "${off%"${off#?}"}" = "-" ] && sign=-1; o="${off#?}"; osec=$(( sign * (10#${o%%:*} * 3600 + 10#${o##*:} * 60) )) ;; esac
+    iso_at() { local e=$(( $1 + osec )); date -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%S; }
+    if [ -n "${STUB_HIST_FAIL:-}" ]; then acct="$(printf '%s%s' 1234 56789012)"; echo "An error occurred (AccessDenied) when calling the DescribeAlarmHistory operation: User: arn:aws:sts::$acct:assumed-role/x is not authorized" >&2; exit 254; fi
+    if [ -n "${STUB_HIST_AT:-}" ]; then
+      # fixed history, newest first: an OK->ALARM entry at STUB_HIST_AT, an ALARM->OK a minute later, and an older ALARM entry an hour before
+      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$(iso_at $((STUB_HIST_AT + 60))).500000$off\",\"HistorySummary\":\"Alarm updated from ALARM to OK\"},{\"Timestamp\":\"$(iso_at "$STUB_HIST_AT").217000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"},{\"Timestamp\":\"$(iso_at $((STUB_HIST_AT - 3600))).100000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
+    elif [ "$(get alarm OK)" = ALARM ] || [ "$(get lambda_fired 0)" = 1 ]; then
+      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$(iso_at "$(date +%s)").123000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
+    else echo '{"AlarmHistoryItems":[]}'; fi ;;
+  "logs filter-log-events")
+    # Only the real log group exists; any other name fails like AWS does.
+    # STUB_LG_LAZY=1: like AWS, the group only exists after the Lambda's first run (first log line).
+    if [ "$(arg --log-group-name "$@")" != "$LOG_GROUP_REAL" ] || { [ "${STUB_LG_LAZY:-0}" = 1 ] && [ ! -s "$S/events" ]; }; then
+      echo "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist." >&2; exit 254
+    fi
+    st="$(arg --start-time "$@")"; en="$(arg --end-time "$@")"
+    if [ -s "$S/events" ]; then
+      case "$*" in
+        *--no-paginate*)
+          # real behavior: the first page can be EMPTY with a nextToken; the matching events are on a later page
+          echo '{"events":[],"searchedLogStreams":[],"nextToken":"tok-page-2"}' ;;
+        *)
+          # the CLI follows nextToken itself and merges the pages
+          jq -Rn --argjson st "$st" --argjson en "${en:-0}" '{events: [inputs | split("\t") | select((.[0] | tonumber) >= $st and ($en == 0 or (.[0] | tonumber) <= $en)) | {logStreamName: "s", timestamp: (.[0] | tonumber), message: .[1], eventId: "e"}]}' < "$S/events" ;;
+      esac
+    else echo '{"events":[],"searchedLogStreams":[]}'; fi ;;
+  *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
+esac

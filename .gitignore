@@ -11,3 +11,6 @@ venv/
 __pycache__/
 .DS_Store
 *.log
+
+# cost-brake-test results (hold timings and ids)
+results-*.txt
