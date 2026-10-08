@@ -24,6 +24,21 @@ It tests a stack with: an SNS topic, a requests alarm and a bytes alarm, a Lambd
 - Only `us-east-1`. The script refuses any other region.
 - No credentials are in the scripts. Account ids, ARNs, the distribution id and your site host are redacted from the screen summary and the results file.
 
+## All in one
+
+In CloudShell (us-east-1), after `export STACK_NAME=...` and `export SITE_URL=https://<your blog host>`:
+
+```
+tmux new -s brake
+./test-disable-enable.sh --dry-run
+./flood-test.sh --dry-run
+./flood-test.sh
+```
+
+1. `tmux new -s brake` keeps the run alive if the browser tab drops (reconnect with `tmux attach -t brake`).
+2. The two `--dry-run` commands only read and print their plan (`flood-test.sh` also prints the exact `update-stack` parameters it would use). Read them.
+3. `./flood-test.sh` is the whole real-traffic test: it lowers `RequestsPer5Min` (default 100), runs `flood.sh` (N=300), **always puts the threshold back** (also when `flood.sh` fails or you press Ctrl-C), proves it by reading it back, and prints the `flood.sh` `TEST=` lines plus `threshold_lowered` and `threshold_restored`. The forced-alarm test (`./test-disable-enable.sh`, see below) is separate.
+
 ## Run it in CloudShell
 
 Open AWS CloudShell in **us-east-1** (it has the aws CLI, jq, curl). Copy this folder there (or `git clone` the repo), then:
@@ -61,25 +76,25 @@ With `AlertOnly` it fires the alarm and checks for `ALERT_WAIT` seconds (default
 | `LOG_CHECK_EVERY` | 30 | while polling the distribution, look for `not confirmed` in the Lambda log at most this often (a log group that does not exist yet is not an error) |
 | `RETRY_PAUSE` | 10 | seconds between those attempts |
 | `RESULTS_DIR` | `.` | where `results-<UTC>.txt` is written (mode 600, git-ignored) |
-| `N`, `BATCH` | 300, 50 | `flood.sh` only. `N` at most 2000 and at most `3 x RequestsPer5Min + 100`; `BATCH` at most 50 |
+| `THRESHOLD` | 100 | `flood-test.sh` only: the low `RequestsPer5Min` during the test (below N) |
+| `N`, `BATCH` | 300, 50 | `flood.sh` and `flood-test.sh`. `N` at most 2000 and at most `3 x RequestsPer5Min + 100`; `BATCH` at most 50 |
 
-## Optional: a real request burst (`flood.sh`)
+## Optional: a real request burst (`flood-test.sh`, which runs `flood.sh`)
 
 `test-disable-enable.sh` forces the alarm state, so it does not prove that real traffic reaches the metric. `flood.sh` does:
 it sends N requests (default 300) with curl in parallel batches, and measures request, metric, alarm, disable.
+It needs `RequestsPer5Min` below N, so use the one script that does the whole procedure:
 
-1. Lower the threshold below N. CloudFormation, the stack, Update, Use existing template, change parameter `RequestsPer5Min`
-   (for example to `100`). CLI equivalent:
-   ```
-   aws cloudformation update-stack --region us-east-1 --stack-name "$STACK_NAME" --use-previous-template \
-     --capabilities CAPABILITY_IAM --parameters ParameterKey=RequestsPer5Min,ParameterValue=100 \
-     <ParameterKey=...,UsePreviousValue=true for every other parameter of the stack>
-   ```
-   The console is easier because it keeps the other parameters.
-2. `N=300 ./flood.sh` (dry run first with `--dry-run`). It refuses if `RequestsPer5Min` is empty, not a number, or not below N, if N is more than `3 x RequestsPer5Min + 100`, or if the alarm is not `OK`. `SITE_URL` may contain a path (kept) and a query (dropped; the script adds `?cbt=...`).
-3. **Put `RequestsPer5Min` back** to its normal value (default 10000) the same way. Do not forget this: a low threshold trips on real visitors.
+```
+STACK_NAME=<stack> SITE_URL=https://<your blog host> ./flood-test.sh --dry-run   # reads only, prints the plan and the exact update-stack parameters
+STACK_NAME=<stack> SITE_URL=https://<your blog host> ./flood-test.sh             # THRESHOLD=100 N=300 by default
+```
 
-In `Disable` mode the script waits for the alarm to return to OK before restoring, otherwise the same busy 5-minute window would trip it again, so the site stays down a few minutes longer.
+In order: (1) preflight: `STACK_NAME` and `SITE_URL` are required, region `us-east-1` only, `aws`, `jq` and `curl` must exist; it reads the stack and shows `RequestsPer5Min`, `ActionOnTrip`, the distribution (last 4 characters only) and what will happen, and you type `FLOOD <last 4 characters of the distribution id>` (with `Disable` the site goes down). (2) `aws cloudformation update-stack --use-previous-template --capabilities CAPABILITY_IAM` with `ParameterKey=RequestsPer5Min,ParameterValue=<THRESHOLD>` and `UsePreviousValue=true` for **every other parameter** (the list is built from `describe-stacks`; no other value is read or sent, so NoEcho and secret parameters are safe), then `aws cloudformation wait stack-update-complete`, then it reads the value back. If the update fails, or CloudFormation reports no changes, it stops and says so (nothing was changed, `flood.sh` is not run). (3) `./flood.sh` runs as it is, and its exit code is forwarded (in `Disable` mode it asks for its own `DISABLE <last 4>` phrase and the optional email minute). (4) The threshold is **always** put back, by a trap on exit, Ctrl-C, SIGTERM and SIGHUP (SIGPIPE ignored, same pattern as `lib.sh`), also when `flood.sh` fails: update-stack, wait, then it reads `RequestsPer5Min` again to prove it. If that fails (two attempts) it prints a loud warning with the exact command to run by hand, and exits with code `5` (or keeps a non-zero code that was already set). (5) The final summary has the `flood.sh` `TEST=` lines plus `threshold_lowered` and `threshold_restored`.
+
+Before it lowers anything it also prints the restore command, so if your session dies you can paste it. `THRESHOLD` must be below N and N at most `3 x THRESHOLD + 100`; the stack must be in `CREATE_COMPLETE`, `UPDATE_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`. `flood.sh`'s own results file goes to `flood-<UTC>/` inside `RESULTS_DIR`. While the threshold is low, **real visitors can trip the brake too**, so run it when that is acceptable. Running `flood.sh` alone still works (lower the threshold in the console first and put it back afterwards); it refuses if `RequestsPer5Min` is empty, not a number, or not below N, if N is more than `3 x RequestsPer5Min + 100`, or if the alarm is not `OK`. `SITE_URL` may contain a path (kept) and a query (dropped; the script adds `?cbt=...`).
+
+In `Disable` mode `flood.sh` waits for the alarm to return to OK before restoring, otherwise the same busy 5-minute window would trip it again, so the site stays down a few minutes longer.
 
 ### `--evidence-only`: re-check the evidence of an earlier run
 
@@ -113,6 +128,7 @@ Exit codes (both scripts):
 | `1` | at least one `FAIL`, or a refusal before anything changed (site not healthy, alarm not OK, host mismatch) |
 | `2` | bad input (option, region, URL, number out of range) |
 | `3` | the typed phrase did not match; nothing was changed |
+| `5` | `flood-test.sh` only: `flood.sh` passed but `RequestsPer5Min` could not be put back (read the warning, run the printed command) |
 | `4` | `Disable` mode: no `FAIL`, but at least one `INCONCLUSIVE`, so the brake was not proven. Read the lines and run again |
 | `129`, `130`, `143` | stopped by SIGHUP, Ctrl-C or SIGTERM (the restore still ran unless `--no-auto-restore`) |
 
@@ -130,6 +146,7 @@ Exit codes (both scripts):
 | `alarm_reset` | the forced alarm was set back to OK (a real alarm is never touched) |
 | `restore_guard` | `--restore-only` only: restored although an alarm was in ALARM without this test's marker |
 | `flood_sent`, `alarm_in_alarm`, `alarm_back_to_ok` | `flood.sh` only: requests sent, seconds until the alarm tripped on its own, seconds until it cleared |
+| `threshold_lowered`, `threshold_restored` | `flood-test.sh` only: `RequestsPer5Min` was lowered and read back; it is back to the original value (`SKIPPED` when it was never changed) |
 
 ### How to read the timing
 
@@ -174,7 +191,14 @@ check those associations with the caller's rights: for example `wafv2:GetWebACL`
 naming such an action, add it read-only for that resource. The brake Lambda's own role already does this update, so its
 policy is a good reference.
 
-Only for the `flood.sh` threshold change (step 1 of the flood section, which you can also do in the console with another identity): `cloudformation:UpdateStack` on that stack plus the rights CloudFormation needs to update the stack's resources (including `iam:PassRole` and the IAM actions for the Lambda role, because `--capabilities CAPABILITY_IAM` is used). That is close to admin for that stack, so use a separate identity for it.
+For `flood-test.sh` (the threshold change) add, for the same stack: `cloudformation:UpdateStack` and `cloudformation:DescribeStacks` (the wait `aws cloudformation wait stack-update-complete` polls `DescribeStacks`), plus the rights CloudFormation needs to update the stack's resources (including `iam:PassRole` and the IAM actions for the Lambda role, because `--capabilities CAPABILITY_IAM` is used; `cloudwatch:PutMetricAlarm` for the alarms, `lambda:UpdateFunctionConfiguration` and similar). Example for the first part:
+
+```
+{ "Effect": "Allow", "Action": ["cloudformation:UpdateStack", "cloudformation:DescribeStacks"],
+  "Resource": "arn:aws:cloudformation:us-east-1:<account-id>:stack/<stack-name>/*" }
+```
+
+The resource rights are close to admin for that stack, so use a separate identity for it, or do the change in the console and run `flood.sh` alone.
 
 This policy was written from the AWS API names and was **not tested against a real account** (the scripts were developed against stubs only). Start with `--dry-run` and an `AlertOnly` run.
 
@@ -188,7 +212,7 @@ This policy was written from the AWS API names and was **not tested against a re
 ## Tests of the scripts themselves
 
 `tests/run.sh` runs both scripts against a fake `aws` and `curl` (shell stubs in `tests/bin`): disable, alert-only, restore-only,
-dry-run, an AWS error mid-run, Ctrl-C, `--no-auto-restore`, refusals, flood and its guards, redaction. The stubs behave like the real stack where it matters:
+dry-run, an AWS error mid-run, Ctrl-C, `--no-auto-restore`, refusals, flood and its guards, redaction, and `flood-test.sh` (dry run without writes, lowered then restored, `flood.sh` failing, Ctrl-C and SIGTERM, a failing or no-op update-stack, a failing restore, a stack with several parameters including a NoEcho one). The stubs behave like the real stack where it matters:
 an auto-generated function name, a log group that only exists under its real name (and only after the first Lambda run), alarm-history timestamps with `-05:00` (default), `+05:30`, `-08:00` and `Z` offsets, `filter-log-events` pages (an empty first page with a `nextToken`),
 a forced alarm that reverts (`not confirmed`), a real trip during the retries, a stale ETag (`PreconditionFailed`), a non-OK alarm, a bytes alarm in a real ALARM, a wildcard alias,
 a redirecting site, very long Lambda logs, an `Enabled` read that lags behind the update, and output piped into a reader that dies with the Ctrl-C. No AWS account and no network needed.
