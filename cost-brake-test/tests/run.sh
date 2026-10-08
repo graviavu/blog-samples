@@ -5,7 +5,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 export PATH="$here/bin:$PATH"
-export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1 RETRY_PAUSE=3
+export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1 RETRY_PAUSE=3 LOG_CHECK_EVERY=0
 export STACK_NAME=fake-stack SITE_URL=https://blog.fake-host.example
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cbt.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 PASS=0 FAIL=0
@@ -16,7 +16,7 @@ check() { # description, then a command; passes when the command succeeds
 }
 has()    { grep -q -- "$2" "$1"; }
 hasnot() { ! grep -q -- "$2" "$1"; }
-state()  { cat "$STUB_DIR/$1" 2>/dev/null || { [ "$1" = enabled ] && echo true; }; }
+state()  { cat "$STUB_DIR/$1" 2>/dev/null || { [ "$1" = enabled ] && echo "${STUB_INIT_ENABLED:-true}"; }; }
 
 # run NAME "stdin text" script args...   -> sets RC, OUT (stdout+stderr file), RES (results file), STUB_DIR
 run() {
@@ -29,7 +29,35 @@ run() {
 }
 reset_env() {
   unset STUB_ACTION STUB_LAMBDA STUB_BREAK STUB_INIT_ENABLED STUB_FAIL_NTH STUB_INT STUB_FLOOD_AT STUB_THRESHOLD \
-    STUB_ALARM_INIT STUB_REVERT STUB_LG_ANSWER STUB_LOG_GROUP STUB_TS_OFFSET STUB_LOG_LINES STUB_ALIAS STUB_CURL_CODE STUB_PRECOND_ONCE EXPECT_CODE
+    STUB_ALARM_INIT STUB_REVERT STUB_LG_ANSWER STUB_LOG_GROUP STUB_TS_OFFSET STUB_LOG_LINES STUB_ALIAS STUB_CURL_CODE STUB_PRECOND_ONCE EXPECT_CODE \
+    STUB_SIG STUB_SIG_AT STUB_QUERY_LAG STUB_KILL_READER STUB_LG_LAZY STUB_REAL_AFTER_REVERT STUB_BYTES_ALARM STUB_BYTES_REASON STUB_ALARM_REASON ATTEMPTS
+  export LOG_CHECK_EVERY=0
+}
+# runpipe NAME "stdin" MODE script args...: like run, but stdout goes through a pipe ("| tee"-like reader whose pid the
+# stub can kill). MODE out: only stdout is piped, stderr goes to $ERR. MODE both: "2>&1 |". CBT_TTY stands in for /dev/tty.
+runpipe() {
+  local name="$1" input="$2" mode="$3"; shift 3
+  STUB_DIR="$TMP/$name/state"; RESDIR="$TMP/$name/res"; mkdir -p "$STUB_DIR" "$RESDIR"
+  OUT="$TMP/$name/piped.txt"; ERR="$TMP/$name/err.txt"; TTYF="$TMP/$name/tty.txt"; : > "$ERR"; : > "$TTYF"
+  export STUB_DIR RESULTS_DIR="$RESDIR" CBT_TTY="$TTYF"
+  if [ "$mode" = both ]; then
+    { printf '%b' "$input" | "$@" 2>&1 | sh -c 'echo $$ > "$STUB_DIR/reader.pid"; exec cat' > "$OUT"; RC=${PIPESTATUS[1]}; } 2>/dev/null
+  else
+    { printf '%b' "$input" | "$@" 2>"$ERR" | sh -c 'echo $$ > "$STUB_DIR/reader.pid"; exec cat' > "$OUT"; RC=${PIPESTATUS[1]}; } 2>/dev/null
+  fi   # 2>/dev/null: bash's "Terminated" job notice for the killed reader
+  unset CBT_TTY
+  RES="$(ls "$RESDIR"/results-*.txt 2>/dev/null | head -n 1)"; [ -n "$RES" ] || RES=/dev/null
+}
+# between FILE A B: some line matching B lies between the first and the second line matching A
+between() {
+  local a1 a2
+  a1=$(grep -n -- "$2" "$1" | sed -n 1p | cut -d: -f1); a2=$(grep -n -- "$2" "$1" | sed -n 2p | cut -d: -f1)
+  [ -n "$a1" ] && [ -n "$a2" ] && grep -n -- "$3" "$1" | cut -d: -f1 | while read -r b; do [ "$b" -gt "$a1" ] && [ "$b" -lt "$a2" ] && echo y; done | grep -q y
+}
+# none_after FILE A B: no line matching B comes after the first line matching A (and A exists)
+none_after() {
+  local a; a=$(grep -n -- "$2" "$1" | head -n 1 | cut -d: -f1)
+  [ -n "$a" ] && ! tail -n +"$((a + 1))" "$1" | grep -q -- "$3"
 }
 before() { # FILE PATTERN_A PATTERN_B: first line matching A comes before first line matching B
   local a b
@@ -211,6 +239,7 @@ check "exit 0" test "$RC" = 0
 export STUB_REVERT=9
 run revert9 'DISABLE 1234\n\n' "$T"
 check "INCONCLUSIVE, not FAIL" has "$RES" 'TEST=enabled_false RESULT=INCONCLUSIVE'
+check "Disable mode INCONCLUSIVE exits 4" test "$RC" = 4
 check "lambda_log INCONCLUSIVE with hint" has "$RES" "TEST=lambda_log RESULT=INCONCLUSIVE.*not confirmed"
 check "no FAIL anywhere" hasnot "$RES" 'RESULT=FAIL'
 check "gave up after ATTEMPTS=3" count_is "$STUB_DIR/calls.log" 'set-alarm-state.*--state-value ALARM' 3
@@ -218,6 +247,7 @@ check "distribution still enabled" test "$(state enabled)" = true
 export STUB_ACTION=AlertOnly
 run revertalert '\n' "$T"
 check "alert-only INCONCLUSIVE" has "$RES" 'TEST=alertonly_stays_enabled RESULT=INCONCLUSIVE'
+check "alert-only INCONCLUSIVE still exits 0" test "$RC" = 0
 reset_env
 
 echo "SITE_URL checks"
@@ -227,9 +257,6 @@ export STUB_ACTION=Disable STUB_ALIAS=other.example
 run alias 'DISABLE 1234\n' "$T"
 check "host not an alias of the distribution: refused" test "$RC" -ne 0
 check "alarm never touched" hasnot "$STUB_DIR/calls.log" set-alarm-state
-run aliasrestore '' "$T" --restore-only
-check "restore-only refuses too" test "$RC" -ne 0
-check "restore-only changed nothing" hasnot "$STUB_DIR/calls.log" update-distribution
 reset_env; export STUB_ACTION=AlertOnly
 SITE_URL=https://dfaketest.cloudfront.net run cfdomain '\n' "$T"
 check "distribution domain name accepted" test "$RC" = 0
@@ -337,6 +364,148 @@ out2="$(DIST_ID=X SITE_HOST=y bash -c ". '$root/lib.sh'; redact 'domain d111abcd
 check "cloudfront domain removed" test "${out2#*cloudfront.net}" = "$out2"
 check "other domains kept" has <(echo "$out2") www.example.com
 check "13-digit timestamp kept" has <(echo "$out") 1789000000000
+
+echo "round 3 (1): piped stdout, the reader dies (SIGPIPE must not kill the restore)"
+export STUB_ACTION=Disable STUB_INT=INT STUB_KILL_READER=1
+runpipe pipeint 'DISABLE 1234\n' out "$T"
+check "Ctrl-C with '| reader': exit 130" test "$RC" = 130
+check "restore still ran: distribution enabled" test "$(state enabled)" = true
+check "forced alarm reset" test "$(state alarm)" = OK
+check "restore recorded in the results file" has "$RES" 'TEST=restore_deployed RESULT=PASS'
+check "hint printed on stderr" has "$ERR" -e '--restore-only'
+check "restore messages on stderr" has "$ERR" 'Restore: enabling'
+export STUB_INT=TERM
+runpipe pipeterm 'DISABLE 1234\n' both "$T"
+check "TERM with '2>&1 | reader': exit 143" test "$RC" = 143
+check "restore still ran: distribution enabled" test "$(state enabled)" = true
+check "hint printed on the terminal (both pipes dead)" has "$TTYF" -e '--restore-only'
+check "summary printed on the terminal" has "$TTYF" 'TEST=restore_deployed RESULT=PASS'
+export STUB_INT=READER
+runpipe pipereader 'DISABLE 1234\n' out "$T"
+check "reader dies alone: run stops with exit 1" test "$RC" = 1
+check "restore still ran: distribution enabled" test "$(state enabled)" = true
+check "hint printed on stderr" has "$ERR" -e '--restore-only'
+export STUB_INT=INT STUB_FLOOD_AT=10 STUB_THRESHOLD=10 N=20 BATCH=5
+unset STUB_INT; export STUB_SIG=INT STUB_SIG_AT=describe-alarms:4
+runpipe pipeflood 'DISABLE 1234\n' out "$F"
+check "flood: Ctrl-C with '| reader': exit 130" test "$RC" = 130
+check "flood: distribution enabled" test "$(state enabled)" = true
+check "flood: hint printed on stderr" has "$ERR" -e '--restore-only'
+unset N BATCH; reset_env
+check "on_exit ignores SIGPIPE" grep -q "trap '' PIPE" "$root/lib.sh"
+check "README: do not pipe, use tmux" grep -q 'Do not pipe the output' "$root/README.md"
+
+echo "round 3 (2): --restore-only and aliases"
+export STUB_ALIAS=other.example STUB_INIT_ENABLED=false
+run aliasrestore '' "$T" --restore-only
+check "restore-only with a non-matching alias: exit 0" test "$RC" = 0
+check "warns about the alias" has "$OUT" 'WARNING: SITE_URL host is not'
+check "restored the stack's distribution" test "$(state enabled)" = true
+reset_env; export STUB_INIT_ENABLED=false STUB_FAIL_NTH=get-distribution:1
+run aliasread '' "$T" --restore-only
+check "restore-only: unreadable distribution is only a warning" has "$OUT" 'WARNING: cannot read the distribution'
+check "and the restore ran" test "$(state enabled)" = true
+reset_env; export STUB_ACTION=AlertOnly STUB_ALIAS='*.fake-host.example'
+run wildcard '\n' "$T"
+check "wildcard alias matches one label: accepted" test "$RC" = 0
+export STUB_ALIAS='*.host.example'
+run wildcard2 '\n' "$T"
+check "wildcard alias does not match two labels: refused" test "$RC" -ne 0
+check "  and nothing was forced" hasnot "$STUB_DIR/calls.log" set-alarm-state
+reset_env
+hm() { bash -c ". '$root/lib.sh'; rm -rf \"\$WORK\"; host_matches '$1' '$2'"; }
+check "host_matches exact" hm blog.example.com blog.example.com
+check "host_matches *.example.com / blog.example.com" hm '*.example.com' blog.example.com
+check "host_matches *.example.com / a.b.example.com is no" eval '! hm "*.example.com" a.b.example.com'
+check "host_matches *.example.com / example.com is no" eval '! hm "*.example.com" example.com'
+check "host_matches *.example.com / blogexample.com is no" eval '! hm "*.example.com" blogexample.com'
+
+echo "round 3 (3): do not undo a real brake trip"
+export STUB_ACTION=Disable STUB_INIT_ENABLED=false
+run showfirst 'DISABLE 1234\n' "$T"
+check "alarm state shown before the site pre-check" before "$OUT" 'Alarm state now' 'site answered HTTP'
+check "all stack alarms read before the site is checked" before "$STUB_DIR/calls.log" 'describe-alarms --alarm-names fake-stack-RequestsAlarm-X fake-stack-BytesAlarm-Y' '^curl'
+check "pre-check hint says the brake may have tripped for real" has "$OUT" 'tripped for REAL'
+export STUB_ALARM_INIT=ALARM STUB_ALARM_REASON='Threshold Crossed: 1 datapoint'
+run guardno '' "$T" --restore-only
+check "real ALARM, no phrase: exit 3" test "$RC" = 3
+check "  distribution left disabled" test "$(state enabled)" = false
+check "  no update-distribution" hasnot "$STUB_DIR/calls.log" update-distribution
+check "  says the brake may have tripped for real" has "$OUT" 'tripped for REAL'
+run guardwrong 'yes\n' "$T" --restore-only
+check "real ALARM, wrong phrase: exit 3, left disabled" test "$RC" = 3 -a "$(state enabled)" = false
+run guardok 'RESTORE 1234\n' "$T" --restore-only
+check "real ALARM, phrase typed: restored" test "$(state enabled)" = true
+check "  override recorded" has "$RES" 'TEST=restore_guard RESULT=OVERRIDDEN'
+check "  real alarm never touched" hasnot "$STUB_DIR/calls.log" set-alarm-state
+run guardforce '' "$T" --restore-only --force
+check "real ALARM, --force: restored without asking" test "$(state enabled)" = true -a "$RC" = 0
+check "  no phrase prompt" hasnot "$OUT" 'type exactly'
+reset_env; export STUB_INIT_ENABLED=false STUB_BYTES_ALARM=ALARM STUB_BYTES_REASON='Threshold Crossed'
+run guardbytes '' "$T" --restore-only
+check "bytes alarm in real ALARM also guards: exit 3" test "$RC" = 3 -a "$(state enabled)" = false
+reset_env; export STUB_INIT_ENABLED=false STUB_ALARM_INIT=ALARM STUB_ALARM_REASON='cost-brake-test 2026-10-08T10:00:00Z: manual test'
+run guardours '' "$T" --restore-only
+check "our own forced ALARM: no question, restored" test "$(state enabled)" = true -a "$RC" = 0
+check "  our alarm reset to OK" test "$(state alarm)" = OK
+reset_env; export STUB_INIT_ENABLED=false STUB_FAIL_NTH=describe-alarms:1
+run guardunknown '' "$T" --restore-only
+check "alarm state unreadable: asks, exit 3 without phrase" test "$RC" = 3 -a "$(state enabled)" = false
+reset_env
+run forcealone '' "$T" --force
+check "--force without --restore-only: exit 2" test "$RC" = 2
+
+echo "round 3 (4): ATTEMPTS cap, alarm re-checked before each retry"
+ATTEMPTS=6 run att6 '' "$T"; check "ATTEMPTS=6 refused (exit 2)" test "$RC" = 2
+ATTEMPTS=0 run att0 '' "$T"; check "ATTEMPTS=0 refused (exit 2)" test "$RC" = 2
+export STUB_ACTION=Disable STUB_REVERT=1
+run retrycheck 'DISABLE 1234\n\n' "$T"
+check "alarm read between the first and the second forcing" between "$STUB_DIR/calls.log" 'set-alarm-state.*--state-value ALARM' 'describe-alarms'
+export STUB_REAL_AFTER_REVERT=1
+run retryreal 'DISABLE 1234\n\n' "$T"
+check "real ALARM before the retry: stops (non-zero)" test "$RC" -ne 0
+check "  forced only once" count_is "$STUB_DIR/calls.log" 'set-alarm-state.*--state-value ALARM' 1
+check "  no restore (nothing of ours to undo)" hasnot "$STUB_DIR/calls.log" update-distribution
+check "  real alarm not reset" hasnot "$STUB_DIR/calls.log" 'state-value OK'
+check "  says it may be a real trip" has "$OUT" 'tripped for REAL'
+reset_env
+
+echo "round 3 (5): exit code 4 is documented"
+check "README documents exit code 4" grep -q '| `4` |' "$root/README.md"
+
+echo "round 3 (6): WAIT_CHECK cleared in on_exit"
+export STUB_ACTION=Disable STUB_QUERY_LAG=1 STUB_SIG=INT STUB_SIG_AT=get-distribution-config:1
+run waitclr 'DISABLE 1234\n' "$T"
+check "Ctrl-C during the poll: exit 130" test "$RC" = 130
+check "restored" test "$(state enabled)" = true
+check "restore poll does not read the Lambda log" none_after "$STUB_DIR/calls.log" update-distribution filter-log-events
+check "on_exit clears WAIT_CHECK" grep -q 'WAIT_CHECK=""     # the restore' "$root/lib.sh"
+reset_env
+
+echo "round 3 (7): TIMEOUT default 900"
+run dryto '' env -u TIMEOUT "$T" --dry-run
+check "test-disable-enable.sh default TIMEOUT 900" has "$OUT" 'up to 900s'
+run drytof '' env -u TIMEOUT "$F" --dry-run
+check "flood.sh default TIMEOUT 900" has "$OUT" 'up to 900s'
+check "README: TIMEOUT 900 for both" grep -q '| `TIMEOUT` | 900 |' "$root/README.md"
+
+echo "round 3 (8): README IAM policy"
+check "DescribeAlarms + DescribeAlarmHistory in their own statement on *" grep -q '"Action": \["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory"\], "Resource": "\*"' "$root/README.md"
+check "SetAlarmState still scoped to the alarm" grep -q '"Action": "cloudwatch:SetAlarmState"' "$root/README.md"
+check "log group placeholder is the LoggingConfig.LogGroup value" grep -q 'log-group:<LoggingConfig.LogGroup value>:\*' "$root/README.md"
+check "no guessed log group name in the policy" hasnot "$root/README.md" 'log-group:/aws/lambda/<stack-name>-brake'
+check "WAF and Lambda@Edge note" grep -q 'Lambda@Edge' "$root/README.md"
+
+echo "round 3 (9): Lambda log polled at most every LOG_CHECK_EVERY, missing group is quiet"
+export STUB_ACTION=Disable STUB_LAMBDA=off LOG_CHECK_EVERY=30
+run throttle 'DISABLE 1234\n\n' "$T"
+check "many distribution polls" test "$(grep -c 'DistributionConfig.Enabled' "$STUB_DIR/calls.log")" -gt 5
+check "no log reads during the poll, only LOG_TRIES=2 for the evidence" count_is "$STUB_DIR/calls.log" 'filter-log-events' 2
+export LOG_CHECK_EVERY=0 STUB_LG_LAZY=1
+run lazylg 'DISABLE 1234\n\n' "$T"
+check "log group not there yet: polled anyway" test "$(grep -c 'filter-log-events' "$STUB_DIR/calls.log")" -gt 2
+check "  but quiet while polling (only the 2 evidence tries print it)" test "$(grep -c 'ResourceNotFoundException' "$OUT")" = 2
+reset_env
 
 echo
 echo "passed: $PASS  failed: $FAIL"

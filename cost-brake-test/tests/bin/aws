@@ -10,6 +10,11 @@ if [ -n "${STUB_FAIL_NTH:-}" ] && [ "$cmd" = "${STUB_FAIL_NTH%%:*}" ]; then
   if [ "$n" = "${STUB_FAIL_NTH##*:}" ]; then acct="$(printf '%s%s' 1234 56789012)"; echo "stub: simulated failure of $cmd (arn:aws:iam::$acct:role/x, account $acct, dist $D, host dfaketest.cloudfront.net)" >&2; exit 254; fi
 fi
 arg() { local k="$1"; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
+# STUB_SIG=INT|TERM and STUB_SIG_AT=<command>:<n>: signal the script during the n-th call of that command.
+if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT%%:*}" ]; then
+  n=$(( $(get "sig_$cmd" 0) + 1 )); put "sig_$cmd" "$n"
+  if [ "$n" = "${STUB_SIG_AT##*:}" ]; then signal_main "$STUB_SIG"; fi
+fi
 case "$svc $cmd" in
   "cloudformation describe-stacks")
     cat <<JSON
@@ -20,7 +25,9 @@ JSON
   "cloudfront get-distribution-config")
     en=$(get enabled "${STUB_INIT_ENABLED:-true}")
     case "$*" in
-      *"DistributionConfig.Enabled"*) if [ "$en" = true ]; then echo True; else echo False; fi ;;
+      *"DistributionConfig.Enabled"*)
+        lag=$(get lag 0); if [ "$lag" -gt 0 ]; then put lag $((lag - 1)); en=$(get prev_enabled true); fi
+        if [ "$en" = true ]; then echo True; else echo False; fi ;;
       *) echo "{\"ETag\":\"$(get etag ETAG1)\",\"DistributionConfig\":{\"Comment\":\"fake\",\"Enabled\":$en}}" ;;
     esac ;;
   "cloudfront get-distribution")
@@ -40,19 +47,35 @@ JSON
     fi
     if [ "$(arg --if-match "$@")" != "$(get etag ETAG1)" ]; then echo "An error occurred (PreconditionFailed): stale ETag" >&2; exit 254; fi
     f="$(arg --distribution-config "$@")"; f="${f#file://}"
-    put enabled "$(jq -r '.Enabled' "$f")"; put pending 2; echo '{}' ;;
+    set_enabled "$(jq -r '.Enabled' "$f")"; put pending 2; echo '{}' ;;
   "cloudwatch set-alarm-state")
     st="$(arg --state-value "$@")"
     put alarm "$st"; put reason "$(arg --state-reason "$@")"
     if [ "$st" = ALARM ]; then lambda_runs; fi
-    if [ "${STUB_INT:-0}" = 1 ]; then kill -INT "$PPID"; fi ;;
+    case "${STUB_INT:-0}" in 1|INT) signal_main INT ;; TERM) signal_main TERM ;; READER) signal_main READER ;; esac ;;
   "cloudwatch describe-alarms")
-    a=$(get alarm "${STUB_ALARM_INIT:-OK}")
-    if [ "$a" = ALARM ]; then
-      left=$(get alarm_ok_after 0)
-      if [ "$left" -gt 0 ]; then put alarm_ok_after $((left - 1)); if [ "$left" = 1 ]; then put alarm OK; a=OK; fi; fi
-    fi
-    echo "{\"MetricAlarms\":[{\"AlarmName\":\"fake\",\"StateValue\":\"$a\",\"StateReason\":\"$(get reason none)\"}]}" ;;
+    # --alarm-names takes several names. The requests alarm keeps its state in files; the bytes alarm is
+    # STUB_BYTES_ALARM (default OK) with reason STUB_BYTES_REASON.
+    names=""; on=0
+    for x in "$@"; do
+      case "$x" in --alarm-names) on=1; continue ;; --*) on=0 ;; esac
+      if [ "$on" = 1 ]; then names="$names $x"; fi
+    done
+    out=""
+    for nm in $names; do
+      case "$nm" in
+        *RequestsAlarm*)
+          a=$(get alarm "${STUB_ALARM_INIT:-OK}")
+          if [ "$a" = ALARM ]; then
+            left=$(get alarm_ok_after 0)
+            if [ "$left" -gt 0 ]; then put alarm_ok_after $((left - 1)); if [ "$left" = 1 ]; then put alarm OK; a=OK; fi; fi
+          fi
+          r="$(get reason "${STUB_ALARM_REASON:-none}")" ;;
+        *) a="${STUB_BYTES_ALARM:-OK}"; r="${STUB_BYTES_REASON:-none}" ;;
+      esac
+      out="$out${out:+,}{\"AlarmName\":\"$nm\",\"StateValue\":\"$a\",\"StateReason\":\"$r\"}"
+    done
+    echo "{\"MetricAlarms\":[$out]}" ;;
   "cloudwatch describe-alarm-history")
     if [ "$(get alarm OK)" = ALARM ] || [ "$(get lambda_fired 0)" = 1 ]; then
       off="${STUB_TS_OFFSET:-+00:00}"   # e.g. +05:30, -08:00, Z: real CloudWatch answers in the caller's local offset
@@ -63,7 +86,8 @@ JSON
     else echo '{"AlarmHistoryItems":[]}'; fi ;;
   "logs filter-log-events")
     # Only the real log group exists; any other name fails like AWS does.
-    if [ "$(arg --log-group-name "$@")" != "$LOG_GROUP_REAL" ]; then
+    # STUB_LG_LAZY=1: like AWS, the group only exists after the Lambda's first run (first log line).
+    if [ "$(arg --log-group-name "$@")" != "$LOG_GROUP_REAL" ] || { [ "${STUB_LG_LAZY:-0}" = 1 ] && [ ! -s "$S/events" ]; }; then
       echo "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist." >&2; exit 254
     fi
     case "$*" in *--no-paginate*) ;; *) echo "stub: filter-log-events called without --no-paginate" >&2; exit 98 ;; esac
