@@ -5,7 +5,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 export PATH="$here/bin:$PATH"
-export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1 RETRY_PAUSE=3 LOG_CHECK_EVERY=0
+export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1 RETRY_PAUSE=3 LOG_CHECK_EVERY=0 RESTORE_BACKOFF=0
 export STACK_NAME=fake-stack SITE_URL=https://blog.fake-host.example
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cbt.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 PASS=0 FAIL=0
@@ -30,7 +30,8 @@ run() {
 reset_env() {
   unset STUB_ACTION STUB_LAMBDA STUB_BREAK STUB_INIT_ENABLED STUB_FAIL_NTH STUB_INT STUB_FLOOD_AT STUB_THRESHOLD \
     STUB_ALARM_INIT STUB_REVERT STUB_LG_ANSWER STUB_LOG_GROUP STUB_TS_OFFSET STUB_LOG_LINES STUB_ALIAS STUB_CURL_CODE STUB_PRECOND_ONCE EXPECT_CODE \
-    STUB_HIST_AT STUB_HIST_FAIL STUB_SIG STUB_SIG_AT STUB_QUERY_LAG STUB_KILL_READER STUB_LG_LAZY STUB_REAL_AFTER_REVERT STUB_BYTES_ALARM STUB_BYTES_REASON STUB_ALARM_REASON ATTEMPTS STUB_EXTRA_PARAMS STUB_UPDATE_NOCHANGE STUB_UPDATE_FAIL_FROM STUB_WAIT_FAIL STUB_STACK_STATUS THRESHOLD N BATCH
+    STUB_HIST_AT STUB_HIST_FAIL STUB_SIG STUB_SIG_AT STUB_QUERY_LAG STUB_KILL_READER STUB_LG_LAZY STUB_REAL_AFTER_REVERT STUB_BYTES_ALARM STUB_BYTES_REASON STUB_ALARM_REASON ATTEMPTS STUB_EXTRA_PARAMS STUB_UPDATE_NOCHANGE STUB_UPDATE_FAIL_FROM STUB_WAIT_FAIL STUB_STACK_STATUS THRESHOLD N BATCH \
+    STUB_PEAK STUB_PEAK_FAIL STUB_FOREIGN_UPDATE STUB_ROLLBACK_FAILED STUB_UPDATE_DELAY STUB_ALARM_HOLD_LOW STUB_ALARM_STUCK FORCE_NO_PEAK RESTORE_TRIES STACK_POLICY
   export LOG_CHECK_EVERY=0
 }
 # runpipe NAME "stdin" MODE script args...: like run, but stdout goes through a pipe ("| tee"-like reader whose pid the
@@ -609,7 +610,9 @@ tcalls() { grep -c "cloudformation update-stack" "$STUB_DIR/calls.log"; }
 run ftdry '' "$FT" --dry-run
 check "dry-run: exit 0" test "$RC" = 0
 check "dry-run: no update-stack, wait, set-alarm-state or request" hasnot "$STUB_DIR/calls.log" 'update-stack\|cloudformation wait\|set-alarm-state\|^curl'
-check "dry-run: only reads (describe-stacks, get-distribution)" test "$(grep -vc 'describe-stacks\|cloudfront get-distribution --id' "$STUB_DIR/calls.log")" = 0
+check "dry-run: only reads (describe-stacks, get-distribution, get-metric-statistics)" test "$(grep -vc 'describe-stacks\|cloudfront get-distribution --id\|cloudwatch get-metric-statistics' "$STUB_DIR/calls.log")" = 0
+check "dry-run: shows the 24 h peak" has "$OUT" 'Busiest 5 minutes, last 24 h \. 4 requests'
+check "dry-run: no curl at all" hasnot "$STUB_DIR/calls.log" '^curl'
 check "dry-run: prints the lowering call with the other parameters UsePreviousValue" has "$OUT" 'ParameterKey=RequestsPer5Min,ParameterValue=10 ParameterKey=DistributionId,UsePreviousValue=true ParameterKey=ActionOnTrip,UsePreviousValue=true ParameterKey=AlertEmail,UsePreviousValue=true ParameterKey=ApiSecretToken,UsePreviousValue=true ParameterKey=MonthlyBudgetUsd,UsePreviousValue=true'
 check "dry-run: prints the restore call with the original value" has "$OUT" 'ParameterKey=RequestsPer5Min,ParameterValue=10000 '
 check "dry-run: --use-previous-template and CAPABILITY_IAM shown" has "$OUT" '--use-previous-template --capabilities CAPABILITY_IAM'
@@ -621,7 +624,9 @@ check "dry-run: no results file" test "$RES" = /dev/null
 run ftphrase 'yes\n' "$FT"
 check "wrong phrase: exit 3" test "$RC" = 3
 check "wrong phrase: nothing written" test "$(tcalls)" = 0
-check "wrong phrase: no request" hasnot "$STUB_DIR/calls.log" '^curl'
+check "wrong phrase: no flood request" hasnot "$STUB_DIR/calls.log" 'cbt='
+check "wrong phrase: site and alarm were checked first (nothing changed yet)" has "$STUB_DIR/calls.log" '^curl -s -L'
+check "wrong phrase: no results file, no restore" test "$RES" = /dev/null
 
 run ftok 'FLOOD 1234\n\n' "$FT"
 check "normal: exit 0" test "$RC" = 0
@@ -636,8 +641,12 @@ check "normal: first update-stack lowers to 10, others UsePreviousValue" has "$S
 check "normal: second update-stack restores 10000" has "$STUB_DIR/calls.log" 'ParameterKey=RequestsPer5Min,ParameterValue=10000 ParameterKey=DistributionId'
 check "normal: both updates waited for" test "$(grep -c 'cloudformation wait stack-update-complete' "$STUB_DIR/calls.log")" = 2
 check "normal: threshold in the stack is back" test "$(cat "$STUB_DIR/threshold")" = 10000
-check "normal: lowered before the flood, restored after" before "$STUB_DIR/calls.log" 'ParameterValue=10 ' '^curl'
-check "normal: restore after the last request" none_after "$STUB_DIR/calls.log" 'ParameterValue=10000' '^curl'
+check "normal: lowered before the flood, restored after" before "$STUB_DIR/calls.log" 'ParameterValue=10 ' 'cbt='
+check "normal: restore after the last request" none_after "$STUB_DIR/calls.log" 'ParameterValue=10000' 'cbt='
+check "normal: flood.sh ran with --leave-disabled" has "$OUT" 'flood.sh --leave-disabled'
+check "normal: alarm waited OK after the restore (alarm_back_to_ok PASS)" has "$RES" 'TEST=alarm_back_to_ok RESULT=PASS'
+check "normal: threshold_restored says Enabled and OK" has "$RES" 'TEST=threshold_restored RESULT=PASS.*distribution Enabled, alarm OK'
+check "normal: results header has the peak" has "$RES" '^# mode=flood-test.*peak_5min_24h=4'
 check "normal: flood.sh results kept in a sub folder" ls "$RESDIR"/flood-*/results-*.txt
 check "normal: results private" test "$(ls -l "$RES" | cut -c1-10)" = "-rw-------"
 check "normal: no distribution id or site host in results" test "$(grep -c 'EFAKETEST1234\|fake-host.example' "$RES")" = 0
@@ -657,28 +666,29 @@ check "disable: wrong second phrase: no flood request sent" hasnot "$STUB_DIR/ca
 export STUB_ACTION=AlertOnly
 
 echo "flood-test.sh, failure inside flood.sh"
-STUB_FAIL_NTH=describe-alarms:2 run ftfail 'FLOOD 1234\n\n' "$FT"
+STUB_FAIL_NTH=describe-alarms:4 run ftfail 'FLOOD 1234\n\n' "$FT"
 check "flood.sh fails: its exit code is forwarded (1)" test "$RC" = 1
 check "flood.sh fails: threshold restored" test "$(cat "$STUB_DIR/threshold")" = 10000
 check "flood.sh fails: threshold_restored PASS" has "$RES" 'TEST=threshold_restored RESULT=PASS'
 check "flood.sh fails: lowered then restored (2 updates)" test "$(tcalls)" = 2
 
 echo "flood-test.sh, Ctrl-C during the flood"
-STUB_FLOOD_AT=1000 STUB_SIG=INT STUB_SIG_AT=describe-alarms:4 run ftint 'FLOOD 1234\n\n' "$FT"
+STUB_FLOOD_AT=1000 STUB_SIG=INT STUB_SIG_AT=describe-alarms:6 run ftint 'FLOOD 1234\n\n' "$FT"
 check "Ctrl-C: exit 130" test "$RC" = 130
 check "Ctrl-C: threshold restored" test "$(cat "$STUB_DIR/threshold")" = 10000
-check "Ctrl-C: says it is putting the value back" has "$OUT" 'putting RequestsPer5Min back'
+check "Ctrl-C: the flood had started" has "$STUB_DIR/calls.log" 'cbt='
+check "Ctrl-C: says it is putting everything back" has "$OUT" 'putting everything back now'
 check "Ctrl-C: restore proven (PASS)" has "$RES" 'TEST=threshold_restored RESULT=PASS'
-STUB_FLOOD_AT=1000 STUB_SIG=TERM STUB_SIG_AT=describe-alarms:4 run ftterm 'FLOOD 1234\n\n' "$FT"
+STUB_FLOOD_AT=1000 STUB_SIG=TERM STUB_SIG_AT=describe-alarms:6 run ftterm 'FLOOD 1234\n\n' "$FT"
 check "SIGTERM: exit 143 and threshold restored" test "$RC" = 143 -a "$(cat "$STUB_DIR/threshold")" = 10000
-STUB_FLOOD_AT=1000 STUB_SIG=INT STUB_SIG_AT=describe-alarms:4 STUB_KILL_READER=1 runpipe ftpipe 'FLOOD 1234\n\n' out "$FT"
+STUB_FLOOD_AT=1000 STUB_SIG=INT STUB_SIG_AT=describe-alarms:6 STUB_KILL_READER=1 runpipe ftpipe 'FLOOD 1234\n\n' out "$FT"
 check "Ctrl-C with a dying '| reader': threshold restored" test "$(cat "$STUB_DIR/threshold")" = 10000
 
 echo "flood-test.sh, update-stack fails"
 STUB_UPDATE_FAIL_FROM=1 run ftupfail 'FLOOD 1234\n\n' "$FT"
 check "update fails: non-zero exit" test "$RC" -ne 0
 check "update fails: clear message" has "$OUT" 'update-stack failed.*RequestsPer5Min was not changed'
-check "update fails: flood.sh never ran" hasnot "$STUB_DIR/calls.log" '^curl'
+check "update fails: flood.sh never ran" hasnot "$STUB_DIR/calls.log" 'cbt='
 check "update fails: threshold_lowered FAIL" has "$RES" 'TEST=threshold_lowered RESULT=FAIL'
 check "update fails: nothing to restore (SKIPPED, no second update-stack)" has "$RES" 'TEST=threshold_restored RESULT=SKIPPED'
 check "update fails: only the one failed update-stack call" test "$(tcalls)" = 1
@@ -687,10 +697,13 @@ check "update fails: no TEST=threshold_restored FAIL" hasnot "$RES" 'threshold_r
 STUB_UPDATE_NOCHANGE=1 run ftnochange 'FLOOD 1234\n\n' "$FT"
 check "no changes: aborts cleanly, exit 1" test "$RC" = 1
 check "no changes: clear message" has "$OUT" 'no changes to perform'
-check "no changes: flood.sh never ran" hasnot "$STUB_DIR/calls.log" '^curl'
+check "no changes: flood.sh never ran" hasnot "$STUB_DIR/calls.log" 'cbt='
 STUB_WAIT_FAIL=1 run ftwaitfail 'FLOOD 1234\n\n' "$FT"
-check "lowering wait fails (rollback): exit non-zero, no flood" test "$RC" -ne 0 -a "$(grep -c '^curl' "$STUB_DIR/calls.log")" = 0
-check "lowering wait fails: value checked, left alone when still original" has "$RES" 'TEST=threshold_lowered RESULT=FAIL'
+check "lowering wait fails (rollback): exit non-zero, no flood" test "$RC" -ne 0 -a "$(grep -c 'cbt=' "$STUB_DIR/calls.log")" = 0
+check "lowering wait fails: threshold_lowered FAIL" has "$RES" 'TEST=threshold_lowered RESULT=FAIL'
+check "lowering wait fails: rollback put back the ORIGINAL value (stub), so no restore update" test "$(cat "$STUB_DIR/threshold")" = 10000 -a "$(tcalls)" = 1
+check "lowering wait fails: threshold_restored SKIPPED (never changed)" has "$RES" 'TEST=threshold_restored RESULT=SKIPPED'
+check "lowering wait fails: exit 1, not 5" test "$RC" = 1
 STUB_THRESHOLD=10 run ftsame 'FLOOD 1234\n\n' "$FT"
 check "already at the low value: refuses before any change" test "$RC" -ne 0 -a "$(tcalls)" = 0
 STUB_STACK_STATUS=UPDATE_IN_PROGRESS run ftbusy 'FLOOD 1234\n\n' "$FT"
@@ -703,13 +716,13 @@ check "restore fails: threshold_lowered PASS" has "$RES" 'TEST=threshold_lowered
 check "restore fails: threshold_restored FAIL" has "$RES" 'TEST=threshold_restored RESULT=FAIL'
 check "restore fails: loud warning" has "$OUT" 'WARNING: RequestsPer5Min COULD NOT BE PUT BACK'
 check "restore fails: exact manual command printed after the warning" after_has "$OUT" 'COULD NOT BE PUT BACK' 'update-stack --region us-east-1 --stack-name fake-stack --use-previous-template --capabilities CAPABILITY_IAM --parameters ParameterKey=RequestsPer5Min,ParameterValue=10000 ParameterKey=DistributionId,UsePreviousValue=true.*MonthlyBudgetUsd,UsePreviousValue=true'
-check "restore fails: it tried twice" test "$(grep -c 'cloudformation update-stack' "$STUB_DIR/calls.log")" = 3
+check "restore fails: it tried RESTORE_TRIES=5 times (1 lowering + 5)" test "$(tcalls)" = 6
 check "restore fails: the stack really is still lowered (what the warning says)" test "$(cat "$STUB_DIR/threshold")" = 10
 STUB_FAIL_NTH=update-stack:2 run ftretry 'FLOOD 1234\n\n' "$FT"
 check "restore: one transient failure, second attempt works" test "$RC" = 0 -a "$(cat "$STUB_DIR/threshold")" = 10000
-check "restore: retry noted on screen" has "$OUT" 'trying once more'
-STUB_UPDATE_FAIL_FROM=2 STUB_FAIL_NTH=describe-alarms:2 run ftbothfail 'FLOOD 1234\n\n' "$FT"
-check "flood.sh fails AND restore fails: flood.sh's code kept, warning shown" test "$RC" = 1 && has "$OUT" 'COULD NOT BE PUT BACK'
+check "restore: retry noted on screen with the backoff" has "$OUT" 'Restore attempt 1 of 5 failed (update-stack failed); trying again in 0s'
+STUB_UPDATE_FAIL_FROM=2 STUB_FAIL_NTH=describe-alarms:4 run ftbothfail 'FLOOD 1234\n\n' "$FT"
+check "flood.sh fails AND restore fails: exit 5 (not flood.sh's 1), warning shown" test "$RC" = 5 && has "$OUT" 'COULD NOT BE PUT BACK'
 
 echo "flood-test.sh, input checks"
 THRESHOLD=20 run ftthr '' "$FT"
@@ -732,6 +745,205 @@ check "--help documents THRESHOLD" has "$OUT" 'THRESHOLD'
 check "README has the All in one section" grep -q '^## All in one' "$root/README.md"
 check "README IAM mentions UpdateStack and the wait" grep -q 'cloudformation:UpdateStack' "$root/README.md"
 check "no secrets or values of other parameters in the script" hasnot "$FT" 'ParameterValue=\$\(' 
+unset N BATCH THRESHOLD; reset_env
+
+echo "round 6 (HIGH 1a): THRESHOLD must be at least 2 x the busiest 5 minutes of the last 24 h"
+export STUB_ACTION=AlertOnly STUB_FLOOD_AT=10 N=20 BATCH=5 THRESHOLD=10 STUB_EXTRA_PARAMS=1
+run pk1 'FLOOD 1234\n\n' "$FT"
+check "peak 4, THRESHOLD 10: runs, exit 0" test "$RC" = 0
+check "peak read with the documented call (us-east-1 stub, Requests, DistributionId + Region=Global, 300 s, Sum)" has "$STUB_DIR/calls.log" '^cloudwatch get-metric-statistics --namespace AWS/CloudFront --metric-name Requests --dimensions Name=DistributionId,Value=EFAKETEST1234 Name=Region,Value=Global --start-time .* --end-time .* --period 300 --statistics Sum'
+check "peak read before any update-stack" before "$STUB_DIR/calls.log" get-metric-statistics update-stack
+check "default: no stack policy in update-stack" hasnot "$STUB_DIR/calls.log" 'stack-policy'
+STUB_PEAK=6 run pk6 'FLOOD 1234\n\n' "$FT"
+check "peak 6 > THRESHOLD 10 / 2: refused (exit 1), no update-stack" test "$RC" = 1 -a "$(tcalls)" = 0
+check "  says which THRESHOLD is needed" has "$OUT" 'Use THRESHOLD >= 12'
+check "  no flood request" hasnot "$STUB_DIR/calls.log" 'cbt='
+STUB_PEAK=5 run pk5 'FLOOD 1234\n\n' "$FT"
+check "THRESHOLD exactly 2 x peak (5): accepted" test "$RC" = 0
+STUB_PEAK=5.5 run pkfrac 'FLOOD 1234\n\n' "$FT"
+check "fractional peak 5.5 is rounded up (6): refused" test "$RC" = 1 -a "$(tcalls)" = 0
+STUB_PEAK=6 run pkdry '' "$FT" --dry-run
+check "dry-run refuses too (exit 1) and shows the peak" test "$RC" = 1 && has "$OUT" 'Busiest 5 minutes, last 24 h \. 6 requests'
+STUB_PEAK=none run pknone 'FLOOD 1234\n\n' "$FT"
+check "no datapoints: refused without FORCE_NO_PEAK (exit 1, no update)" test "$RC" = 1 -a "$(tcalls)" = 0
+check "  tells about FORCE_NO_PEAK=1" has "$OUT" 'FORCE_NO_PEAK=1'
+STUB_PEAK_FAIL=1 run pkfail 'FLOOD 1234\n\n' "$FT"
+check "peak unreadable (AccessDenied): refused (exit 1, no update)" test "$RC" = 1 -a "$(tcalls)" = 0
+check "  AWS error printed" has "$OUT" 'GetMetricStatistics operation'
+check "  account id redacted" hasnot "$OUT" "$(printf '%s%s' 1234 56789012)"
+STUB_PEAK_FAIL=1 FORCE_NO_PEAK=1 run pkforce 'FLOOD 1234\n\n' "$FT"
+check "FORCE_NO_PEAK=1 with an unreadable peak: goes on, exit 0" test "$RC" = 0
+check "  warns" has "$OUT" 'FORCE_NO_PEAK=1 is set'
+check "  results header says the peak is unknown" has "$RES" 'peak_5min_24h=unknown (FORCE_NO_PEAK=1)'
+STUB_PEAK=6 FORCE_NO_PEAK=1 run pkforce2 'FLOOD 1234\n\n' "$FT"
+check "FORCE_NO_PEAK=1 does not override a peak that was read" test "$RC" = 1 -a "$(tcalls)" = 0
+FORCE_NO_PEAK=yes run pkbad '' "$FT"
+check "FORCE_NO_PEAK=yes: exit 2" test "$RC" = 2
+THRESHOLD=10 N=10 run pkn '' "$FT"
+check "N must stay above THRESHOLD: exit 2" test "$RC" = 2
+check "README: peak rule, FORCE_NO_PEAK and cloudwatch:GetMetricStatistics" grep -q 'FORCE_NO_PEAK' "$root/README.md"
+check "README: GetMetricStatistics permission" grep -q 'cloudwatch:GetMetricStatistics' "$root/README.md"
+
+echo "round 6 (HIGH 1): refuses before any change when the site is down or the alarm is not OK"
+STUB_INIT_ENABLED=false run ftdown 'FLOOD 1234\n\n' "$FT"
+check "distribution disabled at the start: refused, no update-stack" test "$RC" -ne 0 -a "$(tcalls)" = 0
+check "  says it may be a real trip" has "$OUT" 'tripped for REAL'
+STUB_ALARM_INIT=ALARM STUB_ALARM_REASON='Threshold Crossed' run ftalarm 'FLOOD 1234\n\n' "$FT"
+check "alarm in ALARM at the start: refused, no update-stack" test "$RC" -ne 0 -a "$(tcalls)" = 0
+
+echo "round 6 (HIGH 1b/1c): threshold back BEFORE the site is re-enabled; the end state is verified"
+export STUB_ACTION=Disable STUB_ALARM_HOLD_LOW=1
+run ord 'FLOOD 1234\nDISABLE 1234\n\n' "$FT"
+check "exit 0" test "$RC" = 0
+check "flood.sh left the site to flood-test.sh" has "$OUT" 'leave-disabled: the distribution is left as it is'
+check "the restore update-stack comes BEFORE update-distribution" before "$STUB_DIR/calls.log" 'ParameterValue=10000' '^cloudfront update-distribution'
+check "exactly one update-distribution (no early re-enable by flood.sh)" count_is "$STUB_DIR/calls.log" '^cloudfront update-distribution' 1
+check "site enabled at the end" test "$(state enabled)" = true
+check "threshold back" test "$(cat "$STUB_DIR/threshold")" = 10000
+check "alarm_back_to_ok PASS (it only clears once the threshold is back, in this stub)" has "$RES" 'TEST=alarm_back_to_ok RESULT=PASS'
+check "re-enable recorded, site 200" has "$RES" 'TEST=site_http RESULT=PASS'
+check "threshold_restored PASS with Enabled and OK" has "$RES" 'TEST=threshold_restored RESULT=PASS.*distribution Enabled, alarm OK'
+check "threshold_restored is the last line of the summary" test "$(grep '^TEST=' "$RES" | tail -n 1 | cut -d' ' -f1)" = TEST=threshold_restored
+echo "round 6 (HIGH 2): the lifeline is printed again after the lowering"
+check "printed after threshold_lowered PASS" after_has "$OUT" 'TEST=threshold_lowered RESULT=PASS' 'COPY THIS NOW'
+check "  with the exact restore update-stack (unredacted)" after_has "$OUT" 'TEST=threshold_lowered RESULT=PASS' 'update-stack --region us-east-1 --stack-name fake-stack --use-previous-template --capabilities CAPABILITY_IAM --parameters ParameterKey=RequestsPer5Min,ParameterValue=10000 '
+check "  and then the --restore-only command (Disable)" after_has "$OUT" 'TEST=threshold_lowered RESULT=PASS' 'test-disable-enable.sh --restore-only'
+check "  mentions the CloudShell idle timeout" has "$OUT" '20-30 minutes without keyboard input'
+
+echo "round 6 (HIGH 1b/1c): the alarm stays in ALARM after the threshold is back (a real trip?)"
+export STUB_ALARM_STUCK=1
+run stuck 'FLOOD 1234\nDISABLE 1234\n\n' "$FT"
+check "exit 5" test "$RC" = 5
+check "  NOT re-enabled while the alarm is in ALARM" test "$(state enabled)" = false && hasnot "$STUB_DIR/calls.log" 'cloudfront update-distribution'
+check "  threshold back anyway" test "$(cat "$STUB_DIR/threshold")" = 10000
+check "  threshold_restored is not PASS" hasnot "$RES" 'threshold_restored RESULT=PASS'
+check "  threshold_restored FAIL names the disabled site and the alarm" has "$RES" 'TEST=threshold_restored RESULT=FAIL.*Enabled=false and the alarm is ALARM'
+check "  loud warning: site down" has "$OUT" 'THE DISTRIBUTION IS NOT ENABLED'
+check "  loud warning: may be a REAL trip" has "$OUT" 'may be a REAL trip'
+check "  --restore-only printed after the warning" after_has "$OUT" 'THE DISTRIBUTION IS NOT ENABLED' 'restore-only'
+unset STUB_ALARM_STUCK
+echo "round 6 (HIGH 1b): restore fails in Disable mode: the site is not re-enabled with the low threshold"
+STUB_UPDATE_FAIL_FROM=2 run dfail 'FLOOD 1234\nDISABLE 1234\n\n' "$FT"
+check "exit 5" test "$RC" = 5
+check "  no update-distribution" hasnot "$STUB_DIR/calls.log" 'cloudfront update-distribution'
+check "  says why" has "$OUT" 'NOT re-enabling the distribution: RequestsPer5Min is not back'
+check "  commands in order: threshold first, then --restore-only" before "$OUT" '^1\. put RequestsPer5Min back' '^2\. once the requests alarm is OK'
+check "  threshold_restored FAIL" has "$RES" 'TEST=threshold_restored RESULT=FAIL'
+echo "round 6 (HIGH 1b): Ctrl-C while flood.sh polls (Disable): threshold first, then the site"
+STUB_SIG=INT STUB_SIG_AT=get-distribution-config:2 run ordint 'FLOOD 1234\nDISABLE 1234\n\n' "$FT"
+check "exit 130" test "$RC" = 130
+check "  threshold back and site enabled" test "$(cat "$STUB_DIR/threshold")" = 10000 -a "$(state enabled)" = true
+check "  restore update-stack before update-distribution" before "$STUB_DIR/calls.log" 'ParameterValue=10000' '^cloudfront update-distribution'
+check "  lifeline printed by the trap" has "$OUT" 'Not finished (exit 130)'
+unset STUB_ALARM_HOLD_LOW
+export STUB_ACTION=AlertOnly
+run aostate 'FLOOD 1234\n\n' "$FT"
+check "AlertOnly: end state checked too (alarm waited OK, then PASS)" has "$RES" 'TEST=alarm_back_to_ok RESULT=PASS' && has "$RES" 'TEST=threshold_restored RESULT=PASS'
+
+echo "round 6 (flood.sh --leave-disabled)"
+unset THRESHOLD; export STUB_ACTION=Disable STUB_THRESHOLD=10
+run fld 'DISABLE 1234\n\n' "$F" --leave-disabled
+check "exit 0" test "$RC" = 0
+check "  site left disabled, no update-distribution" test "$(state enabled)" = false && hasnot "$STUB_DIR/calls.log" update-distribution
+check "  no wait for the alarm in flood.sh" hasnot "$RES" alarm_back_to_ok
+STUB_FAIL_NTH=get-distribution:2 run fld2 'DISABLE 1234\n' "$F" --leave-disabled
+check "error after the disable: non-zero, and the trap does NOT re-enable" test "$RC" -ne 0 -a "$(state enabled)" = false
+check "  no update-distribution" hasnot "$STUB_DIR/calls.log" update-distribution
+check "--help documents --leave-disabled" "$F" --help
+run fldhelp '' "$F" --help
+check "  text" has "$OUT" 'leave-disabled'
+unset STUB_THRESHOLD; export THRESHOLD=10 STUB_ACTION=AlertOnly
+
+echo "round 6 (MEDIUM 3): restore retry"
+RESTORE_TRIES=2 STUB_UPDATE_FAIL_FROM=2 run rt2 'FLOOD 1234\n\n' "$FT"
+check "RESTORE_TRIES=2: 1 lowering + 2 restore calls, exit 5" test "$(tcalls)" = 3 -a "$RC" = 5
+RESTORE_TRIES=0 run rt0 '' "$FT"; check "RESTORE_TRIES=0: exit 2" test "$RC" = 2
+RESTORE_TRIES=11 run rt11 '' "$FT"; check "RESTORE_TRIES=11: exit 2" test "$RC" = 2
+RESTORE_BACKOFF=030 run rtb '' "$FT"; check "RESTORE_BACKOFF=030: exit 2" test "$RC" = 2
+check "default 5 tries, 30 s backoff" grep -q 'RESTORE_TRIES="${RESTORE_TRIES:-5}"; RESTORE_BACKOFF="${RESTORE_BACKOFF:-30}"' "$FT"
+STUB_FOREIGN_UPDATE=2 run foreign 'FLOOD 1234\n\n' "$FT"
+check "another update IN_PROGRESS at the restore: waited, retried, exit 0" test "$RC" = 0 -a "$(cat "$STUB_DIR/threshold")" = 10000
+check "  rejected once, then a third update-stack" test "$(tcalls)" = 3
+check "  says it waits for the other update" has "$OUT" 'Another update of the stack is in progress: waiting'
+check "  waits: lowering, the other update, the restore" count_is "$STUB_DIR/calls.log" 'cloudformation wait stack-update-complete' 3
+check "  threshold_restored PASS" has "$RES" 'TEST=threshold_restored RESULT=PASS'
+STUB_FOREIGN_UPDATE=1 run foreign1 'FLOOD 1234\n\n' "$FT"
+check "another update IN_PROGRESS at the lowering: stops, no flood, nothing to restore" test "$RC" = 1 -a "$(grep -c 'cbt=' "$STUB_DIR/calls.log")" = 0
+check "  threshold_restored SKIPPED" has "$RES" 'TEST=threshold_restored RESULT=SKIPPED'
+
+echo "round 6 (MEDIUM 5): the CloudFormation stub behaves like CloudFormation"
+SD="$TMP/stubcf/state"; mkdir -p "$SD"   # the stub numbers EVERY update-stack call, rejected ones too
+sa() { STUB_DIR="$SD" env -u STUB_EXTRA_PARAMS aws --region us-east-1 cloudformation "$@"; }
+sup() { sa update-stack --stack-name fake-stack --use-previous-template --capabilities CAPABILITY_IAM --parameters "ParameterKey=RequestsPer5Min,ParameterValue=$1" ParameterKey=DistributionId,UsePreviousValue=true ParameterKey=ActionOnTrip,UsePreviousValue=true; }
+sst() { sa describe-stacks --stack-name fake-stack --output json | jq -r '.Stacks[0].StackStatus + " " + (.Stacks[0].Parameters[] | select(.ParameterKey=="RequestsPer5Min") | .ParameterValue)'; }
+sup 50 >/dev/null 2>&1
+check "stub: right after update-stack the stack is UPDATE_IN_PROGRESS" test "$(sst)" = "UPDATE_IN_PROGRESS 50"
+check "stub: a second update while IN_PROGRESS is rejected" eval '! sup 60'
+check "stub: the rejection names the state" eval 'sup 60 2>&1 | grep -q "UPDATE_IN_PROGRESS state and can not be updated"'
+check "stub: wait succeeds, UPDATE_COMPLETE 50" eval 'sa wait stack-update-complete --stack-name fake-stack && test "$(sst)" = "UPDATE_COMPLETE 50"'
+check "stub: same value again: No updates are to be performed" eval 'sup 50 2>&1 | grep -q "No updates are to be performed"'
+STUB_WAIT_FAIL=5 sup 60 >/dev/null 2>&1
+check "stub: a failed update makes the wait fail" eval '! sa wait stack-update-complete --stack-name fake-stack'
+check "stub: and rolls back to the ORIGINAL value (50, not 60)" test "$(sst)" = "UPDATE_ROLLBACK_COMPLETE 50"
+STUB_ROLLBACK_FAILED=6 sup 70 >/dev/null 2>&1
+sa wait stack-update-complete --stack-name fake-stack >/dev/null 2>&1
+check "stub: UPDATE_ROLLBACK_FAILED is reached" eval 'sst | grep -q "^UPDATE_ROLLBACK_FAILED "'
+check "stub: and then update-stack is rejected" eval 'sup 80 2>&1 | grep -q "UPDATE_ROLLBACK_FAILED state"'
+STUB_ROLLBACK_FAILED=2 run rbf 'FLOOD 1234\n\n' "$FT"
+check "restore ends in UPDATE_ROLLBACK_FAILED: exit 5" test "$RC" = 5
+check "  no useless retries (2 update-stack calls)" test "$(tcalls)" = 2
+check "  continue-update-rollback hint printed" has "$OUT" 'continue-update-rollback --region us-east-1 --stack-name fake-stack'
+check "  threshold_restored FAIL" has "$RES" 'TEST=threshold_restored RESULT=FAIL.*UPDATE_ROLLBACK_FAILED'
+STUB_STACK_STATUS=UPDATE_ROLLBACK_FAILED run rbfpre 'FLOOD 1234\n\n' "$FT"
+check "stack already UPDATE_ROLLBACK_FAILED: refused before any change, with the hint" test "$RC" = 1 -a "$(tcalls)" = 0 && has "$OUT" 'continue-update-rollback'
+STUB_UPDATE_DELAY=6 run delay 'FLOOD 1234\n\n' "$FT"
+check "slow update (6 polls): still lowered and restored, exit 0" test "$RC" = 0 -a "$(cat "$STUB_DIR/threshold")" = 10000
+
+echo "round 6 (LOW 6): numbers"
+N=020 run lz1 '' "$FT"; check "N=020: exit 2" test "$RC" = 2
+THRESHOLD=010 run lz2 '' "$FT"; check "THRESHOLD=010: exit 2" test "$RC" = 2
+BATCH=05 run lz3 '' "$FT"; check "BATCH=05: exit 2" test "$RC" = 2
+TIMEOUT=0900 run lz4 '' "$FT"; check "TIMEOUT=0900: exit 2" test "$RC" = 2
+TIMEOUT=1000000 run lz5 '' "$FT"; check "TIMEOUT with 7 digits: exit 2" test "$RC" = 2
+N=0300 run lz6 '' "$F"; check "flood.sh N=0300: exit 2" test "$RC" = 2
+TIMEOUT=09 run lz7 '' "$T" --dry-run; check "test-disable-enable.sh TIMEOUT=09: exit 2" test "$RC" = 2
+cn() { bash -c ". '$root/lib.sh'; rm -rf \"\$WORK\"; check_number X '$1' ${2:-}" >/dev/null 2>&1; }
+check "check_number 0 ok" cn 0
+check "check_number 999999 ok" cn 999999
+check "check_number 1234567 refused" eval '! cn 1234567'
+check "check_number 1234567 with 10 digits allowed ok" cn 1234567 10
+check "check_number 007 refused" eval '! cn 007'
+check "check_number empty refused" eval '! cn ""'
+
+echo "round 6 (LOW 7): exit 5 wins; STACK_NAME must be a plain name"
+SN="s$(printf '%s%s' 1234 56789012)"
+STACK_NAME="$SN" run sn12 'FLOOD 1234\n\n' "$FT"
+check "the lifeline is not redacted (a stack name with 12 digits stays whole)" has "$OUT" "update-stack --region us-east-1 --stack-name $SN --use-previous-template"
+STACK_NAME="arn:aws:cloudformation:us-east-1:$(printf '%s%s' 1234 56789012):stack/fake-stack/x" run snarn '' "$FT"
+check "STACK_NAME as an ARN: exit 2, no AWS call" test "$RC" = 2 -a ! -s "$STUB_DIR/calls.log"
+check "  says to use the plain name" has "$OUT" 'plain stack name'
+STACK_NAME='fake stack' run snsp '' "$FT"; check "STACK_NAME with a space: exit 2" test "$RC" = 2
+STACK_NAME='1fake' run sndig '' "$FT"; check "STACK_NAME starting with a digit: exit 2" test "$RC" = 2
+
+echo "round 6 (optional): STACK_POLICY=1"
+STACK_POLICY=1 run sp 'FLOOD 1234\n\n' "$FT"
+check "exit 0" test "$RC" = 0
+check "both update-stack calls carry the policy for RequestsAlarm" count_is "$STUB_DIR/calls.log" 'update-stack .*--stack-policy-during-update-body .*LogicalResourceId/RequestsAlarm' 2
+check "  the policy denies Update:* elsewhere and allows Update:Modify on RequestsAlarm" has "$STUB_DIR/calls.log" '"Effect":"Deny","Action":"Update:\*","Principal":"\*","NotResource":"LogicalResourceId/RequestsAlarm"},{"Effect":"Allow","Action":"Update:Modify"'
+check "  the printed restore command carries it too" has "$OUT" 'ParameterValue=10000.*' && has "$OUT" 'stack-policy-during-update-body'
+STACK_POLICY=2 run sp2 '' "$FT"; check "STACK_POLICY=2: exit 2" test "$RC" = 2
+
+echo "round 6: README"
+check "README: CloudShell idle timeout, tmux does not survive it" grep -q 'tmux does not survive' "$root/README.md"
+check "README: keep the tab active, or a local or EC2 shell" grep -q 'local or EC2 shell' "$root/README.md"
+check "README: copy the printed restore command before starting" grep -q 'copy the printed restore command' "$root/README.md"
+check "README: no longer says tmux keeps the run alive" hasnot "$root/README.md" 'keeps the run alive if the browser tab drops'
+check "README IAM: PutMetricAlarm on the requests alarm" grep -q 'cloudwatch:PutMetricAlarm' "$root/README.md"
+check "README IAM: CAPABILITY_IAM is an acknowledgement" grep -q 'acknowledgement, not a permission' "$root/README.md"
+check "README IAM: iam:PassRole only with a RoleARN" grep -q 'iam:PassRole.*RoleARN' "$root/README.md"
+check "README IAM: confirm in CloudTrail" grep -q 'CloudTrail' "$root/README.md"
+check "README IAM: no more 'close to admin'" hasnot "$root/README.md" 'close to admin'
+check "README: exit 5 covers the end state" grep -q '| `5` |.*not Enabled' "$root/README.md"
 unset N BATCH THRESHOLD; reset_env
 
 echo
