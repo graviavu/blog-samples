@@ -77,12 +77,16 @@ JSON
     done
     echo "{\"MetricAlarms\":[$out]}" ;;
   "cloudwatch describe-alarm-history")
-    if [ "$(get alarm OK)" = ALARM ] || [ "$(get lambda_fired 0)" = 1 ]; then
-      off="${STUB_TS_OFFSET:-+00:00}"   # e.g. +05:30, -08:00, Z: real CloudWatch answers in the caller's local offset
-      case "$off" in Z) osec=0 ;; *) sign=1; [ "${off%"${off#?}"}" = "-" ] && sign=-1; o="${off#?}"; osec=$(( sign * (10#${o%%:*} * 3600 + 10#${o##*:} * 60) )) ;; esac
-      e=$(( $(date +%s) + osec ))
-      lt="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%S)"
-      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$lt.123000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
+    # Real CloudWatch answers in the caller's local offset; default -05:00 (the offset seen on the real run).
+    off="${STUB_TS_OFFSET:--05:00}"
+    case "$off" in Z) osec=0 ;; *) sign=1; [ "${off%"${off#?}"}" = "-" ] && sign=-1; o="${off#?}"; osec=$(( sign * (10#${o%%:*} * 3600 + 10#${o##*:} * 60) )) ;; esac
+    iso_at() { local e=$(( $1 + osec )); date -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%S; }
+    if [ -n "${STUB_HIST_FAIL:-}" ]; then acct="$(printf '%s%s' 1234 56789012)"; echo "An error occurred (AccessDenied) when calling the DescribeAlarmHistory operation: User: arn:aws:sts::$acct:assumed-role/x is not authorized" >&2; exit 254; fi
+    if [ -n "${STUB_HIST_AT:-}" ]; then
+      # fixed history, newest first: an OK->ALARM entry at STUB_HIST_AT, an ALARM->OK a minute later, and an older ALARM entry an hour before
+      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$(iso_at $((STUB_HIST_AT + 60))).500000$off\",\"HistorySummary\":\"Alarm updated from ALARM to OK\"},{\"Timestamp\":\"$(iso_at "$STUB_HIST_AT").217000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"},{\"Timestamp\":\"$(iso_at $((STUB_HIST_AT - 3600))).100000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
+    elif [ "$(get alarm OK)" = ALARM ] || [ "$(get lambda_fired 0)" = 1 ]; then
+      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$(iso_at "$(date +%s)").123000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
     else echo '{"AlarmHistoryItems":[]}'; fi ;;
   "logs filter-log-events")
     # Only the real log group exists; any other name fails like AWS does.
@@ -90,10 +94,16 @@ JSON
     if [ "$(arg --log-group-name "$@")" != "$LOG_GROUP_REAL" ] || { [ "${STUB_LG_LAZY:-0}" = 1 ] && [ ! -s "$S/events" ]; }; then
       echo "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist." >&2; exit 254
     fi
-    case "$*" in *--no-paginate*) ;; *) echo "stub: filter-log-events called without --no-paginate" >&2; exit 98 ;; esac
-    st="$(arg --start-time "$@")"
+    st="$(arg --start-time "$@")"; en="$(arg --end-time "$@")"
     if [ -s "$S/events" ]; then
-      jq -Rn --argjson st "$st" '[inputs | split("\t") | select((.[0] | tonumber) >= $st) | [(.[0] | tonumber), .[1]]]' < "$S/events"
-    else echo '[]'; fi ;;
+      case "$*" in
+        *--no-paginate*)
+          # real behavior: the first page can be EMPTY with a nextToken; the matching events are on a later page
+          echo '{"events":[],"searchedLogStreams":[],"nextToken":"tok-page-2"}' ;;
+        *)
+          # the CLI follows nextToken itself and merges the pages
+          jq -Rn --argjson st "$st" --argjson en "${en:-0}" '{events: [inputs | split("\t") | select((.[0] | tonumber) >= $st and ($en == 0 or (.[0] | tonumber) <= $en)) | {logStreamName: "s", timestamp: (.[0] | tonumber), message: .[1], eventId: "e"}]}' < "$S/events" ;;
+      esac
+    else echo '{"events":[],"searchedLogStreams":[]}'; fi ;;
   *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
 esac

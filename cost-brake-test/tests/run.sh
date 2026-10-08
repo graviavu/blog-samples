@@ -30,7 +30,7 @@ run() {
 reset_env() {
   unset STUB_ACTION STUB_LAMBDA STUB_BREAK STUB_INIT_ENABLED STUB_FAIL_NTH STUB_INT STUB_FLOOD_AT STUB_THRESHOLD \
     STUB_ALARM_INIT STUB_REVERT STUB_LG_ANSWER STUB_LOG_GROUP STUB_TS_OFFSET STUB_LOG_LINES STUB_ALIAS STUB_CURL_CODE STUB_PRECOND_ONCE EXPECT_CODE \
-    STUB_SIG STUB_SIG_AT STUB_QUERY_LAG STUB_KILL_READER STUB_LG_LAZY STUB_REAL_AFTER_REVERT STUB_BYTES_ALARM STUB_BYTES_REASON STUB_ALARM_REASON ATTEMPTS
+    STUB_HIST_AT STUB_HIST_FAIL STUB_SIG STUB_SIG_AT STUB_QUERY_LAG STUB_KILL_READER STUB_LG_LAZY STUB_REAL_AFTER_REVERT STUB_BYTES_ALARM STUB_BYTES_REASON STUB_ALARM_REASON ATTEMPTS
   export LOG_CHECK_EVERY=0
 }
 # runpipe NAME "stdin" MODE script args...: like run, but stdout goes through a pipe ("| tee"-like reader whose pid the
@@ -87,7 +87,11 @@ check "distribution ends enabled" test "$(state enabled)" = true
 check "alarm ends OK" test "$(state alarm)" = OK
 check "restore used If-Match" has "$STUB_DIR/calls.log" 'update-distribution.*--if-match ETAG1'
 check "log group read from the function (auto-style name)" has "$STUB_DIR/calls.log" 'get-function-configuration --function-name fake-stack-BrakeFunction-AbC123xyz.*LoggingConfig.LogGroup'
-check "logs read from the configured group, no pagination" has "$STUB_DIR/calls.log" 'filter-log-events --log-group-name /aws/lambda/fake-stack-brake .*--no-paginate'
+check "logs read from the configured group" has "$STUB_DIR/calls.log" 'filter-log-events --log-group-name /aws/lambda/fake-stack-brake '
+check "logs: the CLI paginates (no --no-paginate), no --query, capped by --max-items 2000" hasnot "$STUB_DIR/calls.log" 'filter-log-events.*\(--no-paginate\|--query\)'
+check "logs: --max-items 2000 given" has "$STUB_DIR/calls.log" 'filter-log-events .*--max-items 2000'
+check "alarm history: --max-records 100, no --start-date (window filtered in jq)" has "$STUB_DIR/calls.log" 'describe-alarm-history .*--max-records 100'
+check "alarm history: no --start-date" hasnot "$STUB_DIR/calls.log" 'describe-alarm-history.*--start-date'
 check "alarm history seconds sane" secs_between "$RES" alarm_history -2 120
 check "site host checked against the distribution" has "$STUB_DIR/calls.log" 'cloudfront get-distribution --id EFAKETEST1234 --output json'
 check "alarm read before it is forced" before "$STUB_DIR/calls.log" describe-alarms 'set-alarm-state.*ALARM'
@@ -192,6 +196,8 @@ export STUB_LOG_GROUP=/aws/lambda/some-custom-group
 run lgwrong 'DISABLE 1234\n\n' "$T"
 check "wrong group is a FAIL" has "$RES" 'TEST=lambda_log RESULT=FAIL'
 check "AWS error is printed, not swallowed" has "$OUT" 'ResourceNotFoundException'
+check "FAIL: raw response goes to the results file as comment lines" has "$RES" '^# lambda_log, raw response'
+check "FAIL: raw response is shown on screen" has "$OUT" '^# lambda_log, raw response'
 unset STUB_LG_ANSWER
 run lgcustom 'DISABLE 1234\n\n' "$T"
 check "custom log group found through the function config" has "$RES" 'TEST=lambda_log RESULT=PASS'
@@ -505,6 +511,95 @@ export LOG_CHECK_EVERY=0 STUB_LG_LAZY=1
 run lazylg 'DISABLE 1234\n\n' "$T"
 check "log group not there yet: polled anyway" test "$(grep -c 'filter-log-events' "$STUB_DIR/calls.log")" -gt 2
 check "  but quiet while polling (only the 2 evidence tries print it)" test "$(grep -c 'ResourceNotFoundException' "$OUT")" = 2
+reset_env
+
+echo "evidence: pagination (empty first page with nextToken), AWS errors, raw response"
+export STUB_ACTION=Disable
+run pagedisable 'DISABLE 1234\n\n' "$T"
+check "real behavior stub: lambda_log still PASS" has "$RES" 'TEST=lambda_log RESULT=PASS'
+check "  alarm_history PASS with the -05:00 offset (default)" has "$RES" 'TEST=alarm_history RESULT=PASS'
+check "  no raw dump on success" hasnot "$RES" 'raw response'
+# the stub's old-style call must not work: --no-paginate gives an empty first page
+printf '%s\t%s\n' "$(( $(date +%s) * 1000 ))" "[INFO] disabled distribution EFAKETEST1234 (alarm x)" > "$TMP/ev.events"
+mkdir -p "$TMP/pg/state"; cp "$TMP/ev.events" "$TMP/pg/state/events"
+pgout="$(STUB_DIR="$TMP/pg/state" aws --region us-east-1 logs filter-log-events --log-group-name /aws/lambda/fake-stack-brake --start-time 0 --no-paginate --output json)"
+check "stub: --no-paginate returns an empty first page with nextToken" test "$(jq -r '(.events | length | tostring) + (.nextToken // "-")' <<<"$pgout")" = "0tok-page-2"
+pgout="$(STUB_DIR="$TMP/pg/state" aws --region us-east-1 logs filter-log-events --log-group-name /aws/lambda/fake-stack-brake --start-time 0 --max-items 2000 --output json)"
+check "stub: without it the pages are merged" test "$(jq -r '.events | length' <<<"$pgout")" = 1
+export STUB_HIST_FAIL=1
+run histfail 'DISABLE 1234\n\n' "$T"
+check "AWS error text printed (redacted)" has "$OUT" 'AccessDenied'
+check "  no account id on screen" hasnot "$OUT" "$(printf '%s%s' 1234 56789012)"
+check "  alarm_history INCONCLUSIVE" has "$RES" 'TEST=alarm_history RESULT=INCONCLUSIVE'
+check "  raw response written to the results file as comments" has "$RES" '^# alarm_history, raw response'
+check "  error text in the results file, redacted" has "$RES" '^# .*AccessDenied'
+check "  no account id in the results file" hasnot "$RES" "$(printf '%s%s' 1234 56789012)"
+check "  Disable mode INCONCLUSIVE exits 4" test "$RC" = 4
+check "  the rest of the run still restored" test "$(state enabled)" = true
+reset_env
+
+echo "--evidence-only (read-only)"
+SE=$(( $(date +%s) - 600 ))
+isoz() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+SINCE_ISO="$(isoz "$SE")"
+evsetup() { # NAME: pre-seed the fake log group (one old matching line, one unrelated line, the real line) and the alarm history
+  mkdir -p "$TMP/$1/state"
+  {
+    printf '%s\t%s\n' "$(( (SE - 3000) * 1000 ))" "[INFO] disabled distribution EFAKETEST1234 (alarm older-run)"
+    printf '%s\t%s\n' "$(( (SE + 3) * 1000 ))" "[INFO] unrelated filler line"
+    printf '%s\t%s\n' "$(( (SE + 7) * 1000 + 250 ))" "[INFO] disabled distribution EFAKETEST1234 (alarm fake-stack-RequestsAlarm-X)"
+  } > "$TMP/$1/state/events"
+}
+export STUB_ACTION=Disable STUB_HIST_AT=$((SE + 4))
+evsetup ev1
+run ev1 '' env -u SITE_URL "$T" --evidence-only --since "$SINCE_ISO"
+check "exit 0 (SITE_URL not needed)" test "$RC" = 0
+check "alarm_history PASS, 4 s after --since (not the older entry)" secs_between "$RES" alarm_history 4 4
+check "lambda_log PASS, 7 s after --since (not the older run)" secs_between "$RES" lambda_log 7 7
+check "TEST= lines printed" has "$OUT" 'TEST=lambda_log RESULT=PASS SECONDS=7'
+check "matching log line shown" has "$OUT" 'disabled distribution'
+check "  non-matching lines not shown" hasnot "$OUT" 'unrelated filler'
+check "  distribution id redacted in the shown line" hasnot "$OUT" EFAKETEST1234
+check "no write call: no set-alarm-state, update-distribution" hasnot "$STUB_DIR/calls.log" 'set-alarm-state\|update-distribution'
+check "no cloudfront call at all, no curl" hasnot "$STUB_DIR/calls.log" 'cloudfront\|^curl'
+check "only reads: stack, function config, history, logs" test "$(cut -d' ' -f1,2 "$STUB_DIR/calls.log" | sort -u | tr '\n' ',')" = "cloudformation describe-stacks,cloudwatch describe-alarm-history,lambda get-function-configuration,logs filter-log-events,"
+check "alarm history: no --start-date, --max-records 100" has "$STUB_DIR/calls.log" 'describe-alarm-history .*--max-records 100'
+check "logs: --start-time is exactly --since (no slack)" has "$STUB_DIR/calls.log" "filter-log-events .*--start-time $((SE * 1000)) "
+check "distribution untouched" test "$(state enabled)" = true
+check "no state or distribution files written by the stub" test ! -e "$STUB_DIR/alarm" -a ! -e "$STUB_DIR/pending"
+check "results file records the mode" has "$RES" '^# mode=evidence-only since='
+UNTIL_ISO="$(isoz $((SE + 5)))"
+evsetup ev2
+run ev2 '' env -u SITE_URL "$T" --evidence-only --since "$SINCE_ISO" --until "$UNTIL_ISO"
+check "--until: history inside the window still found" secs_between "$RES" alarm_history 4 4
+check "--until: log line after the window is excluded: FAIL" has "$RES" 'TEST=lambda_log RESULT=FAIL'
+check "--until: end time passed to the log call" has "$STUB_DIR/calls.log" "filter-log-events .*--end-time $(((SE + 5) * 1000))"
+check "--until: FAIL exits 1" test "$RC" = 1
+check "--until: raw response in the results file" has "$RES" '^# lambda_log, raw response'
+evsetup ev3
+run ev3 '' env -u SITE_URL "$T" --evidence-only --since "$(isoz $((SE + 5)))"
+check "history before --since is not counted (the 4 s entry is before; the hour-old one too): INCONCLUSIVE" has "$RES" 'TEST=alarm_history RESULT=INCONCLUSIVE'
+check "  evidence step shows the raw history" has "$RES" '^# alarm_history, raw response'
+check "  exit 4" test "$RC" = 4
+export STUB_ACTION=AlertOnly
+evsetup ev4; printf '%s\t%s\n' "$(( (SE + 9) * 1000 ))" "[INFO] AlertOnly: would disable EFAKETEST1234 (alarm fake)" >> "$TMP/ev4/state/events"
+run ev4 '' "$T" --evidence-only --since "$SINCE_ISO"
+check "AlertOnly stack: looks for the AlertOnly line" secs_between "$RES" lambda_log 9 9
+run ev5 '' "$T" --evidence-only
+check "--evidence-only without --since: exit 2" test "$RC" = 2
+run ev6 '' "$T" --evidence-only --since yesterday
+check "bad --since: exit 2" test "$RC" = 2
+run ev7 '' "$T" --evidence-only --since 2026-10-08T18:43:00+05:00
+check "non-UTC --since: exit 2" test "$RC" = 2
+run ev8 '' "$T" --since "$SINCE_ISO"
+check "--since without --evidence-only: exit 2" test "$RC" = 2
+run ev9 '' "$T" --evidence-only --since "$SINCE_ISO" --until "$(isoz $((SE - 5)))"
+check "--until before --since: exit 2" test "$RC" = 2
+run ev10 '' "$T" --evidence-only --restore-only --since "$SINCE_ISO"
+check "--evidence-only with --restore-only: exit 2" test "$RC" = 2
+check "none of the refusals called AWS" test ! -s "$STUB_DIR/calls.log"
+check "README documents --evidence-only" grep -q -- '--evidence-only --since' "$root/README.md"
+check "README has the pagination note" grep -q 'nextToken' "$root/README.md"
 reset_env
 
 echo
