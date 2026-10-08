@@ -36,6 +36,7 @@ export SITE_URL=https://<your blog host>
 ./test-disable-enable.sh --dry-run          # prints every command, changes nothing
 ./test-disable-enable.sh                    # the real test
 ./test-disable-enable.sh --restore-only     # only if a run was cut off and the site is still down
+./test-disable-enable.sh --evidence-only --since 2026-10-08T18:43:00Z   # read-only: re-check the evidence of an earlier run
 ```
 
 What it does, in order: reads the stack (distribution id, ActionOnTrip, alarm names, function name) and says what will happen;
@@ -79,6 +80,20 @@ it sends N requests (default 300) with curl in parallel batches, and measures re
 3. **Put `RequestsPer5Min` back** to its normal value (default 10000) the same way. Do not forget this: a low threshold trips on real visitors.
 
 In `Disable` mode the script waits for the alarm to return to OK before restoring, otherwise the same busy 5-minute window would trip it again, so the site stays down a few minutes longer.
+
+### `--evidence-only`: re-check the evidence of an earlier run
+
+If the brake worked but the evidence step said `INCONCLUSIVE` or `FAIL` (alarm history or Lambda log not found), you do not need to run the test again:
+
+```
+STACK_NAME=<stack> ./test-disable-enable.sh --evidence-only --since 2026-10-08T18:43:00Z [--until 2026-10-08T19:00:00Z]
+```
+
+`--since` (and the optional `--until`) is a **UTC** time, `YYYY-MM-DDTHH:MM:SSZ`; use a minute or so before the `T0` the earlier run printed. The mode is read-only: it forces no alarm, updates no distribution, does not check the site (so `SITE_URL` is not needed). It only calls `describe-stacks`, `lambda get-function-configuration`, `cloudwatch describe-alarm-history` and `logs filter-log-events`. It prints `TEST=alarm_history` (seconds from `--since` to the first `to ALARM` entry after it), `TEST=lambda_log` (seconds from `--since` to the first matching Lambda line) and the matching log lines (redacted). It tries each once (no waiting). Exit code `4` if something is `INCONCLUSIVE`, `1` on `FAIL`.
+
+When an evidence line is `INCONCLUSIVE` or `FAIL`, the script prints the redacted AWS error (if any) and writes the redacted raw response (first 2 KB) to the results file as `#` comment lines, so you can paste it.
+
+Pagination note: `logs filter-log-events` can return an **empty first page with a `nextToken`**; the matching events only come on a later page. The script lets the AWS CLI follow the pages itself (no `--no-paginate`, no `--query`) and caps the total at `--max-items 2000`. The alarm-history call uses `--max-records 100` and the time window is applied by the script, not by the CLI.
 
 ## Results
 
@@ -174,7 +189,7 @@ This policy was written from the AWS API names and was **not tested against a re
 
 `tests/run.sh` runs both scripts against a fake `aws` and `curl` (shell stubs in `tests/bin`): disable, alert-only, restore-only,
 dry-run, an AWS error mid-run, Ctrl-C, `--no-auto-restore`, refusals, flood and its guards, redaction. The stubs behave like the real stack where it matters:
-an auto-generated function name, a log group that only exists under its real name (and only after the first Lambda run), alarm-history timestamps with `+05:30`, `-08:00` and `Z` offsets,
+an auto-generated function name, a log group that only exists under its real name (and only after the first Lambda run), alarm-history timestamps with `-05:00` (default), `+05:30`, `-08:00` and `Z` offsets, `filter-log-events` pages (an empty first page with a `nextToken`),
 a forced alarm that reverts (`not confirmed`), a real trip during the retries, a stale ETag (`PreconditionFailed`), a non-OK alarm, a bytes alarm in a real ALARM, a wildcard alias,
 a redirecting site, very long Lambda logs, an `Enabled` read that lags behind the update, and output piped into a reader that dies with the Ctrl-C. No AWS account and no network needed.
 
