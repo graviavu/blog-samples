@@ -25,7 +25,7 @@ EVIDENCE_ONLY=0 LOG_SLACK=1 LOG_END_EPOCH="" HIST_TRIES=6 HIST_SLACK=2 HIST_END=
 DIST_ID="" SITE_HOST="" ACTION="" FUNCTION_NAME="" ALARM_REQ="" THRESHOLD=""
 W_SEC_FLAG="" W_SEC_DEPLOYED="" LOG_GROUP="" WAIT_CHECK="" CHK_T0="" CHK_PAT=""
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-brake.XXXXXX")"
-export CBT_MAIN_PID=$$   # pid of the running script; the test stubs use it to send Ctrl-C/TERM at a chosen moment
+export CBT_MAIN_PID="${CBT_MAIN_PID:-$$}"   # pid of the running script (flood-test.sh sets it first, so flood.sh keeps it); the test stubs use it to send Ctrl-C/TERM at a chosen moment
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 

@@ -17,10 +17,44 @@ if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT%%:*}" ]; then
 fi
 case "$svc $cmd" in
   "cloudformation describe-stacks")
+    # Parameters come from the state file "threshold" (changed by update-stack). STUB_EXTRA_PARAMS=1 adds more parameters,
+    # like a real stack: one NoEcho (the real API shows ****), one with an e-mail value, one number.
+    extra=""
+    if [ "${STUB_EXTRA_PARAMS:-0}" = 1 ]; then
+      extra=',{"ParameterKey":"AlertEmail","ParameterValue":"alerts@example.invalid"},{"ParameterKey":"ApiSecretToken","ParameterValue":"****"},{"ParameterKey":"MonthlyBudgetUsd","ParameterValue":"20"}'
+    fi
     cat <<JSON
-{"Stacks":[{"Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"${STUB_THRESHOLD-10000}"}],
+{"Stacks":[{"StackStatus":"${STUB_STACK_STATUS:-UPDATE_COMPLETE}","Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"$(get threshold "${STUB_THRESHOLD-10000}")"}$extra],
 "Outputs":[{"OutputKey":"AlarmNames","OutputValue":"fake-stack-RequestsAlarm-X,fake-stack-BytesAlarm-Y"},{"OutputKey":"FunctionName","OutputValue":"$FN_NAME"}]}]}
 JSON
+    ;;
+  "cloudformation update-stack")
+    # STUB_UPDATE_FAIL_FROM=n: the n-th and every later update-stack call fails (a restore that keeps failing).
+    if [ -n "${STUB_UPDATE_FAIL_FROM:-}" ]; then
+      un=$(( $(get n_upd 0) + 1 )); put n_upd "$un"
+      if [ "$un" -ge "$STUB_UPDATE_FAIL_FROM" ]; then echo "An error occurred (AccessDenied) when calling the UpdateStack operation: not authorized" >&2; exit 254; fi
+    fi
+    # Like CloudFormation: a parameter that is neither given nor UsePreviousValue would silently fall back to its template
+    # default, so the stub refuses anything but RequestsPer5Min with a value and every other parameter with UsePreviousValue=true.
+    case " $* " in *" --use-previous-template "*) ;; *) echo "stub: update-stack without --use-previous-template" >&2; exit 254 ;; esac
+    case " $* " in *" --capabilities CAPABILITY_IAM "*) ;; *) echo "stub: update-stack without --capabilities CAPABILITY_IAM" >&2; exit 254 ;; esac
+    if [ "${STUB_UPDATE_NOCHANGE:-0}" = 1 ]; then echo "An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed." >&2; exit 254; fi
+    keys="DistributionId ActionOnTrip RequestsPer5Min"; [ "${STUB_EXTRA_PARAMS:-0}" = 1 ] && keys="$keys AlertEmail ApiSecretToken MonthlyBudgetUsd"
+    on=0; seen=""
+    for x in "$@"; do
+      case "$x" in --parameters) on=1; continue ;; --*) on=0 ;; esac
+      [ "$on" = 1 ] || continue
+      k="${x#ParameterKey=}"; k="${k%%,*}"; seen="$seen $k"
+      if [ "$k" = RequestsPer5Min ]; then
+        case "$x" in *,ParameterValue=*) put threshold "${x##*,ParameterValue=}" ;; *) echo "stub: RequestsPer5Min needs a value" >&2; exit 254 ;; esac
+      else
+        case "$x" in "ParameterKey=$k,UsePreviousValue=true") ;; *) echo "stub: parameter $k must be UsePreviousValue=true, got: $x" >&2; exit 254 ;; esac
+      fi
+    done
+    for k in $keys; do case " $seen " in *" $k "*) ;; *) echo "stub: parameter $k omitted (would reset to its default)" >&2; exit 254 ;; esac; done
+    echo '{"StackId":"stub"}' ;;
+  "cloudformation wait")
+    if [ "${STUB_WAIT_FAIL:-0}" = 1 ]; then echo "Waiter StackUpdateComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi
     ;;
   "cloudfront get-distribution-config")
     en=$(get enabled "${STUB_INIT_ENABLED:-true}")
