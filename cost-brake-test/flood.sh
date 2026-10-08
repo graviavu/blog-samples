@@ -5,6 +5,8 @@
 #
 # Usage:
 #   STACK_NAME=<cost-protection stack> SITE_URL=https://<your blog> [N=300] [BATCH=50] ./flood.sh [--dry-run] [--no-auto-restore]
+#   --leave-disabled: used by flood-test.sh. Do not re-enable the distribution (not at the end, not on Ctrl-C or error):
+#     the caller first puts RequestsPer5Min back, waits for the alarm to be OK, and only then re-enables it.
 # Environment (optional): N (300 requests, max 2000, and at most 3 x RequestsPer5Min + 100), BATCH (50 parallel curls, max 50),
 #   REGION (us-east-1 only), TIMEOUT (900), POLL_INTERVAL (5), ALERT_WAIT (120), RESULTS_DIR (.),
 #   EXPECT_CODE (200, status of your healthy site), LOG_TRIES (12), EMAIL_PROMPT_TIMEOUT (120), LOG_CHECK_EVERY (30)
@@ -21,6 +23,7 @@ for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --no-auto-restore) NO_AUTO=1 ;;
+    --leave-disabled) LEAVE_DISABLED=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
@@ -45,6 +48,7 @@ DRY RUN: nothing is called or changed. The real run executes, in this order (reg
 + evidence: aws lambda get-function-configuration (log group), aws logs filter-log-events --max-items 2000
 + then: aws cloudfront get-distribution-config / get-distribution (Disable: Enabled=false and Deployed; AlertOnly: stays Enabled for ${ALERT_WAIT}s)
 + Disable: wait until the alarm is OK again (so it cannot re-trigger), then restore as in test-disable-enable.sh
+  (with --leave-disabled: no wait and no restore here; flood-test.sh restores the threshold first, then re-enables)
 PLAN
   rm -rf "$WORK"; exit 0
 fi
@@ -65,7 +69,8 @@ require_alarm_ok
 say "Scenario FLOOD ($ACTION): $N requests in batches of $BATCH against the site; threshold is $THRESHOLD per 5 minutes."
 if [ "$ACTION" = "Disable" ]; then confirm_disable; fi
 
-NEED_RESTORE=1
+# --leave-disabled: the exit trap must not re-enable either (flood-test.sh does it, after the threshold is back)
+if [ "$LEAVE_DISABLED" != 1 ]; then NEED_RESTORE=1; fi
 RUN="r$(date +%s)"; base="${SITE_URL%%[?#]*}"; base="${base%/}"; : > "$WORK/codes"   # keep a path, drop query and fragment
 T0="$(date +%s)"; T0_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 say "T0 = $T0_ISO (first request)"
@@ -108,14 +113,20 @@ if [ "$rc" -eq 0 ]; then
       rec enabled_false FAIL - "not disabled and deployed within ${TIMEOUT}s"
     else die "AWS call failed while polling the distribution"; fi
     collect_evidence "$T0" "$T0_ISO" 'disabled distribution'
-    # Re-enabling while the flooded 5-minute window is still the latest datapoint would trip again. Wait for OK first.
-    say "Waiting for the alarm to return to OK before restoring (the site stays down meanwhile)."
-    rc=0; wait_alarm OK "$(date +%s)" || rc=$?
-    if [ "$rc" -eq 0 ]; then rec alarm_back_to_ok PASS "$W_SEC_FLAG" "alarm OK again"
-    else rec alarm_back_to_ok INCONCLUSIVE - "alarm not OK within ${TIMEOUT}s; restoring anyway, it may trip again"; fi
+    if [ "$LEAVE_DISABLED" != 1 ]; then
+      # Re-enabling while the flooded 5-minute window is still the latest datapoint would trip again. Wait for OK first.
+      say "Waiting for the alarm to return to OK before restoring (the site stays down meanwhile)."
+      rc=0; wait_alarm OK "$(date +%s)" || rc=$?
+      if [ "$rc" -eq 0 ]; then rec alarm_back_to_ok PASS "$W_SEC_FLAG" "alarm OK again"
+      else rec alarm_back_to_ok INCONCLUSIVE - "alarm not OK within ${TIMEOUT}s; restoring anyway, it may trip again"; fi
+    fi
   fi
 fi
 ask_email_minute "$T0"
+if [ "$LEAVE_DISABLED" = 1 ]; then
+  say "--leave-disabled: the distribution is left as it is; flood-test.sh puts RequestsPer5Min back first, then re-enables it."
+  exit 0
+fi
 # NEED_RESTORE drops to 0 only once the restore worked; if it failed the exit trap tries again.
 if restore_phase; then NEED_RESTORE=0; else rec restore FAIL - "see above; run test-disable-enable.sh --restore-only"; fi
 say "Done. Now put RequestsPer5Min back to its normal value (README.md)."

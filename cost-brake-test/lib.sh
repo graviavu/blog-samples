@@ -19,7 +19,7 @@ RESULTS_DIR="${RESULTS_DIR:-.}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS_FILE="$RESULTS_DIR/results-$STAMP.txt"
 
-FAILS=0 INCONCS=0 INCONC_EXIT=0 NEED_RESTORE=0 ALARM_FIRED=0 NO_AUTO=0 FORCE=0 LAST_LOG_CHECK=0 ALARM_VERDICT=unknown
+FAILS=0 INCONCS=0 INCONC_EXIT=0 NEED_RESTORE=0 ALARM_FIRED=0 NO_AUTO=0 FORCE=0 LAST_LOG_CHECK=0 ALARM_VERDICT=unknown LEAVE_DISABLED=0
 ALARM_ALL=()
 EVIDENCE_ONLY=0 LOG_SLACK=1 LOG_END_EPOCH="" HIST_TRIES=6 HIST_SLACK=2 HIST_END="" HIST_RAW="" HIST_TS="" LOG_MAXITEMS=2000
 DIST_ID="" SITE_HOST="" ACTION="" FUNCTION_NAME="" ALARM_REQ="" THRESHOLD=""
@@ -86,7 +86,16 @@ check_expect_code() {
   if [ "$ATTEMPTS" -lt 1 ] || [ "$ATTEMPTS" -gt 5 ]; then echo "ATTEMPTS must be between 1 and 5, got: $ATTEMPTS" >&2; exit 2; fi
 }
 
-check_number() { case "$2" in ''|*[!0-9]*) echo "$1 must be a whole number, got: $2" >&2; exit 2 ;; esac; }
+# check_number NAME VALUE [MAX_DIGITS, default 6]: a plain whole number. A leading 0 is refused (bash arithmetic reads
+# 010 as octal and 08 as an error), and so is anything longer than MAX_DIGITS (a typo, or an overflow in $(( ))).
+check_number() {
+  case "$2" in ''|*[!0-9]*) echo "$1 must be a whole number, got: $2" >&2; exit 2 ;; esac
+  case "$2" in 0?*) echo "$1 must not start with 0, got: $2" >&2; exit 2 ;; esac
+  if [ "${#2}" -gt "${3:-6}" ]; then echo "$1 has more than ${3:-6} digits, got: $2" >&2; exit 2; fi
+}
+
+# iso_utc EPOCH: YYYY-MM-DDTHH:MM:SSZ (BSD date on macOS, GNU date in CloudShell)
+iso_utc() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
 
 init_results() {
   mkdir -p "$RESULTS_DIR"
