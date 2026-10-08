@@ -425,6 +425,9 @@ restore_phase() {
     if [ "$code" = "$EXPECT_CODE" ]; then rec site_http PASS - "HTTP $code"; return 0; fi
     n=$((n + 1)); sleep "$POLL_INTERVAL"
   done
+  if [ "$code" = "000" ]; then
+    err "HTTP 000 means curl could not connect to SITE_URL (wrong host, DNS or TLS). Check SITE_URL; the restore itself is not affected."
+  fi
   rec site_http FAIL - "HTTP $code after restore (expected $EXPECT_CODE)"
   return 1
 }
