@@ -6,21 +6,25 @@ umask 077   # results files and temp files are readable by the owner only
 
 REGION="${REGION:-us-east-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"     # seconds between polls
-TIMEOUT="${TIMEOUT:-600}"               # seconds to wait for the distribution to change
+TIMEOUT="${TIMEOUT:-900}"               # seconds to wait for the distribution to change (CloudFront often needs 5-15 minutes to reach Deployed)
 ALERT_WAIT="${ALERT_WAIT:-120}"         # alert-only scenario: seconds to watch that nothing changes
 LOG_TRIES="${LOG_TRIES:-12}"            # tries (POLL_INTERVAL apart) to find evidence in alarm history and Lambda logs
 EMAIL_PROMPT_TIMEOUT="${EMAIL_PROMPT_TIMEOUT:-120}"
 EXPECT_CODE="${EXPECT_CODE:-200}"       # HTTP status your site answers when healthy (after following redirects)
-ATTEMPTS="${ATTEMPTS:-3}"               # forced-alarm attempts when the Lambda says "not confirmed" (1 try + 2 retries)
+ATTEMPTS="${ATTEMPTS:-3}"               # forced-alarm attempts when the Lambda says "not confirmed" (1 try + 2 retries), at most 5
 RETRY_PAUSE="${RETRY_PAUSE:-10}"        # seconds between such attempts
+LOG_CHECK_EVERY="${LOG_CHECK_EVERY:-30}" # while polling the distribution, look for "not confirmed" in the Lambda log at most this often
+TTY_FALLBACK="${CBT_TTY:-/dev/tty}"     # where the exit messages go if stdout and stderr are both dead pipes (CBT_TTY: for the tests)
 RESULTS_DIR="${RESULTS_DIR:-.}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS_FILE="$RESULTS_DIR/results-$STAMP.txt"
 
-FAILS=0 NEED_RESTORE=0 ALARM_FIRED=0 NO_AUTO=0
+FAILS=0 INCONCS=0 INCONC_EXIT=0 NEED_RESTORE=0 ALARM_FIRED=0 NO_AUTO=0 FORCE=0 LAST_LOG_CHECK=0 ALARM_VERDICT=unknown
+ALARM_ALL=()
 DIST_ID="" SITE_HOST="" ACTION="" FUNCTION_NAME="" ALARM_REQ="" THRESHOLD=""
 W_SEC_FLAG="" W_SEC_DEPLOYED="" LOG_GROUP="" WAIT_CHECK="" CHK_T0="" CHK_PAT=""
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-brake.XXXXXX")"
+export CBT_MAIN_PID=$$   # pid of the running script; the test stubs use it to send Ctrl-C/TERM at a chosen moment
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -46,6 +50,7 @@ rec() {
   if [ -n "$detail" ]; then line="$line DETAIL=\"${detail//\"/\'}\""; fi
   redact "$line" | tee -a "$RESULTS_FILE"
   if [ "$2" = FAIL ]; then FAILS=$((FAILS + 1)); fi
+  if [ "$2" = INCONCLUSIVE ]; then INCONCS=$((INCONCS + 1)); fi
 }
 
 # aws_call: every AWS CLI call. stdout untouched; stderr is redacted before it reaches the screen
@@ -74,7 +79,11 @@ check_site_url() {
   local h="${SITE_URL#*://}"; h="${h%%[/?#]*}"; SITE_HOST="$(lower "${h%%:*}")"
   if [ -z "$SITE_HOST" ]; then echo "SITE_URL has no host" >&2; exit 2; fi
 }
-check_expect_code() { check_number EXPECT_CODE "$EXPECT_CODE"; check_number ATTEMPTS "$ATTEMPTS"; check_number RETRY_PAUSE "$RETRY_PAUSE"; check_number LOG_TRIES "$LOG_TRIES"; if [ "$ATTEMPTS" -lt 1 ]; then echo "ATTEMPTS must be at least 1" >&2; exit 2; fi; }
+check_expect_code() {
+  check_number EXPECT_CODE "$EXPECT_CODE"; check_number ATTEMPTS "$ATTEMPTS"; check_number RETRY_PAUSE "$RETRY_PAUSE"
+  check_number LOG_TRIES "$LOG_TRIES"; check_number LOG_CHECK_EVERY "$LOG_CHECK_EVERY"
+  if [ "$ATTEMPTS" -lt 1 ] || [ "$ATTEMPTS" -gt 5 ]; then echo "ATTEMPTS must be between 1 and 5, got: $ATTEMPTS" >&2; exit 2; fi
+}
 
 check_number() { case "$2" in ''|*[!0-9]*) echo "$1 must be a whole number, got: $2" >&2; exit 2 ;; esac; }
 
@@ -88,7 +97,9 @@ init_results() {
   } | while IFS= read -r l; do redact "$l"; done > "$RESULTS_FILE"
 }
 
-# load_stack: read the cost-protection stack parameters and outputs. Nothing is hardcoded.
+# load_stack [warn]: read the cost-protection stack parameters and outputs. Nothing is hardcoded.
+# With "warn" (--restore-only) a SITE_URL that does not match the distribution is only a warning: the restore targets
+# the stack's DistributionId, not SITE_URL.
 load_stack() {
   local j alarms
   j="$(aws_call cloudformation describe-stacks --stack-name "$STACK_NAME" --output json)" || die "cannot read stack $STACK_NAME"
@@ -98,19 +109,41 @@ load_stack() {
   alarms="$(jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="AlarmNames") | .OutputValue' <<<"$j")"
   FUNCTION_NAME="$(jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="FunctionName") | .OutputValue' <<<"$j")"
   ALARM_REQ="${alarms%%,*}"    # first name in AlarmNames is the requests alarm
+  IFS=, read -r -a ALARM_ALL <<<"$alarms"   # all alarms of the stack (requests and bytes): any of them can trip the brake
   case "$DIST_ID" in E[A-Z0-9]*) ;; *) DIST_ID=""; die "stack has no DistributionId parameter (is this the cost-protection stack?)" ;; esac
   case "$ACTION" in Disable|AlertOnly) ;; *) die "ActionOnTrip is '$ACTION', expected Disable or AlertOnly" ;; esac
   if [ -z "$ALARM_REQ" ] || [ -z "$FUNCTION_NAME" ]; then die "stack outputs AlarmNames or FunctionName are missing"; fi
-  check_site_matches_distribution
+  check_site_matches_distribution "${1:-}"
+}
+
+# host_matches NAME HOST: exact match, or NAME is a wildcard alias (*.example.com) and HOST adds exactly one label to it.
+host_matches() {
+  local n="$1" h="$2" rest pre
+  if [ "$n" = "$h" ]; then return 0; fi
+  case "$n" in '*.'?*) ;; *) return 1 ;; esac
+  rest="${n#\*}"                      # ".example.com"
+  case "$h" in *"$rest") ;; *) return 1 ;; esac
+  pre="${h%"$rest"}"
+  case "$pre" in ''|*.*) return 1 ;; esac
+  return 0
 }
 
 # The test hits SITE_URL and judges the distribution from the stack: they must be the same site.
+# check_site_matches_distribution [warn]: with "warn" a mismatch (or an unreadable distribution) is reported, not fatal.
 check_site_matches_distribution() {
-  local d names n ok=0
-  d="$(aws_call cloudfront get-distribution --id "$DIST_ID" --output json)" || die "cannot read the distribution from the stack"
+  local mode="${1:-}" d names n ok=0
+  if ! d="$(aws_call cloudfront get-distribution --id "$DIST_ID" --output json)"; then
+    if [ "$mode" = warn ]; then err "WARNING: cannot read the distribution to compare it with SITE_URL; restoring the stack's distribution anyway."; return 0; fi
+    die "cannot read the distribution from the stack"
+  fi
   names="$(jq -r '([.Distribution.DomainName // empty] + (.Distribution.DistributionConfig.Aliases.Items // []))[] | ascii_downcase' <<<"$d")" || die "cannot parse the distribution"
-  while IFS= read -r n; do if [ -n "$n" ] && [ "$n" = "$SITE_HOST" ]; then ok=1; fi; done <<<"$names"
-  if [ "$ok" != 1 ]; then die "SITE_URL host is neither the domain name nor an alias of the distribution in the stack. Nothing was changed."; fi
+  while IFS= read -r n; do if [ -n "$n" ] && host_matches "$n" "$SITE_HOST"; then ok=1; fi; done <<<"$names"
+  if [ "$ok" = 1 ]; then return 0; fi
+  if [ "$mode" = warn ]; then
+    err "WARNING: SITE_URL host is not the domain name or an alias of the stack's distribution. --restore-only re-enables the stack's distribution (DistributionId) anyway; the final site check uses SITE_URL and may fail."
+    return 0
+  fi
+  die "SITE_URL host is neither the domain name nor an alias of the distribution in the stack. Nothing was changed."
 }
 
 dist_enabled() { aws_call cloudfront get-distribution-config --id "$DIST_ID" --query 'DistributionConfig.Enabled' --output text; }
@@ -119,14 +152,54 @@ alarm_json()   { aws_call cloudwatch describe-alarms --alarm-names "$ALARM_REQ" 
 
 http_code() { curl -s -L --globoff -o /dev/null -w '%{http_code}' --max-time 15 "$1" || true; }
 
-# precheck_site: the site must answer EXPECT_CODE before we touch anything. Nothing is changed yet, so no auto-restore here;
-# but the distribution may be disabled from an earlier run (or a real trip), so the restore command is shown.
+# show_alarm_state: print the state of every stack alarm before anything is changed, and set ALARM_VERDICT:
+#   ok (none in ALARM), ours (in ALARM, forced by this test), real (in ALARM, NOT set by this test), unknown (could not read).
+show_alarm_state() {
+  local a lines n s w
+  ALARM_VERDICT=unknown
+  if ! a="$(aws_call cloudwatch describe-alarms --alarm-names "${ALARM_ALL[@]}" --output json)"; then err "WARNING: could not read the alarm state."; return 0; fi
+  lines="$(jq -r '.MetricAlarms[]? | [.AlarmName, .StateValue, (if ((.StateReason // "") | test("cost-brake-test")) then "set by this test" else "not set by this test" end)] | @tsv' <<<"$a" 2>/dev/null)" || lines=""
+  if [ -z "$lines" ]; then err "WARNING: could not read the alarm state."; return 0; fi
+  ALARM_VERDICT=ok
+  say "Alarm state now (before anything is changed):"
+  while IFS=$'\t' read -r n s w; do
+    if [ "$s" = ALARM ]; then
+      say "  $n: ALARM ($w)"
+      if [ "$w" = "set by this test" ]; then if [ "$ALARM_VERDICT" != real ]; then ALARM_VERDICT=ours; fi; else ALARM_VERDICT=real; fi
+    else
+      say "  $n: $s"
+    fi
+  done <<<"$lines"
+  if [ "$ALARM_VERDICT" = real ]; then say "WARNING: an alarm is in ALARM and this test did not set it: the cost brake may have tripped for REAL."; fi
+}
+
+# guard_restore (--restore-only): do not undo a real brake trip by accident. If an alarm is in ALARM without our marker
+# (or the state cannot be read), refuse unless --force was given or the user types RESTORE <last 4 of the distribution id>.
+guard_restore() {
+  local phrase="RESTORE ${DIST_ID: -4}" reply=""
+  case "$ALARM_VERDICT" in ok|ours) return 0 ;; esac
+  if [ "$ALARM_VERDICT" = real ]; then
+    err "An alarm is in ALARM and this test did not set it. The brake may have tripped for REAL: re-enabling now undoes it and the traffic (and cost) continues."
+  else
+    err "The alarm state could not be read, so a real brake trip cannot be ruled out."
+  fi
+  if [ "$FORCE" = 1 ]; then rec restore_guard OVERRIDDEN - "--force given, restoring although alarm state is $ALARM_VERDICT"; return 0; fi
+  err "Check the alarm (CloudWatch console) and your traffic first."
+  printf 'To restore anyway, type exactly  %s  : ' "$phrase"
+  IFS= read -r reply || true
+  if [ "$reply" != "$phrase" ]; then echo; echo "Phrase did not match. Nothing was changed."; exit 3; fi
+  rec restore_guard OVERRIDDEN - "phrase typed, restoring although alarm state is $ALARM_VERDICT"
+}
+
+# precheck_site: the site must answer EXPECT_CODE before we touch anything. Nothing is changed yet, so no auto-restore here:
+# the distribution may be disabled by a REAL trip, so we only show how to restore, after the warning.
 precheck_site() {
   local code
   code="$(http_code "$SITE_URL")"
   if [ "$code" != "$EXPECT_CODE" ]; then
     err "site answered HTTP $code before the test, expected $EXPECT_CODE (set EXPECT_CODE if your healthy site answers differently)."
-    err "If the distribution was left disabled by an earlier run, restore it first:"
+    err "The cost brake may have tripped for REAL. Check the alarm state above (and in the CloudWatch console) and your traffic first."
+    err "Only if you are sure an earlier test run left the distribution disabled, restore it:"
     restore_hint >&2
     exit 1
   fi
@@ -136,7 +209,7 @@ precheck_site() {
 require_alarm_ok() {
   local st
   st="$(alarm_json | jq -r '.MetricAlarms[0].StateValue // "MISSING"')" || die "cannot read the requests alarm"
-  if [ "$st" != OK ]; then die "the requests alarm is $st, not OK. Nothing was changed. Wait until it is OK (or find out why it is not) and run again."; fi
+  if [ "$st" != OK ]; then die "the requests alarm is $st, not OK, so it is not forced (again). Wait until it is OK and run again. If you did not expect this, the brake may have tripped for REAL: check the alarm before restoring anything."; fi
 }
 
 # confirm_disable: the site will go down, so the user must type an exact phrase.
@@ -224,18 +297,35 @@ ensure_log_group() {
 }
 
 LOG_JSON='[]'
-read_logs() { # START_EPOCH: sets LOG_JSON (AWS errors are printed, not swallowed)
+read_logs() { # START_EPOCH [quiet]: sets LOG_JSON. AWS errors are printed, not swallowed; with "quiet" a log group that
+  # does not exist yet (created on the first Lambda run) is silent.
+  local rc=0
   ensure_log_group
-  LOG_JSON="$(aws_call logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $((($1 - 1) * 1000)) --no-paginate --query 'events[].[timestamp,message]' --output json)" || LOG_JSON='[]'
+  LOG_JSON="$(aws --region "$REGION" logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $((($1 - 1) * 1000)) --no-paginate --query 'events[].[timestamp,message]' --output json 2>"$WORK/logs.err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then LOG_JSON='[]'; fi
+  if [ -s "$WORK/logs.err" ]; then
+    if [ "${2:-}" = quiet ] && grep -q ResourceNotFoundException "$WORK/logs.err"; then :; else redact "$(cat "$WORK/logs.err")" >&2; fi
+  fi
+  return 0
 }
 log_has() { jq -e --arg p "$1" 'map(select(.[1] | test($p))) | length > 0' <<<"$LOG_JSON" >/dev/null 2>&1; }
 
 # lambda_not_confirmed: 0 when the Lambda logged "not confirmed" since CHK_T0 and no line matches CHK_PAT.
 # The forced ALARM can revert within about a minute; the Lambda then refuses to act. Not a defect of the brake.
 lambda_not_confirmed() {
-  read_logs "$CHK_T0"
+  read_logs "$CHK_T0" quiet
   if log_has 'not confirmed' && ! log_has "$CHK_PAT"; then return 0; fi
   return 1
+}
+# lambda_not_confirmed_poll: the same, for WAIT_CHECK inside the 5 s poll loop, but at most every LOG_CHECK_EVERY seconds
+# (counted from CHK_T0, so a new attempt waits again): CloudWatch Logs is slow and has API limits.
+lambda_not_confirmed_poll() {
+  local now base
+  now="$(date +%s)"; base="$LAST_LOG_CHECK"
+  if [ "$base" -lt "$CHK_T0" ]; then base="$CHK_T0"; fi
+  if [ $((now - base)) -lt "$LOG_CHECK_EVERY" ]; then return 1; fi
+  LAST_LOG_CHECK="$now"
+  lambda_not_confirmed
 }
 
 # fetch_logs START_EPOCH PATTERN: sets LOG_JSON. 0 a message matches, 3 only "not confirmed" seen, 1 nothing after LOG_TRIES.
@@ -264,8 +354,8 @@ collect_evidence() {
       first="$(jq -r --arg p "$pat" '[.[] | select(.[1] | test($p)) | .[0]] | min' <<<"$LOG_JSON")"
       rec lambda_log PASS "$(( first / 1000 - t ))" "log line matching '$pat' found"
       say "Lambda log lines since T0 (first 15):"
-      # head closes the pipe early on long logs: SIGPIPE must not kill the script (pipefail + set -e)
-      jq -r '.[] | "  " + (.[1] | gsub("[\\r\\n]+$"; ""))' <<<"$LOG_JSON" | head -n 15 | while IFS= read -r l; do say "$l"; done || true ;;
+      # jq takes the first 15 itself: no "| head" that closes the pipe early (SIGPIPE is ignored, so jq would complain)
+      jq -r '.[:15][] | "  " + (.[1] | gsub("[\\r\\n]+$"; ""))' <<<"$LOG_JSON" | while IFS= read -r l; do say "$l"; done || true ;;
     3) rec lambda_log INCONCLUSIVE - "$NOT_CONFIRMED_HINT" ;;
     *) rec lambda_log FAIL - "no log line matching '$pat' in $LOG_GROUP after $LOG_TRIES tries" ;;
   esac
@@ -346,14 +436,31 @@ restore_hint() {
   printf "  aws cloudformation describe-stacks --region us-east-1 --stack-name %q --query \"Stacks[0].Outputs[?OutputKey=='ReEnableCommand'].OutputValue\" --output text\n" "$STACK_NAME"
 }
 
-# on_exit: a second Ctrl-C, SIGTERM or SIGHUP must not interrupt the cleanup, so they are ignored from here on.
+# pick_output: after "exec >&3 2>&4", find an output that still works. With "./x.sh | tee log" a Ctrl-C kills tee too,
+# so stdout is a dead pipe: then use stderr, or the terminal, or nothing (but never stop the cleanup).
+pick_output() {
+  local o=0 e=0
+  if { printf '\n' >&3; } 2>/dev/null; then o=1; fi
+  if { printf '\n' >&4; } 2>/dev/null; then e=1; fi
+  if [ "$o" = 1 ] && [ "$e" = 1 ]; then return 0; fi
+  if [ "$o" = 1 ]; then exec 2>&1; return 0; fi
+  if [ "$e" = 1 ]; then exec 1>&2; return 0; fi
+  if { printf '\n' >>"$TTY_FALLBACK"; } 2>/dev/null; then exec >>"$TTY_FALLBACK" 2>&1; return 0; fi
+  exec >/dev/null 2>&1
+}
+
+# on_exit: a second Ctrl-C, SIGTERM or SIGHUP must not interrupt the cleanup, so they are ignored from here on,
+# and so is SIGPIPE: a dead "| tee" must not kill the restore.
 # Order: hint first (it is the lifeline), reset our forced alarm, then restore the distribution.
 on_exit() {
-  local rc=$?
+  local rc=$?       # must be read before any other command
+  trap '' PIPE
   trap '' INT TERM HUP
   trap - EXIT
   set +e
-  exec >&3 2>&4   # a signal can arrive inside "aws_call ... >/dev/null": talk to the real terminal again
+  WAIT_CHECK=""     # the restore's wait_state must not stop on a "not confirmed" log line of the test
+  exec >&3 2>&4     # a signal can arrive inside "aws_call ... >/dev/null": talk to the real terminal again
+  pick_output
   if [ "$NEED_RESTORE" = 1 ]; then
     NEED_RESTORE=0
     if [ "$NO_AUTO" = 1 ]; then
@@ -369,7 +476,11 @@ on_exit() {
   if [ "$ALARM_FIRED" = 1 ] && [ "$NO_AUTO" != 1 ]; then reset_alarm_if_ours; fi
   if [ -f "$RESULTS_FILE" ]; then echo; echo "Summary ($RESULTS_FILE, redacted):"; grep -v '^#' "$RESULTS_FILE"; fi
   rm -rf "$WORK"
-  if [ "$rc" -eq 0 ] && [ "$FAILS" -gt 0 ]; then rc=1; fi
+  # exit codes: 0 pass, 1 fail, 4 inconclusive (Disable mode only: the brake was not proven), others see README
+  if [ "$rc" -eq 0 ] && [ "$FAILS" -gt 0 ]; then rc=1
+  elif [ "$rc" -eq 0 ] && [ "$INCONC_EXIT" = 1 ] && [ "$INCONCS" -gt 0 ]; then rc=4; fi
   exit "$rc"
 }
-install_traps() { exec 3>&1 4>&2; trap on_exit EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; }
+# SIGPIPE is ignored for the whole run: a write to a dead pipe then fails (and set -e ends the run through on_exit,
+# which restores) instead of killing the script on the spot with the distribution still disabled.
+install_traps() { exec 3>&1 4>&2; trap '' PIPE; trap on_exit EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; }

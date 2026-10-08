@@ -7,10 +7,11 @@
 #   STACK_NAME=<cost-protection stack> SITE_URL=https://<your blog> [N=300] [BATCH=50] ./flood.sh [--dry-run] [--no-auto-restore]
 # Environment (optional): N (300 requests, max 2000, and at most 3 x RequestsPer5Min + 100), BATCH (50 parallel curls, max 50),
 #   REGION (us-east-1 only), TIMEOUT (900), POLL_INTERVAL (5), ALERT_WAIT (120), RESULTS_DIR (.),
-#   EXPECT_CODE (200, status of your healthy site), LOG_TRIES (12), EMAIL_PROMPT_TIMEOUT (120)
+#   EXPECT_CODE (200, status of your healthy site), LOG_TRIES (12), EMAIL_PROMPT_TIMEOUT (120), LOG_CHECK_EVERY (30)
+# Do not pipe its output (no "| tee"); run it inside tmux. The results file is the log.
+# Exit codes: 0 pass, 1 fail, 2 bad input, 3 phrase did not match, 4 inconclusive (Disable mode), 129/130/143 signal
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-TIMEOUT="${TIMEOUT:-900}"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 N="${N:-300}"; BATCH="${BATCH:-50}"
@@ -37,9 +38,10 @@ if [ "$DRY" = 1 ]; then
 DRY RUN: nothing is called or changed. The real run executes, in this order (region $REGION):
 + aws cloudformation describe-stacks --stack-name $STACK_NAME --output json   (refuses unless RequestsPer5Min is a number below N=$N and N <= 3 x RequestsPer5Min + 100)
 + aws cloudfront get-distribution --id <distribution id>   (SITE_URL host must be the distribution domain or one of its aliases)
++ aws cloudwatch describe-alarms --alarm-names <all stack alarms>   (state is shown first; a real trip is flagged)
 + curl -L --globoff $SITE_URL   (must answer $EXPECT_CODE); aws cloudwatch describe-alarms (the alarm must be OK); Disable mode needs the typed phrase 'DISABLE <last 4 chars of distribution id>'
 + $N x curl -s --globoff -o /dev/null "<SITE_URL without query>/?cbt=<run>-<i>" in parallel batches of $BATCH      (T0 = time of the first request)
-+ poll every ${POLL_INTERVAL}s: aws cloudwatch describe-alarms --alarm-names <requests alarm>
++ poll every ${POLL_INTERVAL}s, up to ${TIMEOUT}s: aws cloudwatch describe-alarms --alarm-names <requests alarm>
 + evidence: aws lambda get-function-configuration (log group), aws logs filter-log-events --no-paginate
 + then: aws cloudfront get-distribution-config / get-distribution (Disable: Enabled=false and Deployed; AlertOnly: stays Enabled for ${ALERT_WAIT}s)
 + Disable: wait until the alarm is OK again (so it cannot re-trigger), then restore as in test-disable-enable.sh
@@ -56,6 +58,8 @@ fi
 if [ "$N" -gt $((3 * THRESHOLD + 100)) ]; then
   die "N is $N but RequestsPer5Min is only $THRESHOLD: more than 3 x threshold + 100 requests is a needless flood. Lower N or raise the threshold a little."
 fi
+if [ "$ACTION" = Disable ]; then INCONC_EXIT=1; fi   # Disable: INCONCLUSIVE exits 4, the brake was not proven
+show_alarm_state
 precheck_site
 require_alarm_ok
 say "Scenario FLOOD ($ACTION): $N requests in batches of $BATCH against the site; threshold is $THRESHOLD per 5 minutes."
@@ -93,7 +97,7 @@ if [ "$rc" -eq 0 ]; then
     else die "AWS call failed while watching the distribution"; fi
     collect_evidence "$T0" "$T0_ISO" 'AlertOnly: would disable'
   else
-    CHK_PAT='disabled distribution'; WAIT_CHECK=lambda_not_confirmed
+    CHK_PAT='disabled distribution'; WAIT_CHECK=lambda_not_confirmed_poll
     rc=0; wait_state false "$T0" || rc=$?
     WAIT_CHECK=""
     if [ "$rc" -eq 0 ]; then
