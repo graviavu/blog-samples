@@ -6,4 +6,4 @@ if [ -n "${STUB_FLOOD_AT:-}" ]; then
   n=$(grep -c '^curl ' "$S/calls.log")
   if [ "$n" -ge "$STUB_FLOOD_AT" ] && mkdir "$S/flood.lock" 2>/dev/null; then trip_alarm; fi
 fi
-if [ "$(get enabled "${STUB_INIT_ENABLED:-true}")" = true ]; then echo 200; else echo 403; fi
+if [ "$(get enabled "${STUB_INIT_ENABLED:-true}")" = true ]; then echo "${STUB_CURL_CODE:-200}"; else echo 403; fi

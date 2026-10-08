@@ -3,31 +3,42 @@
 . "$(dirname "$0")/stub-lib.sh"
 [ "$1" = "--region" ] && shift 2
 svc="$1"; cmd="$2"; shift 2
+D="${STUB_DIST:-EFAKETEST1234}"
 echo "$svc $cmd $*" >> "$S/calls.log"
 if [ -n "${STUB_FAIL_NTH:-}" ] && [ "$cmd" = "${STUB_FAIL_NTH%%:*}" ]; then
   n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
-  if [ "$n" = "${STUB_FAIL_NTH##*:}" ]; then echo "stub: simulated failure of $cmd" >&2; exit 254; fi
+  if [ "$n" = "${STUB_FAIL_NTH##*:}" ]; then acct="$(printf '%s%s' 1234 56789012)"; echo "stub: simulated failure of $cmd (arn:aws:iam::$acct:role/x, account $acct, dist $D, host dfaketest.cloudfront.net)" >&2; exit 254; fi
 fi
 arg() { local k="$1"; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then echo "$2"; return; fi; shift; done; }
-D="${STUB_DIST:-EFAKETEST1234}"
 case "$svc $cmd" in
   "cloudformation describe-stacks")
     cat <<JSON
-{"Stacks":[{"Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"${STUB_THRESHOLD:-10000}"}],
-"Outputs":[{"OutputKey":"AlarmNames","OutputValue":"fake-stack-RequestsAlarm-X,fake-stack-BytesAlarm-Y"},{"OutputKey":"FunctionName","OutputValue":"fake-stack-brake"}]}]}
+{"Stacks":[{"Parameters":[{"ParameterKey":"DistributionId","ParameterValue":"$D"},{"ParameterKey":"ActionOnTrip","ParameterValue":"${STUB_ACTION:-Disable}"},{"ParameterKey":"RequestsPer5Min","ParameterValue":"${STUB_THRESHOLD-10000}"}],
+"Outputs":[{"OutputKey":"AlarmNames","OutputValue":"fake-stack-RequestsAlarm-X,fake-stack-BytesAlarm-Y"},{"OutputKey":"FunctionName","OutputValue":"$FN_NAME"}]}]}
 JSON
     ;;
   "cloudfront get-distribution-config")
     en=$(get enabled "${STUB_INIT_ENABLED:-true}")
     case "$*" in
       *"DistributionConfig.Enabled"*) if [ "$en" = true ]; then echo True; else echo False; fi ;;
-      *) echo "{\"ETag\":\"ETAG1\",\"DistributionConfig\":{\"Comment\":\"fake\",\"Enabled\":$en}}" ;;
+      *) echo "{\"ETag\":\"$(get etag ETAG1)\",\"DistributionConfig\":{\"Comment\":\"fake\",\"Enabled\":$en}}" ;;
     esac ;;
   "cloudfront get-distribution")
-    p=$(get pending 0)
-    if [ "$p" -gt 0 ]; then put pending $((p - 1)); echo InProgress; else echo Deployed; fi ;;
+    case "$*" in
+      *"Distribution.Status"*)
+        p=$(get pending 0)
+        if [ "$p" -gt 0 ]; then put pending $((p - 1)); echo InProgress; else echo Deployed; fi ;;
+      *) echo "{\"Distribution\":{\"DomainName\":\"dfaketest.cloudfront.net\",\"Status\":\"Deployed\",\"DistributionConfig\":{\"Aliases\":{\"Quantity\":1,\"Items\":[\"${STUB_ALIAS:-blog.fake-host.example}\"]}}}}" ;;
+    esac ;;
+  "lambda get-function-configuration")
+    if [ "$(arg --function-name "$@")" != "$FN_NAME" ]; then echo "stub: ResourceNotFoundException: function not found" >&2; exit 254; fi
+    case "$*" in *LoggingConfig.LogGroup*) echo "${STUB_LG_ANSWER-$LOG_GROUP_REAL}" ;; *) echo '{}' ;; esac ;;
   "cloudfront update-distribution")
-    if [ "$(arg --if-match "$@")" != ETAG1 ]; then echo "stub: PreconditionFailed" >&2; exit 254; fi
+    if [ "${STUB_PRECOND_ONCE:-0}" = 1 ] && [ "$(get precond_done 0)" = 0 ]; then
+      put precond_done 1; put etag ETAG2   # somebody else changed the config: our ETag is stale
+      echo "An error occurred (PreconditionFailed) when calling the UpdateDistribution operation: The If-Match version is missing or not valid" >&2; exit 254
+    fi
+    if [ "$(arg --if-match "$@")" != "$(get etag ETAG1)" ]; then echo "An error occurred (PreconditionFailed): stale ETag" >&2; exit 254; fi
     f="$(arg --distribution-config "$@")"; f="${f#file://}"
     put enabled "$(jq -r '.Enabled' "$f")"; put pending 2; echo '{}' ;;
   "cloudwatch set-alarm-state")
@@ -36,7 +47,7 @@ JSON
     if [ "$st" = ALARM ]; then lambda_runs; fi
     if [ "${STUB_INT:-0}" = 1 ]; then kill -INT "$PPID"; fi ;;
   "cloudwatch describe-alarms")
-    a=$(get alarm OK)
+    a=$(get alarm "${STUB_ALARM_INIT:-OK}")
     if [ "$a" = ALARM ]; then
       left=$(get alarm_ok_after 0)
       if [ "$left" -gt 0 ]; then put alarm_ok_after $((left - 1)); if [ "$left" = 1 ]; then put alarm OK; a=OK; fi; fi
@@ -44,12 +55,21 @@ JSON
     echo "{\"MetricAlarms\":[{\"AlarmName\":\"fake\",\"StateValue\":\"$a\",\"StateReason\":\"$(get reason none)\"}]}" ;;
   "cloudwatch describe-alarm-history")
     if [ "$(get alarm OK)" = ALARM ] || [ "$(get lambda_fired 0)" = 1 ]; then
-      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%S).123000+00:00\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
+      off="${STUB_TS_OFFSET:-+00:00}"   # e.g. +05:30, -08:00, Z: real CloudWatch answers in the caller's local offset
+      case "$off" in Z) osec=0 ;; *) sign=1; [ "${off%"${off#?}"}" = "-" ] && sign=-1; o="${off#?}"; osec=$(( sign * (10#${o%%:*} * 3600 + 10#${o##*:} * 60) )) ;; esac
+      e=$(( $(date +%s) + osec ))
+      lt="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%S)"
+      echo "{\"AlarmHistoryItems\":[{\"Timestamp\":\"$lt.123000$off\",\"HistorySummary\":\"Alarm updated from OK to ALARM\"}]}"
     else echo '{"AlarmHistoryItems":[]}'; fi ;;
   "logs filter-log-events")
-    if [ "$(get lambda_fired 0)" = 1 ]; then
-      if [ "${STUB_ACTION:-Disable}" = Disable ] || [ "${STUB_BREAK:-0}" = 1 ]; then m="[INFO] disabled distribution $D (alarm fake-stack-RequestsAlarm-X)"; else m="[INFO] AlertOnly: would disable $D (alarm fake)"; fi
-      echo "[[$(( $(date +%s) * 1000 )),\"$m\"]]"
+    # Only the real log group exists; any other name fails like AWS does.
+    if [ "$(arg --log-group-name "$@")" != "$LOG_GROUP_REAL" ]; then
+      echo "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist." >&2; exit 254
+    fi
+    case "$*" in *--no-paginate*) ;; *) echo "stub: filter-log-events called without --no-paginate" >&2; exit 98 ;; esac
+    st="$(arg --start-time "$@")"
+    if [ -s "$S/events" ]; then
+      jq -Rn --argjson st "$st" '[inputs | split("\t") | select((.[0] | tonumber) >= $st) | [(.[0] | tonumber), .[1]]]' < "$S/events"
     else echo '[]'; fi ;;
   *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
 esac

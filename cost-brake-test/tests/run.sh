@@ -5,7 +5,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 export PATH="$here/bin:$PATH"
-export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1
+export POLL_INTERVAL=0 ALERT_WAIT=1 TIMEOUT=3 LOG_TRIES=2 EMAIL_PROMPT_TIMEOUT=1 RETRY_PAUSE=3
 export STACK_NAME=fake-stack SITE_URL=https://blog.fake-host.example
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cbt.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 PASS=0 FAIL=0
@@ -27,7 +27,20 @@ run() {
   printf '%b' "$input" | "$@" > "$OUT" 2>&1; RC=$?
   RES="$(ls "$RESDIR"/results-*.txt 2>/dev/null | head -n 1)"; [ -n "$RES" ] || RES=/dev/null
 }
-reset_env() { unset STUB_ACTION STUB_LAMBDA STUB_BREAK STUB_INIT_ENABLED STUB_FAIL_NTH STUB_INT STUB_FLOOD_AT STUB_THRESHOLD; }
+reset_env() {
+  unset STUB_ACTION STUB_LAMBDA STUB_BREAK STUB_INIT_ENABLED STUB_FAIL_NTH STUB_INT STUB_FLOOD_AT STUB_THRESHOLD \
+    STUB_ALARM_INIT STUB_REVERT STUB_LG_ANSWER STUB_LOG_GROUP STUB_TS_OFFSET STUB_LOG_LINES STUB_ALIAS STUB_CURL_CODE STUB_PRECOND_ONCE EXPECT_CODE
+}
+before() { # FILE PATTERN_A PATTERN_B: first line matching A comes before first line matching B
+  local a b
+  a=$(grep -n -- "$2" "$1" | head -n 1 | cut -d: -f1); b=$(grep -n -- "$3" "$1" | head -n 1 | cut -d: -f1)
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
+}
+secs_between() { # RESULTS TEST MIN MAX: the SECONDS= value of that TEST line lies in [MIN, MAX]
+  local v; v=$(grep "TEST=$2 " "$1" | head -n 1 | sed -n 's/.*SECONDS=\(-\{0,1\}[0-9]*\).*/\1/p')
+  [ -n "$v" ] && [ "$v" -ge "$3" ] && [ "$v" -le "$4" ]
+}
+count_is() { [ "$(grep -c -- "$2" "$1")" = "$3" ]; }
 T="$root/test-disable-enable.sh"; F="$root/flood.sh"
 
 echo "disable path"
@@ -40,11 +53,19 @@ check "lambda_log PASS" has "$RES" 'TEST=lambda_log RESULT=PASS'
 check "alarm_history PASS" has "$RES" 'TEST=alarm_history RESULT=PASS'
 check "email_minute measured" has "$RES" 'TEST=email_minute RESULT=MEASURED'
 check "restore enabled and deployed" has "$RES" 'TEST=restore_deployed RESULT=PASS'
-check "site 200 after restore" has "$RES" 'TEST=site_http_200 RESULT=PASS'
+check "site 200 after restore" has "$RES" 'TEST=site_http RESULT=PASS'
 check "alarm reset PASS" has "$RES" 'TEST=alarm_reset RESULT=PASS'
 check "distribution ends enabled" test "$(state enabled)" = true
 check "alarm ends OK" test "$(state alarm)" = OK
 check "restore used If-Match" has "$STUB_DIR/calls.log" 'update-distribution.*--if-match ETAG1'
+check "log group read from the function (auto-style name)" has "$STUB_DIR/calls.log" 'get-function-configuration --function-name fake-stack-BrakeFunction-AbC123xyz.*LoggingConfig.LogGroup'
+check "logs read from the configured group, no pagination" has "$STUB_DIR/calls.log" 'filter-log-events --log-group-name /aws/lambda/fake-stack-brake .*--no-paginate'
+check "alarm history seconds sane" secs_between "$RES" alarm_history -2 120
+check "site host checked against the distribution" has "$STUB_DIR/calls.log" 'cloudfront get-distribution --id EFAKETEST1234 --output json'
+check "alarm read before it is forced" before "$STUB_DIR/calls.log" describe-alarms 'set-alarm-state.*ALARM'
+check "forced alarm reset BEFORE the restore" before "$STUB_DIR/calls.log" 'state-value OK' update-distribution
+check "curl follows redirects and uses --globoff" has "$STUB_DIR/calls.log" '^curl -s -L --globoff'
+check "results file is private (mode 600)" test "$(ls -l "$RES" | cut -c1-10)" = "-rw-------"
 check "no distribution id in results" hasnot "$RES" EFAKETEST1234
 check "no site host in results" hasnot "$OUT" fake-host.example
 
@@ -125,6 +146,133 @@ REGION=eu-west-1 run region '' "$T"; check "other region exit 2" test "$RC" = 2
 STACK_NAME='' run nostack '' "$T" ; check "missing STACK_NAME exit 2" test "$RC" -ne 0
 SITE_URL=http://x.example run http '' "$T"; check "http SITE_URL exit 2" test "$RC" = 2
 
+
+echo "stub no longer hides: timestamp offsets"
+for off in +05:30 -08:00 Z +00:00; do
+  export STUB_ACTION=Disable STUB_TS_OFFSET=$off
+  run "off$off" 'DISABLE 1234\n\n' "$T"
+  check "history offset $off parsed, seconds sane" secs_between "$RES" alarm_history -2 120
+done
+reset_env
+
+echo "stub no longer hides: log group"
+export STUB_ACTION=Disable STUB_LG_ANSWER=None
+run lgfallback 'DISABLE 1234\n\n' "$T"
+check "falls back to /aws/lambda/<stack>-brake" has "$RES" 'TEST=lambda_log RESULT=PASS'
+check "says it fell back" has "$OUT" 'could not read'
+export STUB_LOG_GROUP=/aws/lambda/some-custom-group
+run lgwrong 'DISABLE 1234\n\n' "$T"
+check "wrong group is a FAIL" has "$RES" 'TEST=lambda_log RESULT=FAIL'
+check "AWS error is printed, not swallowed" has "$OUT" 'ResourceNotFoundException'
+unset STUB_LG_ANSWER
+run lgcustom 'DISABLE 1234\n\n' "$T"
+check "custom log group found through the function config" has "$RES" 'TEST=lambda_log RESULT=PASS'
+reset_env
+
+echo "long Lambda log (head closes the pipe)"
+export STUB_ACTION=AlertOnly STUB_LOG_LINES=8000
+run biglog '\n' "$T"
+check "exit 0 despite SIGPIPE risk" test "$RC" = 0
+check "lambda_log PASS" has "$RES" 'TEST=lambda_log RESULT=PASS'
+reset_env
+
+echo "alarm must be OK first"
+export STUB_ACTION=Disable STUB_ALARM_INIT=ALARM
+run alarmbad 'DISABLE 1234\n' "$T"
+check "refuses" test "$RC" -ne 0
+check "says the alarm is not OK" has "$OUT" 'not OK'
+check "alarm never forced" hasnot "$STUB_DIR/calls.log" set-alarm-state
+check "distribution untouched" hasnot "$STUB_DIR/calls.log" update-distribution
+export STUB_ALARM_INIT=INSUFFICIENT_DATA
+run alarmdata 'DISABLE 1234\n' "$T"
+check "INSUFFICIENT_DATA refused too" test "$RC" -ne 0
+reset_env
+
+echo "site pre-check"
+export STUB_ACTION=Disable STUB_INIT_ENABLED=false
+run pre403 'DISABLE 1234\n' "$T"
+check "refuses when site is not healthy" test "$RC" -ne 0
+check "prints the restore command" has "$OUT" -e '--restore-only'
+check "nothing changed" hasnot "$STUB_DIR/calls.log" 'set-alarm-state\|update-distribution'
+reset_env; export STUB_ACTION=AlertOnly STUB_CURL_CODE=301
+run pre301 '\n' "$T"
+check "301 is refused by default" test "$RC" -ne 0
+EXPECT_CODE=301 run pre301ok '\n' "$T"
+check "EXPECT_CODE=301 accepted" test "$RC" = 0
+check "site check uses EXPECT_CODE after restore" has "$RES" 'TEST=site_http RESULT=PASS.*HTTP 301'
+reset_env
+
+echo "forced alarm reverts (Lambda logs 'not confirmed')"
+export STUB_ACTION=Disable STUB_REVERT=1
+run revert1 'DISABLE 1234\n\n' "$T"
+check "retried and passed" has "$RES" 'TEST=enabled_false RESULT=PASS'
+check "alarm forced twice" count_is "$STUB_DIR/calls.log" 'set-alarm-state.*--state-value ALARM' 2
+check "exit 0" test "$RC" = 0
+export STUB_REVERT=9
+run revert9 'DISABLE 1234\n\n' "$T"
+check "INCONCLUSIVE, not FAIL" has "$RES" 'TEST=enabled_false RESULT=INCONCLUSIVE'
+check "lambda_log INCONCLUSIVE with hint" has "$RES" "TEST=lambda_log RESULT=INCONCLUSIVE.*not confirmed"
+check "no FAIL anywhere" hasnot "$RES" 'RESULT=FAIL'
+check "gave up after ATTEMPTS=3" count_is "$STUB_DIR/calls.log" 'set-alarm-state.*--state-value ALARM' 3
+check "distribution still enabled" test "$(state enabled)" = true
+export STUB_ACTION=AlertOnly
+run revertalert '\n' "$T"
+check "alert-only INCONCLUSIVE" has "$RES" 'TEST=alertonly_stays_enabled RESULT=INCONCLUSIVE'
+reset_env
+
+echo "SITE_URL checks"
+SITE_URL='https://blog.fake-host.example@evil.example' run at '' "$T"
+check "'@' in SITE_URL exit 2" test "$RC" = 2
+export STUB_ACTION=Disable STUB_ALIAS=other.example
+run alias 'DISABLE 1234\n' "$T"
+check "host not an alias of the distribution: refused" test "$RC" -ne 0
+check "alarm never touched" hasnot "$STUB_DIR/calls.log" set-alarm-state
+run aliasrestore '' "$T" --restore-only
+check "restore-only refuses too" test "$RC" -ne 0
+check "restore-only changed nothing" hasnot "$STUB_DIR/calls.log" update-distribution
+reset_env; export STUB_ACTION=AlertOnly
+SITE_URL=https://dfaketest.cloudfront.net run cfdomain '\n' "$T"
+check "distribution domain name accepted" test "$RC" = 0
+check "cloudfront domain not in output" hasnot "$OUT" dfaketest
+reset_env
+
+echo "restore: PreconditionFailed is retried with a fresh ETag"
+export STUB_INIT_ENABLED=false STUB_PRECOND_ONCE=1
+run precond '' "$T" --restore-only
+check "ends enabled" test "$(state enabled)" = true
+check "second update used the new ETag" has "$STUB_DIR/calls.log" 'update-distribution.*--if-match ETAG2'
+check "two update calls" count_is "$STUB_DIR/calls.log" '^cloudfront update-distribution' 2
+reset_env
+
+echo "exit trap order and hint"
+export STUB_ACTION=Disable STUB_INT=1
+run introrder 'DISABLE 1234\n' "$T"
+check "hint printed before the restore starts" before "$OUT" 'restore-only' 'Restore: enabling'
+check "forced alarm reset before the restore" before "$STUB_DIR/calls.log" 'state-value OK' update-distribution
+check "on_exit ignores INT TERM HUP" grep -q "trap '' INT TERM HUP" "$root/lib.sh"
+reset_env
+export STUB_ACTION=Disable STUB_FAIL_NTH=get-distribution:2
+STACK_NAME="fake stack" run quote 'DISABLE 1234\n' "$T" --no-auto-restore
+check "restore hint is shell-quoted (printf %q)" has "$OUT" 'STACK_NAME=fake\\ stack'
+reset_env
+
+echo "redaction of AWS errors and dry-run text"
+export STUB_ACTION=Disable STUB_FAIL_NTH=get-distribution:2
+d="$(printf '%s%s' 1234 56789012)"
+run errredact 'DISABLE 1234\n' "$T"
+check "AWS stderr shown" has "$OUT" 'simulated failure'
+check "account id redacted in stderr" hasnot "$OUT" "$d"
+check "arn redacted in stderr" hasnot "$OUT" 'arn:aws'
+check "cloudfront domain redacted in stderr" hasnot "$OUT" 'dfaketest'
+reset_env
+run dryredact '' "$T" --dry-run
+check "dry-run text hides the site host" hasnot "$OUT" 'fake-host.example'
+run dryfloodredact '' "$F" --dry-run
+check "flood dry-run text hides the site host" hasnot "$OUT" 'fake-host.example'
+
+echo ".gitignore"
+check "results-*.txt ignored" grep -q '^results-\*\.txt' "$root/../.gitignore"
+
 echo "flood"
 export STUB_ACTION=Disable STUB_THRESHOLD=10 STUB_FLOOD_AT=10 N=20 BATCH=5
 run flood 'DISABLE 1234\n\n' "$F"
@@ -133,7 +281,7 @@ check "sent N requests" has "$RES" 'TEST=flood_sent RESULT=PASS.*20 requests sen
 check "alarm_in_alarm PASS" has "$RES" 'TEST=alarm_in_alarm RESULT=PASS'
 check "enabled_false PASS" has "$RES" 'TEST=enabled_false RESULT=PASS'
 check "waited for alarm OK" has "$RES" 'TEST=alarm_back_to_ok RESULT=PASS'
-check "site 200 after restore" has "$RES" 'TEST=site_http_200 RESULT=PASS'
+check "site 200 after restore" has "$RES" 'TEST=site_http RESULT=PASS'
 check "ends enabled" test "$(state enabled)" = true
 check "real alarm never forced to OK by the script" hasnot "$STUB_DIR/calls.log" 'state-value OK'
 export STUB_THRESHOLD=10 STUB_ACTION=AlertOnly STUB_FLOOD_AT=10 N=20
@@ -145,6 +293,39 @@ check "refuses when threshold >= N" test "$RC" -ne 0
 check "no request sent" hasnot "$STUB_DIR/calls.log" 'cbt='
 unset N BATCH; reset_env
 
+echo "flood guards"
+export STUB_ACTION=AlertOnly STUB_THRESHOLD=10 N=20 BATCH=5
+STUB_THRESHOLD='' run thrempty '' "$F"
+check "empty RequestsPer5Min: exit 2" test "$RC" = 2
+check "no request sent" hasnot "$STUB_DIR/calls.log" 'cbt='
+STUB_THRESHOLD=abc run thrabc '' "$F"
+check "non-numeric RequestsPer5Min: exit 2" test "$RC" = 2
+N=2001 run ncap '' "$F"
+check "N above 2000: exit 2" test "$RC" = 2
+BATCH=51 run bcap '' "$F"
+check "BATCH above 50: exit 2" test "$RC" = 2
+N=500 run nbig '' "$F"
+check "N above 3 x threshold + 100: refused" test "$RC" -ne 0
+check "no request sent" hasnot "$STUB_DIR/calls.log" 'cbt='
+STUB_ALARM_INIT=ALARM run floodalarm '' "$F"
+check "alarm not OK: refused before traffic" test "$RC" -ne 0
+check "no request sent" hasnot "$STUB_DIR/calls.log" 'cbt='
+STUB_ALIAS=other.example run floodalias '' "$F"
+check "host not in distribution: refused" test "$RC" -ne 0
+check "no request sent" hasnot "$STUB_DIR/calls.log" 'cbt='
+SITE_URL='https://blog.fake-host.example@evil.example' run floodat '' "$F"
+check "'@' in SITE_URL: exit 2" test "$RC" = 2
+STUB_FLOOD_AT=10 SITE_URL='https://blog.fake-host.example/blog/?x=1#frag' run floodpath '\n' "$F"
+check "path kept, query dropped, cbt added" has "$STUB_DIR/calls.log" 'blog.fake-host.example/blog/?cbt=r'
+check "original query not in requests" hasnot "$STUB_DIR/calls.log" 'x=1/?cbt'
+check "flood curls use --globoff" has "$STUB_DIR/calls.log" 'curl -s --globoff -o /dev/null'
+echo "flood: first restore attempt fails, exit trap retries"
+export STUB_ACTION=Disable STUB_FLOOD_AT=10 STUB_FAIL_NTH=update-distribution:1
+run floodrestore 'DISABLE 1234\n\n' "$F"
+check "trap restored after the failed restore" test "$(state enabled)" = true
+check "says it is restoring again" has "$OUT" 'restoring the distribution'
+unset N BATCH; reset_env
+
 echo "redaction"
 d="$(printf '%s%s%s' 1234 5678 9012)"
 out="$(DIST_ID=EXYZ99 SITE_HOST=my.host.example bash -c ". '$root/lib.sh'; DIST_ID=EXYZ99 SITE_HOST=my.host.example; redact 'acct $d arn:aws:iam::$d:role/r id EXYZ99 host my.host.example ts 1789000000000'")"
@@ -152,6 +333,9 @@ check "account id removed" test "${out#*"$d"}" = "$out"
 check "arn removed" test "${out#*arn:aws}" = "$out"
 check "distribution id removed" test "${out#*EXYZ99}" = "$out"
 check "host removed" test "${out#*my.host.example}" = "$out"
+out2="$(DIST_ID=X SITE_HOST=y bash -c ". '$root/lib.sh'; redact 'domain d111abcdef8.cloudfront.net and www.example.com'")"
+check "cloudfront domain removed" test "${out2#*cloudfront.net}" = "$out2"
+check "other domains kept" has <(echo "$out2") www.example.com
 check "13-digit timestamp kept" has <(echo "$out") 1789000000000
 
 echo
