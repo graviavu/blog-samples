@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake curl: 200 while the fake distribution is enabled, 403 when disabled. Counts calls; can trip the alarm (flood test).
+. "$(dirname "$0")/stub-lib.sh"
+echo "curl $*" >> "$S/calls.log"
+if [ -n "${STUB_FLOOD_AT:-}" ]; then
+  n=$(grep -c '^curl ' "$S/calls.log")
+  if [ "$n" -ge "$STUB_FLOOD_AT" ] && mkdir "$S/flood.lock" 2>/dev/null; then trip_alarm; fi
+fi
+if [ "$(get enabled "${STUB_INIT_ENABLED:-true}")" = true ]; then echo 200; else echo 403; fi
