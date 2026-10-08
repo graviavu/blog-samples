@@ -21,6 +21,7 @@ RESULTS_FILE="$RESULTS_DIR/results-$STAMP.txt"
 
 FAILS=0 INCONCS=0 INCONC_EXIT=0 NEED_RESTORE=0 ALARM_FIRED=0 NO_AUTO=0 FORCE=0 LAST_LOG_CHECK=0 ALARM_VERDICT=unknown
 ALARM_ALL=()
+EVIDENCE_ONLY=0 LOG_SLACK=1 LOG_END_EPOCH="" HIST_TRIES=6 HIST_SLACK=2 HIST_END="" HIST_RAW="" HIST_TS="" LOG_MAXITEMS=2000
 DIST_ID="" SITE_HOST="" ACTION="" FUNCTION_NAME="" ALARM_REQ="" THRESHOLD=""
 W_SEC_FLAG="" W_SEC_DEPLOYED="" LOG_GROUP="" WAIT_CHECK="" CHK_T0="" CHK_PAT=""
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-brake.XXXXXX")"
@@ -99,7 +100,7 @@ init_results() {
 
 # load_stack [warn]: read the cost-protection stack parameters and outputs. Nothing is hardcoded.
 # With "warn" (--restore-only) a SITE_URL that does not match the distribution is only a warning: the restore targets
-# the stack's DistributionId, not SITE_URL.
+# the stack's DistributionId, not SITE_URL. With "nosite" (--evidence-only) SITE_URL is not used at all.
 load_stack() {
   local j alarms
   j="$(aws_call cloudformation describe-stacks --stack-name "$STACK_NAME" --output json)" || die "cannot read stack $STACK_NAME"
@@ -113,7 +114,7 @@ load_stack() {
   case "$DIST_ID" in E[A-Z0-9]*) ;; *) DIST_ID=""; die "stack has no DistributionId parameter (is this the cost-protection stack?)" ;; esac
   case "$ACTION" in Disable|AlertOnly) ;; *) die "ActionOnTrip is '$ACTION', expected Disable or AlertOnly" ;; esac
   if [ -z "$ALARM_REQ" ] || [ -z "$FUNCTION_NAME" ]; then die "stack outputs AlarmNames or FunctionName are missing"; fi
-  check_site_matches_distribution "${1:-}"
+  if [ "${1:-}" != nosite ]; then check_site_matches_distribution "${1:-}"; fi
 }
 
 # host_matches NAME HOST: exact match, or NAME is a wildcard alias (*.example.com) and HOST adds exactly one label to it.
@@ -269,18 +270,36 @@ wait_alarm() {
 }
 
 # Evidence from the stack itself. Both are best effort: they lag, so they are retried.
-# jq: CloudWatch timestamps come with any offset (Z, +00:00, +05:30, -0800) and optional fractions; convert to epoch seconds.
+# jq: CloudWatch timestamps come with any offset (Z, +00:00, +05:30, -0800, -05:00) and optional fractions; convert to epoch seconds.
+# The window is filtered here, not by the CLI (--start-date): $s = first epoch second wanted, $u = last (0 = no upper limit).
 HIST_JQ='def ep: if type == "number" then . else
     (sub("\\.[0-9]+"; "") | capture("^(?<b>.*?)(?<z>Z|[+-][0-9]{2}:?[0-9]{2})$")
      | (.b + "Z" | fromdateiso8601) - (if .z == "Z" then 0 else ((if .z[0:1] == "-" then -1 else 1 end) * ((.z[1:3] | tonumber) * 3600 + (.z[-2:] | tonumber) * 60)) end)) end;
-  [.AlarmHistoryItems[]? | select(.HistorySummary | test("to ALARM")) | .Timestamp | ep] | min // empty'
-alarm_history_seconds() { # START_EPOCH START_ISO -> prints seconds from start to the "to ALARM" history entry, or nothing
-  local t="$1" iso="$2" n=0 h ts
-  while [ "$n" -lt 6 ]; do
-    h="$(aws_call cloudwatch describe-alarm-history --alarm-name "$ALARM_REQ" --history-item-type StateUpdate --start-date "$iso" --output json)" || h='{}'
-    ts="$(jq -r "$HIST_JQ" <<<"$h" 2>/dev/null)" || ts=""
-    if [ -n "$ts" ]; then echo $((ts - t)); return 0; fi
-    n=$((n + 1)); sleep "$POLL_INTERVAL"
+  [.AlarmHistoryItems[]? | select((.HistorySummary // "") | test("to ALARM")) | (.Timestamp | ep) | select(. >= $s and ($u == 0 or . <= $u))] | min // empty'
+# alarm_history_once START_EPOCH: one call. Sets HIST_RAW (the answer, or the error text) and HIST_TS (epoch of the first
+# "to ALARM" entry in the window, empty if none). Returns 0 when found. Not used in a $(...) so the globals survive.
+# The AWS error text (redacted, by aws_call) goes to the screen; nothing is swallowed.
+alarm_history_once() {
+  local t="$1" h
+  HIST_RAW=""; HIST_TS=""
+  if ! h="$(aws_call cloudwatch describe-alarm-history --alarm-name "$ALARM_REQ" --history-item-type StateUpdate --max-records 100 --output json)"; then
+    HIST_RAW="(describe-alarm-history failed) $(cat "$WORK/aws.err" 2>/dev/null)"; return 1
+  fi
+  HIST_RAW="$h"
+  if ! HIST_TS="$(jq -r --argjson s $((t - HIST_SLACK)) --argjson u "${HIST_END:-0}" "$HIST_JQ" <<<"$h" 2>"$WORK/jq.err")"; then
+    HIST_TS=""; err "WARNING: could not parse the alarm history: $(cat "$WORK/jq.err")"; return 1
+  fi
+  if [ -z "$HIST_TS" ]; then return 1; fi
+  return 0
+}
+# alarm_history_seconds START_EPOCH: sets HIST_SECS (seconds from start to the "to ALARM" history entry). 0 found, 1 not found.
+HIST_SECS=""
+alarm_history_seconds() {
+  local t="$1" n=0
+  HIST_SECS=""
+  while [ "$n" -lt "$HIST_TRIES" ]; do
+    if alarm_history_once "$t"; then HIST_SECS=$((HIST_TS - t)); return 0; fi
+    n=$((n + 1)); if [ "$n" -lt "$HIST_TRIES" ]; then sleep "$POLL_INTERVAL"; fi
   done
   return 1
 }
@@ -296,13 +315,22 @@ ensure_log_group() {
   LOG_GROUP="$lg"
 }
 
+# read_logs START_EPOCH [quiet]: sets LOG_JSON = [[timestamp_ms, message], ...] and keeps the raw answer in $WORK/logs.raw.
+# AWS errors are printed, not swallowed; with "quiet" a log group that does not exist yet (created on the first Lambda run) is silent.
+# The CLI paginates by itself (no --no-paginate): filter-log-events can return an EMPTY first page with a nextToken, and the
+# matching events only come on a later page. No --query either: with several pages it would be applied page by page; the
+# reshaping is done in jq on the merged answer. --max-items caps the total.
 LOG_JSON='[]'
-read_logs() { # START_EPOCH [quiet]: sets LOG_JSON. AWS errors are printed, not swallowed; with "quiet" a log group that
-  # does not exist yet (created on the first Lambda run) is silent.
-  local rc=0
+read_logs() {
+  local rc=0 args
   ensure_log_group
-  LOG_JSON="$(aws --region "$REGION" logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $((($1 - 1) * 1000)) --no-paginate --query 'events[].[timestamp,message]' --output json 2>"$WORK/logs.err")" || rc=$?
-  if [ "$rc" -ne 0 ]; then LOG_JSON='[]'; fi
+  args=(--log-group-name "$LOG_GROUP" --start-time $((($1 - LOG_SLACK) * 1000)) --max-items "$LOG_MAXITEMS" --output json)
+  if [ -n "$LOG_END_EPOCH" ]; then args=("${args[@]}" --end-time $((LOG_END_EPOCH * 1000))); fi
+  aws --region "$REGION" logs filter-log-events "${args[@]}" >"$WORK/logs.raw" 2>"$WORK/logs.err" || rc=$?
+  LOG_JSON='[]'
+  if [ "$rc" -eq 0 ]; then
+    LOG_JSON="$(jq -c '(.events // []) | map([.timestamp, .message])' "$WORK/logs.raw" 2>"$WORK/jq.err")" || { LOG_JSON='[]'; err "WARNING: could not parse the Lambda log answer: $(cat "$WORK/jq.err")"; }
+  fi
   if [ -s "$WORK/logs.err" ]; then
     if [ "${2:-}" = quiet ] && grep -q ResourceNotFoundException "$WORK/logs.err"; then :; else redact "$(cat "$WORK/logs.err")" >&2; fi
   fi
@@ -343,21 +371,45 @@ fetch_logs() {
 
 NOT_CONFIRMED_HINT="the Lambda logged 'not confirmed': the forced ALARM went back to OK before its check, so it correctly did nothing. Run again; see README (forced alarm can revert)"
 
+# dump_raw LABEL TEXT: on INCONCLUSIVE or FAIL, show the redacted raw answer (first 2 KB) and write it to the results file as
+# comment lines, so it can be pasted for diagnosis.
+dump_raw() {
+  local label="$1" text="${2:-}" l
+  text="${text:0:2048}"
+  {
+    echo "# $label, raw response (first 2 KB, redacted):"
+    if [ -z "$text" ]; then echo "# (empty)"; else printf '%s\n' "$text" | while IFS= read -r l; do printf '# %s\n' "$l"; done; fi
+  } | redact_stream | tee -a "$RESULTS_FILE"
+}
+
 # collect_evidence START_EPOCH START_ISO LOG_PATTERN
 collect_evidence() {
-  local t="$1" iso="$2" pat="$3" s first rc=0
-  if s="$(alarm_history_seconds "$t" "$iso")"; then rec alarm_history PASS "$s" "history entry 'to ALARM' found"
-  else rec alarm_history INCONCLUSIVE - "no history entry found yet"; fi
+  local t="$1" pat="$3" first rc=0 n
+  if alarm_history_seconds "$t"; then rec alarm_history PASS "$HIST_SECS" "history entry 'to ALARM' found"
+  else
+    rec alarm_history INCONCLUSIVE - "no history entry found yet"
+    n="$(jq -r '[.AlarmHistoryItems[]?] | length' <<<"${HIST_RAW:-}" 2>/dev/null)" || n="?"
+    say "alarm_history: the answer had ${n:-0} history item(s), none 'to ALARM' inside the window. Last AWS error text, if any, is printed above."
+    dump_raw "alarm_history" "${HIST_RAW:-}"
+  fi
   fetch_logs "$t" "$pat" || rc=$?
   case "$rc" in
     0)
       first="$(jq -r --arg p "$pat" '[.[] | select(.[1] | test($p)) | .[0]] | min' <<<"$LOG_JSON")"
       rec lambda_log PASS "$(( first / 1000 - t ))" "log line matching '$pat' found"
-      say "Lambda log lines since T0 (first 15):"
-      # jq takes the first 15 itself: no "| head" that closes the pipe early (SIGPIPE is ignored, so jq would complain)
-      jq -r '.[:15][] | "  " + (.[1] | gsub("[\\r\\n]+$"; ""))' <<<"$LOG_JSON" | while IFS= read -r l; do say "$l"; done || true ;;
-    3) rec lambda_log INCONCLUSIVE - "$NOT_CONFIRMED_HINT" ;;
-    *) rec lambda_log FAIL - "no log line matching '$pat' in $LOG_GROUP after $LOG_TRIES tries" ;;
+      if [ "$EVIDENCE_ONLY" = 1 ]; then
+        say "Matching Lambda log lines (first 15):"
+        jq -r --arg p "$pat" '[.[] | select(.[1] | test($p))] | .[:15][] | "  " + (.[1] | gsub("[\\r\\n]+$"; ""))' <<<"$LOG_JSON" | while IFS= read -r l; do say "$l"; done || true
+      else
+        say "Lambda log lines since T0 (first 15):"
+        # jq takes the first 15 itself: no "| head" that closes the pipe early (SIGPIPE is ignored, so jq would complain)
+        jq -r '.[:15][] | "  " + (.[1] | gsub("[\\r\\n]+$"; ""))' <<<"$LOG_JSON" | while IFS= read -r l; do say "$l"; done || true
+      fi ;;
+    3) rec lambda_log INCONCLUSIVE - "$NOT_CONFIRMED_HINT"
+       dump_raw "lambda_log" "$(head -c 2048 "$WORK/logs.raw" 2>/dev/null)" ;;
+    *) rec lambda_log FAIL - "no log line matching '$pat' in $LOG_GROUP after $LOG_TRIES tries"
+       say "lambda_log: $(jq -r '(.events // []) | length' "$WORK/logs.raw" 2>/dev/null || echo '?') event(s) came back from $LOG_GROUP, none matching. Last AWS error text, if any, is printed above."
+       dump_raw "lambda_log" "$(head -c 2048 "$WORK/logs.raw" 2>/dev/null)" ;;
   esac
 }
 

@@ -42,7 +42,7 @@ DRY RUN: nothing is called or changed. The real run executes, in this order (reg
 + curl -L --globoff $SITE_URL   (must answer $EXPECT_CODE); aws cloudwatch describe-alarms (the alarm must be OK); Disable mode needs the typed phrase 'DISABLE <last 4 chars of distribution id>'
 + $N x curl -s --globoff -o /dev/null "<SITE_URL without query>/?cbt=<run>-<i>" in parallel batches of $BATCH      (T0 = time of the first request)
 + poll every ${POLL_INTERVAL}s, up to ${TIMEOUT}s: aws cloudwatch describe-alarms --alarm-names <requests alarm>
-+ evidence: aws lambda get-function-configuration (log group), aws logs filter-log-events --no-paginate
++ evidence: aws lambda get-function-configuration (log group), aws logs filter-log-events --max-items 2000
 + then: aws cloudfront get-distribution-config / get-distribution (Disable: Enabled=false and Deployed; AlertOnly: stays Enabled for ${ALERT_WAIT}s)
 + Disable: wait until the alarm is OK again (so it cannot re-trigger), then restore as in test-disable-enable.sh
 PLAN
