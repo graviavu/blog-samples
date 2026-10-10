@@ -78,6 +78,7 @@ case "$svc $cmd" in
     for f in "$S"/res/*__*; do
       [ -e "$f" ] || continue; b="$(basename "$f")"; k="${b%%__*}"; n="${b#*__}"
       [ "$(cat "$f")" = "$want" ] || continue
+      case " ${STUB_TAG_HIDE:-} " in *" $k "*) continue ;; esac   # STUB_TAG_HIDE="iam": the tag listing lags for that kind
       case "$k" in
         s3) printf 'arn:aws:s3:::%s\t' "$n" ;; iam) printf 'arn:aws:iam::%s:role/%s\t' "$acct12" "$n" ;;
         lambda) printf 'arn:aws:lambda:us-east-1:%s:function:%s\t' "$acct12" "$n" ;; cf) printf 'arn:aws:cloudfront::%s:distribution/%s\t' "$acct12" "$n" ;;

@@ -93,7 +93,7 @@ The simplest way is an admin of a test account. If you want less, this is the sh
      "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
     {"Effect": "Allow",
      "Action": ["lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:TagResource", "lambda:PublishVersion",
-                "lambda:PutFunctionConcurrency", "lambda:CreateFunctionUrlConfig", "lambda:DeleteFunctionUrlConfig", "lambda:AddPermission",
+                "lambda:PutFunctionConcurrency", "lambda:ListTags", "lambda:GetFunctionConfiguration", "lambda:CreateFunctionUrlConfig", "lambda:DeleteFunctionUrlConfig", "lambda:AddPermission",
                 "lambda:EnableReplication*", "lambda:DisableReplication*"],
      "Resource": "arn:aws:lambda:*:ACCOUNT:function:bhc-*"},
     {"Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
@@ -103,7 +103,8 @@ The simplest way is an admin of a test account. If you want less, this is the sh
                 "cloudfront:DeleteDistribution", "cloudfront:ListDistributions", "cloudfront:TagResource", "cloudfront:ListTagsForResource",
                 "cloudfront:CreateCachePolicy", "cloudfront:GetCachePolicy", "cloudfront:DeleteCachePolicy", "cloudfront:ListCachePolicies"],
      "Resource": "*"},
-    {"Effect": "Allow", "Action": ["logs:DescribeLogGroups", "logs:DeleteLogGroup"], "Resource": "*"}
+    {"Effect": "Allow", "Action": "logs:DescribeLogGroups", "Resource": "*"},
+    {"Effect": "Allow", "Action": "logs:DeleteLogGroup", "Resource": "arn:aws:logs:*:ACCOUNT:log-group:/aws/lambda/*bhc-*"}
   ]
 }
 ```
@@ -125,6 +126,8 @@ Custom: min TTL 0, default TTL 0, max TTL 86400 (above `outTtl`), no query strin
 - The test origin counter is per Lambda execution environment. If the environment restarts mid-test the counter restarts; the verdicts use the nonce and mark such a run INCONCLUSIVE rather than guess.
 
 ## Tests
+
+(`RT_RUNID` is a test hook that fixes the run id for the stub tests. It must still look like `2610101200-ab12`; leave it unset for a real run.)
 
 ```
 tests/run.sh                  # shell tests (fake aws/curl/date/sleep/zip) + node unit tests + shellcheck when available

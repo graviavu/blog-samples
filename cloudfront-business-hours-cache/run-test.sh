@@ -38,7 +38,7 @@ on_exit() {
     say ""
     teardown
     if [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
-      { printf '\n## Teardown\n\n'; if [ "$TD_FAIL" = 0 ]; then echo "Complete: every resource of this run was deleted."; else echo "INCOMPLETE: some resources of this run may still exist. See the screen output."; fi; } | redact >> "$RESULTS_FILE"
+      { printf '\n## Teardown\n\n'; if [ "$TD_FAIL" = 0 ]; then if [ -z "$LOGS_LEFT" ]; then echo "Complete: every resource of this run was deleted."; else echo "All resources deleted, but log groups left:$LOGS_LEFT"; fi; else echo "INCOMPLETE: some resources of this run may still exist. See the screen output."; fi; } | redact >> "$RESULTS_FILE"
     fi
     if [ "$TD_FAIL" = 0 ] && [ -n "$STATE_FILE" ]; then rm -f "$STATE_FILE"; fi
     if [ "$TD_FAIL" != 0 ]; then rc=4; fi   # an incomplete teardown always wins: leftovers must not be hidden by an earlier code
@@ -441,6 +441,7 @@ confirm() { # phrase
 }
 
 main_run() {
+  # RT_RUNID is a TEST HOOK (the stub tests need a fixed id). It must still match the run id format, checked below.
   RUNID="${RT_RUNID:-$(date -u +%y%m%d%H%M)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')}"
   printf '%s' "$RUNID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "run id '$RUNID' is not of the form 2610101200-ab12"
   print_plan "$RUNID"
@@ -487,16 +488,32 @@ discover_by_tag() {
   done
   TRY_CP=1; TRY_DIST=1
   if [ -z "$BUCKET$ROLE$ORIGIN_ROLE$EDGE_FN$ORIGIN_FN$DIST_ID" ]; then die "nothing tagged RunId=$RUNID was found (already deleted?)"; fi
+  # The tag listing can lag (IAM especially): also try the exact role names. The tag check before each delete still applies.
+  [ -n "$ROLE" ] || ROLE="bhc-$RUNID-erole"
+  [ -n "$ORIGIN_ROLE" ] || ORIGIN_ROLE="bhc-$RUNID-orole"
+}
+# save_found: write the run id and every name found into the state file, so a second --cleanup (after a partial one) can use it
+save_found() {
+  local k v
+  : > "$STATE_FILE"
+  for k in RUNID BUCKET ROLE ORIGIN_ROLE ORIGIN_FN EDGE_FN DIST_ID TRY_CP TRY_DIST; do
+    eval "v=\${$k:-}"
+    [ -n "$v" ] && [ "$v" != 0 ] && printf '%s=%s\n' "$k" "$v" >> "$STATE_FILE"
+  done
+  return 0
 }
 
+FALLBACK=0
 main_cleanup() {
   printf '%s' "$CLEANUP_ID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "--cleanup needs a run id like 2610101200-ab12"
   STATE_FILE="$RESULTS_DIR/state-$CLEANUP_ID.env"
-  if [ -f "$STATE_FILE" ]; then
+  FALLBACK=0
+  if [ -f "$STATE_FILE" ] && grep -q '^RUNID=' "$STATE_FILE"; then
     state_load "$STATE_FILE"
     [ "$RUNID" = "$CLEANUP_ID" ] || die "state file does not belong to run $CLEANUP_ID"
   else
-    say "no state file $STATE_FILE (it is written next to where the run started: RESULTS_DIR, default the current directory)."
+    FALLBACK=1
+    say "no usable $(basename "$STATE_FILE") in RESULTS_DIR (default: the directory the run was started in)."
     say "falling back to a read-only listing by the RunId tag"
     RUNID="$CLEANUP_ID"
     discover_by_tag
@@ -506,7 +523,7 @@ main_cleanup() {
   if [ "$DRY_RUN" = 1 ]; then say "dry run: nothing was deleted."; return 0; fi
   say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
   confirm "$CLEANUP_PHRASE"
-  [ -f "$STATE_FILE" ] || : > "$STATE_FILE"
+  if [ "$FALLBACK" = 1 ]; then save_found; fi
   CREATE_STARTED=1
 }
 

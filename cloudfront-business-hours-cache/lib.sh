@@ -257,13 +257,14 @@ td_logs() {
   if [ -n "$ORIGIN_FN" ]; then td_log_group "$REGION" "/aws/lambda/$ORIGIN_FN"; fi
   if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" = 1 ]; then say "  edge log groups: kept until the edge function is deleted (--cleanup removes them)"; fi
   if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" != 1 ]; then
-    regions="$(aws_ro ec2 describe-regions --query 'Regions[].RegionName' --output text)" || regions="$REGION"
+    regions="$(aws_ro ec2 describe-regions --query 'Regions[].RegionName' --output text)" || { regions="$REGION"; LOGS_LEFT="$LOGS_LEFT edge-log-groups-in-other-regions(not-checked:ec2:DescribeRegions-failed)"; }
     for r in $regions; do td_log_group "$r" "/aws/lambda/us-east-1.$EDGE_FN"; done
   fi
   if [ -n "$LOGS_LEFT" ]; then say "  log groups NOT deleted:$LOGS_LEFT (a few cents of stored logs at most; delete them in the console)"; fi
 }
 td_bucket() {
   [ -n "$BUCKET" ] || return 0
+  if [ -n "$DIST_ID" ] && [ "$DIST_GONE" != 1 ]; then say "  bucket: kept (the distribution and its edge function may still read it)"; return 0; fi
   owned s3 "$BUCKET" "bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
   aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null 2>&1
   if aws_do s3api delete-bucket --bucket "$BUCKET" >/dev/null; then say "  bucket: deleted"; else say "  bucket: delete failed"; TD_FAIL=1; fi
@@ -271,8 +272,10 @@ td_bucket() {
 teardown() {
   say "teardown: deleting only resources tagged RunId=$RUNID"
   td_dist; td_cache_policy; td_edge; td_origin; td_edge_role; td_origin_role; td_logs; td_bucket
-  if [ "$TD_FAIL" = 0 ]; then
+  if [ "$TD_FAIL" = 0 ] && [ -z "$LOGS_LEFT" ]; then
     say "teardown: complete"
+  elif [ "$TD_FAIL" = 0 ]; then
+    say "teardown: all resources deleted, but LOG GROUPS LEFT:$LOGS_LEFT"
   else
     say "teardown: INCOMPLETE. Read the lines above. Resources named bhc-$RUNID-* may still exist (cents at most, but delete them)."
   fi

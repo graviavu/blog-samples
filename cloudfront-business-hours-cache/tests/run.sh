@@ -21,7 +21,7 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
@@ -183,6 +183,7 @@ check "the rest was deleted" has "$STUB_DIR/deleted.log" "DELETE cf"
 check "incomplete teardown gives rc 4" is "$RC" 4
 reset_env; export STUB_FOREIGN_TAG=cf; go foreign_cf "$PHRASE\n"
 check "distribution with a foreign tag is never disabled or deleted" bash -c "! grep -qE '^cloudfront (update|delete)-distribution' '$STUB_DIR/calls.log'"
+check "bucket is kept while the distribution still exists" bash -c "[ -e '$STUB_DIR/res/s3__bhc-$RUNID_A-cfg' ] && grep -q 'bucket: kept' '$OUT'"
 check "...and its cache policy and edge function stay too" bash -c "! grep -q 'DELETE cp' '$STUB_DIR/deleted.log' && ! grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log'"
 
 echo "Lambda@Edge replicas still held by AWS, then --cleanup"
@@ -288,9 +289,34 @@ printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>
 check "fallback --cleanup finishes the job from the tag listing" bash -c "[ '$RC' = 0 ] && grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-erole' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-orole' '$STUB_DIR/deleted.log'"
 check "...including the edge log group, and only exact names" bash -c "grep -q 'DELETE loggroup eu-west-1 /aws/lambda/us-east-1.bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && [ -e '$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge-extra' ]"
 check "...output redacted" clean "$OUT"
+check "fallback output shows no redacted-token placeholder for the state file" bash -c "! grep -q 'redacted-token' '$OUT'"
+reset_env; export STUB_REPLICA=1; go fb2 "$PHRASE\n"
+rm -f "$RESULTS_DIR/state-$RUNID_A.env"; OUT="$TMP/fb2-a.txt"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "fallback cleanup while the replica is still held: rc 4" is "$RC" 4
+check "...it left a usable state file with the run id and names" bash -c "grep -q '^RUNID=$RUNID_A' '$RESULTS_DIR/state-$RUNID_A.env' && grep -q '^EDGE_FN=bhc-$RUNID_A-edge' '$RESULTS_DIR/state-$RUNID_A.env'"
+export STUB_REPLICA=0; OUT="$TMP/fb2-b.txt"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "the second --cleanup succeeds (no 'does not belong' error)" bash -c "[ '$RC' = 0 ] && ! grep -q 'does not belong' '$OUT' && grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log'"
+check "...and removes the state file" bash -c "[ ! -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+newdir fb_old; mkdir -p "$STUB_DIR/res"; : > "$RESULTS_DIR/state-$RUNID_A.env"
+echo "$RUNID_A" > "$STUB_DIR/res/lambda__bhc-$RUNID_A-origin"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "an empty state file from an older run is treated as missing (fallback), not an error" bash -c "[ '$RC' = 0 ] && grep -q 'DELETE lambda bhc-$RUNID_A-origin' '$STUB_DIR/deleted.log'"
+reset_env; export STUB_REPLICA=1 STUB_TAG_HIDE=iam; go fb3 "$PHRASE\n"
+rm -f "$RESULTS_DIR/state-$RUNID_A.env"; export STUB_REPLICA=0; OUT="$TMP/fb3.txt"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "fallback also tries the exact role names when the tag listing does not show them" bash -c "grep -q 'DELETE iam bhc-$RUNID_A-erole' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-orole' '$STUB_DIR/deleted.log'"
 newdir fb_none
 printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
 check "fallback with nothing tagged: refuses (rc 2)" is "$RC" 2
+
+echo "review round: leftover log groups are reported"
+reset_env; export STUB_FAIL=delete-log-group; SEED_LOGS=1 go logsleft "$PHRASE\n"; unset SEED_LOGS
+check "screen summary names the log groups left, not just 'complete'" bash -c "grep -q 'LOG GROUPS LEFT' '$OUT' && ! grep -q '^teardown: complete' '$OUT'"
+check "results file says the same" has "$(first_res)" "log groups left"
+reset_env; export STUB_FAIL=describe-regions; go noregions "$PHRASE\n"
+check "describe-regions failure is shown as not checked" bash -c "grep -q 'not-checked' '$OUT' && grep -q 'not-checked' '$(first_res)'"
 
 echo "review round: .gitignore"
 check "results and state files are git-ignored" bash -c "grep -q 'results-\*.md' '$root/.gitignore' && grep -q 'state-\*.env' '$root/.gitignore'"
