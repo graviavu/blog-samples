@@ -148,7 +148,8 @@ export function makeHandler({ loadText, now = () => new Date(), cacheMs = CONFIG
           if (!config) console.log('config invalid, using fallback');
           cached = { config, until: now().getTime() + (config ? cacheMs : failMs) };
         } catch (e) {
-          console.log(`config read failed (${e && e.name ? e.name : 'error'}), using fallback`); // name only, no message
+          // name only, no message; the missing-SDK case logs exactly one word
+          console.log(e && e.name === 's3-client-unavailable' ? 's3-client-unavailable' : `config read failed (${e && e.name ? e.name : 'error'}), using fallback`);
           cached = { config: null, until: now().getTime() + failMs };
         }
         inflight = null;
@@ -179,9 +180,14 @@ export function makeHandler({ loadText, now = () => new Date(), cacheMs = CONFIG
   };
 }
 
+// The AWS SDK v3 is imported only here, at first use, inside a try/catch: if the Lambda@Edge Node.js runtime does not provide it
+// (unverified), the function still loads, every response gets the fail-safe s-maxage=0, and only "s3-client-unavailable" is
+// logged. Fix: bundle the client into the zip (see README, "If the S3 client is missing").
 let s3 = null;
 async function loadFromS3() {
-  const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3'); // part of the Node.js runtime
+  let mod;
+  try { mod = await import('@aws-sdk/client-s3'); } catch { throw Object.assign(new Error('x'), { name: 's3-client-unavailable' }); }
+  const { S3Client, GetObjectCommand } = mod;
   if (!s3) s3 = new S3Client({ region: 'us-east-1' });
   const out = await s3.send(new GetObjectCommand({ Bucket: CONFIG_BUCKET, Key: CONFIG_KEY }), { abortSignal: AbortSignal.timeout(2500) });
   return out.Body.transformToString();

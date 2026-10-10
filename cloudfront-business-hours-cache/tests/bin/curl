@@ -51,7 +51,9 @@ body="$(jq -nc --arg n "$nonce" --argjson c "$c" --argjson t "$now" --arg p "$pa
 # edge function (origin-response)
 cc=""
 if [ "$status" -lt 400 ] || [ "$mode" = rewrite-errors ]; then
-  if [ "$mode" = cacheall ]; then
+  if [ "$mode" = nosdk ]; then
+    cc="public, max-age=0, s-maxage=0"      # the edge function is on its fail-safe for every response
+  elif [ "$mode" = cacheall ]; then
     cc="public, max-age=0, s-maxage=14400"
   else
     cfg=""; [ -e "$S/s3obj" ] && cfg="$(cat "$S/s3obj")"

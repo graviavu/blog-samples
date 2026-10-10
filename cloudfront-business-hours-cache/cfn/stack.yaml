@@ -3,6 +3,9 @@ Description: >-
   Business-hours cache sample. A Lambda@Edge origin-response function sets Cache-Control from a window kept in S3:
   no cache inside the window, long cache outside (capped to the time until the window opens). Test origin = Lambda function URL.
   MUST be deployed in us-east-1 (Lambda@Edge functions can only be created there).
+  WARNING: the test origin sits behind a PUBLIC Lambda function URL (AuthType NONE) with no cap on invocations unless you set
+  OriginReservedConcurrency. Anyone who finds the URL can invoke it. For a throwaway test account only; for real use put the
+  origin behind CloudFront origin access control with AuthType AWS_IAM.
 
 # Deploy by hand (without run-test.sh), see README "Use the template by itself":
 #   1. zip edge/index.mjs (with __CONFIG_BUCKET__ and __CONFIG_KEY__ replaced) and put it in an S3 bucket in us-east-1
@@ -24,13 +27,35 @@ Parameters:
     Type: String
     Default: window.json
     Description: Object key of the window JSON. Also baked into the edge code.
+    AllowedPattern: '[A-Za-z0-9._-]{1,128}'
+    ConstraintDescription: letters, digits, dot, underscore and dash only
   CodeBucket:
     Type: String
     Description: Existing bucket in us-east-1 that holds the zip of the edge function.
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
   CodeKey:
     Type: String
     Default: edge.zip
     Description: Object key of the edge function zip.
+    AllowedPattern: '[A-Za-z0-9._/-]{1,256}'
+  EdgeRuntime:
+    Type: String
+    Default: nodejs22.x
+    AllowedPattern: 'nodejs[0-9]+\.x'
+    Description: >-
+      Runtime of the Lambda@Edge function. Lambda@Edge supports the latest Node.js and Python runtimes but the list is not
+      fixed; if nodejs22.x is refused for Lambda@Edge, use the newest one it accepts.
+  OriginRuntime:
+    Type: String
+    Default: nodejs22.x
+    AllowedPattern: 'nodejs[0-9]+\.x'
+    Description: Runtime of the test origin function (inline CommonJS code).
+  PermissionsBoundary:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional ARN of an IAM permissions boundary policy for the two roles this stack creates (see README, "Running it as a
+      person with limited rights"). Empty = none.
   OriginReservedConcurrency:
     Type: Number
     Default: 0
@@ -40,6 +65,7 @@ Parameters:
       Many new accounts cannot reserve (the unreserved pool must keep 100), which is why the default is 0.
 
 Conditions:
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundary, '']]
   ReserveOriginConcurrency: !Not [!Equals [!Ref OriginReservedConcurrency, 0]]
 
 Resources:
@@ -62,12 +88,31 @@ Resources:
         - {Key: RunId, Value: !Ref RunId}
         - {Key: Purpose, Value: bhc-test}
 
+  # Only one statement: refuse plain HTTP. (Keep this bucket free of other policies.)
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ConfigBucket.Arn
+              - !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              Bool: {'aws:SecureTransport': 'false'}
+
   # ---- Roles. The edge role may read ONE object (and list the bucket so that a missing key reads as NoSuchKey) and
   #      write logs of its own log groups. The origin role writes logs only.
   EdgeRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'bhc-${RunId}-erole'
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundary, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -83,9 +128,13 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/${ConfigKey}'
+                Condition:
+                  StringEquals: {'s3:ResourceAccount': !Ref 'AWS::AccountId'}
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+                Condition:
+                  StringEquals: {'s3:ResourceAccount': !Ref 'AWS::AccountId'}
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource:
@@ -100,6 +149,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'bhc-${RunId}-orole'
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundary, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -127,7 +177,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'bhc-${RunId}-origin'
-      Runtime: nodejs22.x
+      Runtime: !Ref OriginRuntime
       Handler: index.handler
       Role: !GetAtt OriginRole.Arn
       Timeout: 5
@@ -184,7 +234,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'bhc-${RunId}-edge'
-      Runtime: nodejs22.x
+      Runtime: !Ref EdgeRuntime
       Handler: index.handler
       Role: !GetAtt EdgeRole.Arn
       Timeout: 5
@@ -223,6 +273,7 @@ Resources:
   # ---- Distribution: origin = the function URL, the edge function on origin-response.
   Distribution:
     Type: AWS::CloudFront::Distribution
+    DependsOn: [OriginUrlPermission, OriginInvokePermission]   # the URL must be callable before CloudFront can use it
     Properties:
       Tags:
         - {Key: RunId, Value: !Ref RunId}
@@ -247,8 +298,9 @@ Resources:
           LambdaFunctionAssociations:
             - EventType: origin-response
               LambdaFunctionARN: !Ref EdgeVersion    # Ref of a Version is its ARN including the version number
-              IncludeBody: false
-        # CloudFront keeps a 500 for 10 s by default; 0 makes every request of the error test reach the origin.
+        # To my reading of the CloudFront docs (not re-checked), CloudFront caches an origin error for a short default time (10 s).
+        # 0 makes every request of the error test (T-D) reach the origin. Unverified; if it is unwanted, delete this block and
+        # make T-D look at x-cache/age instead.
         CustomErrorResponses:
           - ErrorCode: 500
             ErrorCachingMinTTL: 0

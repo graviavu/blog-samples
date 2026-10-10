@@ -21,7 +21,7 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_REPLICA_FN STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_REPLICA_FN STUB_STATUS_SEQ STUB_INIT_STATUS EDGE_RUNTIME ORIGIN_RUNTIME PERMISSIONS_BOUNDARY_ARN SETTLE_POLLS STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
@@ -146,7 +146,7 @@ check "the inline origin code in the template is identical to origin/index.js" d
 check "the inline origin code fits CloudFormation's 4096 character limit" bash -c "[ \$(wc -c < '$inline') -lt 4096 ]"
 check "the origin sends no Cache-Control" hasnot "$root/origin/index.js" -i "cache-control"
 check "the template creates the resources the README lists" bash -c "for t in AWS::S3::Bucket AWS::IAM::Role AWS::Lambda::Function AWS::Lambda::Url AWS::Lambda::Version AWS::Lambda::Permission AWS::CloudFront::CachePolicy AWS::CloudFront::Distribution; do grep -q \"Type: \$t\" '$TPL' || exit 1; done"
-check "config bucket: public access block, encryption, no bucket policy" bash -c "grep -q BlockPublicAcls '$TPL' && grep -q SSEAlgorithm '$TPL' && ! grep -q 'AWS::S3::BucketPolicy' '$TPL'"
+check "config bucket: public access block, encryption, and no bucket policy but the TLS-only deny" bash -c "grep -q BlockPublicAcls '$TPL' && grep -q SSEAlgorithm '$TPL' && [ \$(grep -c 'Type: AWS::S3::BucketPolicy' '$TPL') = 1 ] && grep -q 'aws:SecureTransport' '$TPL'"
 check "edge role trusts edgelambda, origin role does not" bash -c "[ \$(grep -c edgelambda.amazonaws.com '$TPL') = 1 ]"
 check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL' && grep -q 'log-group:/aws/lambda/\*bhc-\${RunId}-\*' '$TPL'"
 check "cache policy: min 0, default 0, max 86400, nothing in the key" bash -c "grep -q 'MinTTL: 0' '$TPL' && grep -q 'DefaultTTL: 0' '$TPL' && grep -q 'MaxTTL: 86400' '$TPL' && grep -q 'HeaderBehavior: none' '$TPL' && grep -q 'QueryStringBehavior: none' '$TPL'"
@@ -253,13 +253,14 @@ check "...it was NOT retried with retained resources" bash -c "! grep -q -- '--r
 
 echo "Lambda@Edge replicas: retain, then --cleanup"
 reset_env; export STUB_REPLICA=1; go retain_ok "$PHRASE\n"
-check "replica at stack level only: stack delete retried with the three edge resources retained" has "$STUB_DIR/calls.log" "--retain-resources EdgeVersion EdgeFunction EdgeRole"
+check "replica at stack level only: retries retain exactly the failed resources, one more each time, never the role" bash -c "grep -q -- '--retain-resources EdgeVersion\$' '$STUB_DIR/calls.log' && grep -q -- '--retain-resources EdgeVersion EdgeFunction\$' '$STUB_DIR/calls.log' && ! grep -q 'EdgeRole' '$STUB_DIR/calls.log'"
+check "...the first delete-stack had nothing retained" bash -c "head -n 1 '$STUB_DIR/delete-calls.log' | grep -q 'retained= \$'"
 check "...the screen says so before retrying" has "$OUT" "RETAINED"
 check "...the edge function and role were then deleted right away: rc 0, complete" bash -c "[ '$RC' = 0 ] && grep -q 'teardown: complete' '$OUT' && grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-erole' '$STUB_DIR/deleted.log'"
 reset_env; export STUB_REPLICA=1 STUB_REPLICA_FN=1; SEED_LOGS=1 go replica "$PHRASE\n"; unset SEED_LOGS
 check "replica still held: rc 4" is "$RC" 4
 check "says how to finish later" has "$OUT" "./run-test.sh --cleanup $RUNID_A"
-check "edge role kept while the edge function exists" has "$OUT" "edge role: kept"
+check "the edge role is deleted by the stack; only the function is left to --cleanup" has "$OUT" "edge role: already gone"
 check "edge log group kept until the function is gone" bash -c "[ -e '$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge' ]"
 check "state file kept for --cleanup" test -e "$RESULTS_DIR/state-$RUNID_A.env"
 check "state file holds names and flags only, no account id, ARN or host" bash -c "! grep -E -q '[0-9]{12}|arn:|cloudfront.net|lambda-url' '$RESULTS_DIR/state-$RUNID_A.env'"
@@ -270,11 +271,11 @@ STUB_DIR="$KEEP_STUB"; RESULTS_DIR="$KEEP_RES"; OUT="$TMP/cleanup1.txt"
 printf '%s\n' "$PHRASE" | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
 check "cleanup asks for its own phrase and the create phrase is refused" is "$RC" 1
 printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" --dry-run > "$OUT" 2>&1; RC=$?
-check "cleanup --dry-run changes nothing" bash -c "! grep -q 'DELETE iam bhc-$RUNID_A-erole' '$KEEP_STUB/deleted.log'"
+check "cleanup --dry-run changes nothing" bash -c "! grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$KEEP_STUB/deleted.log'"
 rm -f "$KEEP_RES/state-$RUNID_A.env"   # the state file is optional: every name is derived from the run id
 printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
 check "cleanup (even without a state file) rc 0" is "$RC" 0
-check "cleanup deleted the edge function, the role and the edge log group" bash -c "grep -q 'DELETE iam bhc-$RUNID_A-erole' '$KEEP_STUB/deleted.log' && grep -q 'DELETE loggroup eu-west-1 /aws/lambda/us-east-1.bhc-$RUNID_A-edge' '$KEEP_STUB/deleted.log'"
+check "cleanup deleted the edge function and the edge log group" bash -c "grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$KEEP_STUB/deleted.log' && grep -q 'DELETE loggroup eu-west-1 /aws/lambda/us-east-1.bhc-$RUNID_A-edge' '$KEEP_STUB/deleted.log'"
 check "cleanup left nothing" bash -c "[ -z \"\$(ls '$KEEP_STUB/res')\" ]"
 check "cleanup output redacted" clean "$OUT"
 newdir cleanup_bad
@@ -288,6 +289,48 @@ export STUB_REPLICA_FN=0; OUT="$TMP/retain2-b.txt"
 printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
 check "a second --cleanup after a partial one succeeds" is "$RC" 0
 check "...and removes the state file" bash -c "[ ! -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+
+echo "stack status paths before delete-stack"
+settled_before_delete() { # first delete-stack comes after at least N status polls
+  local n; n=$(grep -n '^cloudformation delete-stack' "$STUB_DIR/calls.log" | head -1 | cut -d: -f1)
+  [ -n "$n" ] && [ "$(head -n "$n" "$STUB_DIR/calls.log" | grep -c 'query Stacks\[0\].StackStatus')" -ge "$1" ]
+}
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_STATUS_SEQ="CREATE_IN_PROGRESS CREATE_IN_PROGRESS CREATE_IN_PROGRESS CREATE_COMPLETE"; go st_create "$PHRASE\n"
+check "CREATE_IN_PROGRESS: polled until it settled, then deleted (no delete-stack while in progress)" bash -c "settled_before_delete() { :; }; grep -q 'DELETE cfn' '$STUB_DIR/deleted.log'"
+check "...at least 4 status polls came before the first delete-stack" settled_before_delete 4
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_STATUS_SEQ="CREATE_IN_PROGRESS ROLLBACK_IN_PROGRESS ROLLBACK_COMPLETE"; go st_rollback "$PHRASE\n"
+check "ROLLBACK_IN_PROGRESS then ROLLBACK_COMPLETE: deleted after the polls" bash -c "grep -q 'DELETE cfn' '$STUB_DIR/deleted.log' && grep -q 'teardown: complete' '$OUT'"
+check "...three polls before delete-stack" settled_before_delete 3
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_INIT_STATUS=ROLLBACK_FAILED; go st_rbfail "$PHRASE\n"
+check "ROLLBACK_FAILED: delete-stack is tried" has "$STUB_DIR/deleted.log" "DELETE cfn"
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_INIT_STATUS=CREATE_FAILED; go st_cfail "$PHRASE\n"
+check "CREATE_FAILED: delete-stack is tried" has "$STUB_DIR/deleted.log" "DELETE cfn"
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_INIT_STATUS=DELETE_FAILED; go st_dfail "$PHRASE\n"
+check "DELETE_FAILED at the start: delete-stack is tried again" has "$STUB_DIR/deleted.log" "DELETE cfn"
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-stack STUB_STATUS_SEQ="DELETE_IN_PROGRESS DELETE_IN_PROGRESS CREATE_COMPLETE"; go st_delprog "$PHRASE\n"
+check "DELETE_IN_PROGRESS: waits, no delete-stack until it has settled" settled_before_delete 3
+reset_env; export SETTLE_POLLS=3 STUB_SIG=INT STUB_SIG_AT=create-stack STUB_STATUS_SEQ="CREATE_IN_PROGRESS"; go st_never "$PHRASE\n"
+check "a stack that never settles is NOT deleted: reported, rc 4, state file kept" bash -c "grep -q 'still CREATE_IN_PROGRESS after the waiting time' '$OUT' && [ '$RC' = 4 ] && ! grep -q '^cloudformation delete-stack' '$STUB_DIR/calls.log' && [ -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+unset SETTLE_POLLS
+
+echo "edge function on its fail-safe, runtimes, bucket owner, argument parse"
+reset_env; export STUB_CDN=nosdk; go nosdk "$PHRASE\n"
+check "every answer on the fail-safe: all six tests INCONCLUSIVE with the clear message, rc 3" bash -c "[ '$(grep -cE '^T-. +INCONCLUSIVE' "$OUT")' = 6 ] && [ '$RC' = 3 ] && grep -q 'could not load the S3 client' '$OUT' && grep -q 'If the S3 client is missing' '$OUT'"
+check "...and the stack is still deleted" has "$OUT" "teardown: complete"
+boundary="arn:aws:iam::$(printf '%s%s' 1234 56789012):policy/bhc-boundary"
+reset_env; export EDGE_RUNTIME=python3.13 ORIGIN_RUNTIME=nodejs20.x PERMISSIONS_BOUNDARY_ARN="$boundary"; go params "$PHRASE\n"
+check "EDGE_RUNTIME, ORIGIN_RUNTIME and PERMISSIONS_BOUNDARY_ARN become stack parameters" bash -c "jq -e '(.[]|select(.ParameterKey==\"EdgeRuntime\").ParameterValue)==\"python3.13\" and (.[]|select(.ParameterKey==\"OriginRuntime\").ParameterValue)==\"nodejs20.x\" and ([.[]|select(.ParameterKey==\"PermissionsBoundary\")]|length)==1' '$STUB_DIR/stack-params.json'"
+reset_env; go params0 "$PHRASE\n"
+check "without overrides the template defaults are used (no runtime or boundary parameter)" bash -c "! jq -e '.[]|select(.ParameterKey==\"EdgeRuntime\" or .ParameterKey==\"OriginRuntime\" or .ParameterKey==\"PermissionsBoundary\")' '$STUB_DIR/stack-params.json' >/dev/null"
+check "every bucket call states the expected bucket owner" bash -c "! grep -E '^s3api (head-bucket|put-object|delete-object|delete-bucket|get-bucket-tagging|put-bucket-tagging|put-public-access-block|put-bucket-policy|put-bucket-encryption) ' '$STUB_DIR/calls.log' | grep -v -- '--expected-bucket-owner' | grep -q ."
+check "artifact bucket: explicit encryption and a TLS-only deny policy" bash -c "grep -q '^s3api put-bucket-encryption' '$STUB_DIR/calls.log' && jq -e '.Statement|length==1' '$STUB_DIR/policy-bhc-$RUNID_A-art.json'"
+newdir argparse; "$RT" --cleanup --dry-run > "$OUT" 2>&1; RC=$?
+check "--cleanup --dry-run (no run id) is refused with a clear message" bash -c "[ '$RC' = 2 ] && grep -q 'needs the run id first' '$OUT'"
+rm -f "$STUB_DIR/calls.log"; "$RT" --cleanup "$RUNID_A" --dry-run > "$OUT" 2>&1; RC=$?
+check "--cleanup <id> --dry-run is understood: rc 0, nothing deleted" bash -c "[ '$RC' = 0 ] && grep -q 'dry run: nothing was deleted' '$OUT'"
+adj="$(printf '%s%s' 1234 56789012)"
+adjout="$(SCRIPT_DIR="$root" bash -c ". '$root/lib.sh'; say 'x $adj $adj y ${adj}a$adj'" 2>&1)"
+check "two adjacent account ids are both redacted" bash -c "! printf '%s' '$adjout' | grep -qE '[0-9]{12}'"
 
 echo "confirmation screen and account guard"
 reset_env; go acct_dry "" --dry-run

@@ -47,6 +47,10 @@ case "$svc $cmd" in
   # ---- S3
   "s3api create-bucket") reg "" s3 "$(arg --bucket "$@")"; okjson ;;
   "s3api put-public-access-block") okjson ;;
+  "s3api put-bucket-encryption") jq -e . >/dev/null 2>&1 <<< "$(arg --server-side-encryption-configuration "$@")" || { echo "stub: bad encryption config" >&2; exit 254; }; okjson ;;
+  "s3api put-bucket-policy")
+    jq -e '.Statement[0].Condition.Bool["aws:SecureTransport"] == "false"' "$(fileof --policy "$@")" >/dev/null 2>&1 || { echo "stub: bad bucket policy" >&2; exit 254; }
+    cp "$(fileof --policy "$@")" "$S/policy-$(arg --bucket "$@").json"; okjson ;;
   "s3api put-bucket-tagging") b="$(arg --bucket "$@")"; reg "$(tag_from "$@")" s3 "$b"; okjson ;;
   "s3api head-bucket")
     if [ -e "$S/res/s3__$(arg --bucket "$@")" ]; then okjson; else echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254; fi ;;
@@ -87,7 +91,7 @@ case "$svc $cmd" in
     jq -e . "$(fileof --parameters "$@")" >/dev/null 2>&1 || { echo "stub: invalid parameters JSON" >&2; exit 254; }
     cp "$(fileof --parameters "$@")" "$S/stack-params.json"
     case " $* " in *" CAPABILITY_NAMED_IAM "*) ;; *) echo "An error occurred (InsufficientCapabilitiesException) when calling the CreateStack operation" >&2; exit 254 ;; esac
-    reg "$tag" cfn "$n"; put stack_status CREATE_COMPLETE
+    reg "$tag" cfn "$n"; put stack_status "${STUB_INIT_STATUS:-CREATE_COMPLETE}"
     rid="$(jq -r '.[] | select(.ParameterKey=="RunId") | .ParameterValue' "$S/stack-params.json")"
     cfg="$(jq -r '.[] | select(.ParameterKey=="ConfigBucketName") | .ParameterValue' "$S/stack-params.json")"
     for kv in "s3 $cfg" "iam bhc-$rid-erole" "iam bhc-$rid-orole" "lambda bhc-$rid-origin" "lambda bhc-$rid-edge" "cf $(fake_dist_id)"; do reg "$tag" "${kv%% *}" "${kv#* }"; done
@@ -102,7 +106,11 @@ case "$svc $cmd" in
     n="$(arg --stack-name "$@")"
     [ -e "$S/res/cfn__$n" ] || { echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id $n does not exist" >&2; exit 254; }
     case "$q" in
-      *StackStatus*) get stack_status; echo ;;
+      *StackStatus*)
+        # STUB_STATUS_SEQ="CREATE_IN_PROGRESS ROLLBACK_IN_PROGRESS ROLLBACK_COMPLETE": the status queries return these in turn, then the last one for ever
+        if [ -n "${STUB_STATUS_SEQ:-}" ]; then
+          i=$(get seq_n 0); put seq_n $((i + 1)); read -r -a seq_words <<< "$STUB_STATUS_SEQ"; w=${#seq_words[@]}; [ "$i" -lt "$w" ] || i=$((w - 1)); echo "${seq_words[$i]}"
+        else get stack_status; echo; fi ;;
       *Tags*) t="$(tagof cfn "$n")"; echo "${t:-None}" ;;
       *Outputs*) if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '[{"OutputKey":"DistributionId","OutputValue":null}]'; else jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" --arg o "$(fake_origin)" '[{OutputKey:"DistributionId",OutputValue:$id},{OutputKey:"DistributionDomain",OutputValue:$d},{OutputKey:"OriginHost",OutputValue:$o}]'; fi ;;
     esac ;;
@@ -110,8 +118,18 @@ case "$svc $cmd" in
     if [ "$(get stack_status)" = DELETE_FAILED ]; then get fail_cause; echo; else echo; fi ;;
   "cloudformation delete-stack")
     n="$(arg --stack-name "$@")"; tagof cfn "$n" >/dev/null || { echo "An error occurred (ValidationError): Stack with id $n does not exist" >&2; exit 254; }
-    retain=0; case " $* " in *" --retain-resources "*) retain=1 ;; esac
-    if [ "${STUB_REPLICA:-0}" = 1 ] && [ "$retain" = 0 ]; then put stack_status DELETE_FAILED; put fail_cause EdgeVersion; exit 0; fi
+    # retained logical ids: the words after --retain-resources
+    retained=" "; seen=0
+    for w in "$@"; do
+      case "$w" in --retain-resources) seen=1; continue ;; --*) seen=0 ;; esac
+      [ "$seen" = 1 ] && retained="$retained$w "
+    done
+    echo "retained=$retained" >> "$S/delete-calls.log"
+    # Lambda@Edge replicas: the version fails first; once it is retained the function fails; once both are retained the stack is deleted
+    if [ "${STUB_REPLICA:-0}" = 1 ]; then
+      case "$retained" in *" EdgeVersion "*) ;; *) put stack_status DELETE_FAILED; put fail_cause EdgeVersion; exit 0 ;; esac
+      case "$retained" in *" EdgeFunction "*) ;; *) put stack_status DELETE_FAILED; put fail_cause EdgeFunction; exit 0 ;; esac
+    fi
     # the config bucket must be empty
     if [ -e "$S/s3obj" ]; then put stack_status DELETE_FAILED; put fail_cause ConfigBucket; echo "stub: bucket not empty" >&2; exit 0; fi
     mytag="$(cat "$S/res/cfn__$n")"
@@ -120,7 +138,7 @@ case "$svc $cmd" in
       case "$k" in cfn) continue ;; esac
       case "$nm" in bhc-*-art) continue ;; esac            # not part of the stack
       [ "$(cat "$r")" = "$mytag" ] || continue               # only what carries the stack's tag
-      if [ "$retain" = 1 ]; then case "$nm" in *-edge|*-erole) continue ;; esac; fi
+      case "$nm" in *-edge) case "$retained" in *" EdgeFunction "*) continue ;; esac ;; esac
       del "$k" "$nm"
     done
     : > "$S/dist_deleted"; del cfn "$n"; put stack_status DELETE_COMPLETE ;;

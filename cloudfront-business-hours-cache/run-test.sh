@@ -17,7 +17,9 @@ MODE=run CLEANUP_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
-    --cleanup) shift; MODE=cleanup; CLEANUP_ID="${1:-}" ;;
+    --cleanup)
+      shift; MODE=cleanup; CLEANUP_ID="${1:-}"
+      case "$CLEANUP_ID" in --*) echo "--cleanup needs the run id first, then options: ./run-test.sh --cleanup 2610101200-ab12 [--dry-run]" >&2; exit 2 ;; esac ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -71,6 +73,7 @@ preflight() {
   local acct
   acct="$(aws_ro sts get-caller-identity --query Account --output text)" || die "cannot read the AWS identity (are you logged in?)"
   printf '%s' "$acct" | grep -Eq '^[0-9]{12}$' || die "unexpected answer from sts get-caller-identity"
+  ACCOUNT_ID="$acct"          # used for --expected-bucket-owner; never printed
   ACCT_LAST4="${acct: -4}"   # screen only: never written to the results file, the state file or a log
   say "AWS identity: profile ${AWS_PROFILE:-<none, default credentials>}, account ********$ACCT_LAST4, region $REGION"
   if [ -n "${EXPECT_ACCOUNT_LAST4:-}" ]; then
@@ -122,7 +125,7 @@ create_all() {
   say "[1/5] checking that the bucket names are free"
   # Bucket names are global: if one of these exists it is not ours, so stop before anything is created.
   for b in "$ART_BUCKET" "$BUCKET"; do
-    if aws_ro s3api head-bucket --bucket "$b" >/dev/null 2>&1; then fail "a bucket named $b already exists; refusing to continue"; fi
+    if aws_ro s3api head-bucket --bucket "$b" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null 2>&1; then fail "a bucket named $b already exists; refusing to continue"; fi
     case "$(error_code)" in 404|NotFound|NoSuchBucket) ;; *) fail "cannot tell whether bucket $b exists (code: $(error_code)); refusing to continue" ;; esac
   done
 
@@ -130,16 +133,27 @@ create_all() {
   package_edge "$d" || fail "packaging the edge function"
   aws_do s3api create-bucket --bucket "$ART_BUCKET" >/dev/null || fail "create-bucket"
   state_set ART_MADE 1   # from here on an untagged bucket of exactly this name is ours (tagging may not have run yet)
-  aws_do s3api put-public-access-block --bucket "$ART_BUCKET" \
+  aws_do s3api put-bucket-encryption --bucket "$ART_BUCKET" --expected-bucket-owner "$ACCOUNT_ID" \
+    --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null || fail "bucket encryption"
+  jq -n --arg a "arn:aws:s3:::$ART_BUCKET" '{Version:"2012-10-17",Statement:[{Sid:"DenyInsecureTransport",Effect:"Deny",Principal:"*",Action:"s3:*",
+    Resource:[$a,($a+"/*")],Condition:{Bool:{"aws:SecureTransport":"false"}}}]}' > "$d/art-policy.json" || fail "building the bucket policy"
+  aws_do s3api put-bucket-policy --bucket "$ART_BUCKET" --expected-bucket-owner "$ACCOUNT_ID" --policy "file://$d/art-policy.json" >/dev/null || fail "bucket policy"
+  aws_do s3api put-public-access-block --bucket "$ART_BUCKET" --expected-bucket-owner "$ACCOUNT_ID" \
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null || fail "public access block"
-  aws_do s3api put-bucket-tagging --bucket "$ART_BUCKET" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
-  aws_do s3api put-object --bucket "$ART_BUCKET" --key "$CODE_KEY" --body "$d/$CODE_KEY" >/dev/null || fail "uploading the edge function zip"
+  aws_do s3api put-bucket-tagging --bucket "$ART_BUCKET" --expected-bucket-owner "$ACCOUNT_ID" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
+  aws_do s3api put-object --bucket "$ART_BUCKET" --key "$CODE_KEY" --body "$d/$CODE_KEY" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null || fail "uploading the edge function zip"
 
   say "[3/5] validating the template and creating the stack $STACK"
   aws_ro cloudformation validate-template --template-body "file://$TEMPLATE" >/dev/null || fail "template validation"
   jq -n --arg r "$RUNID" --arg cb "$BUCKET" --arg ck "$CONFIG_KEY" --arg ab "$ART_BUCKET" --arg ak "$CODE_KEY" \
     '[{ParameterKey:"RunId",ParameterValue:$r},{ParameterKey:"ConfigBucketName",ParameterValue:$cb},{ParameterKey:"ConfigKey",ParameterValue:$ck},
       {ParameterKey:"CodeBucket",ParameterValue:$ab},{ParameterKey:"CodeKey",ParameterValue:$ak}]' > "$d/params.json" || fail "building the parameters"
+  # Optional overrides (the template has defaults): EDGE_RUNTIME, ORIGIN_RUNTIME, PERMISSIONS_BOUNDARY_ARN
+  local pk pv
+  for pk in EdgeRuntime:EDGE_RUNTIME OriginRuntime:ORIGIN_RUNTIME PermissionsBoundary:PERMISSIONS_BOUNDARY_ARN; do
+    eval "pv=\${${pk#*:}:-}"
+    if [ -n "$pv" ]; then jq --arg k "${pk%%:*}" --arg v "$pv" '. + [{ParameterKey:$k,ParameterValue:$v}]' "$d/params.json" > "$d/params2.json" && mv "$d/params2.json" "$d/params.json"; fi
+  done
   state_set TRY_STACK 1   # saved before the call: a Ctrl-C during it must still delete the stack
   aws_do cloudformation create-stack --stack-name "$STACK" --template-body "file://$TEMPLATE" --parameters "file://$d/params.json" \
     --capabilities CAPABILITY_NAMED_IAM --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" >/dev/null || fail "create-stack"
@@ -166,7 +180,7 @@ win_json() { printf '{"startMin":%s,"endMin":%s,"inTtl":%s,"outTtl":%s}' "$1" "$
 put_json() {
   local f="$WORK/window.json"
   printf '%s\n' "$1" > "$f"
-  aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json >/dev/null
+  aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json --expected-bucket-owner "$ACCOUNT_ID" >/dev/null
 }
 # set_rules JSON TEXT: upload the config, then wait for the edge function's 30 s memory cache to expire
 set_rules() {
@@ -326,12 +340,12 @@ e_phase() {
 t_e() {
   local r1 m1 r2 m2 f
   say "T-E: window cannot be used -> fallback s-maxage=0 (E1 object missing, E2 object is not JSON)"
-  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null || fail "cannot delete the config object"
+  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null || fail "cannot delete the config object"
   say "  E1: config object deleted; waiting ${SETTLE_SECS}s for the edge config cache"
   nap "$SETTLE_SECS"
   e_phase /rates/e; r1="$E_RES"; m1="$E_MEAS"
   f="$WORK/notjson.txt"; printf 'this is not json\n' > "$f"
-  aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json >/dev/null || fail "cannot upload the bad config"
+  aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json --expected-bucket-owner "$ACCOUNT_ID" >/dev/null || fail "cannot upload the bad config"
   say "  E2: config object replaced by text that is not JSON; waiting ${SETTLE_SECS}s"
   nap "$SETTLE_SECS"
   e_phase /rates/e2; r2="$E_RES"; m2="$E_MEAS"
@@ -389,6 +403,13 @@ t_c() {
   fi
 }
 
+# edge_failsafe_everywhere: a path with a rule outside its window must get the long TTL. If it gets s-maxage=0 instead, the function is
+# on its fail-safe (for example the AWS SDK v3 is not available in the Lambda@Edge runtime), and no test can say anything.
+edge_failsafe_everywhere() {
+  req /rates/probe || return 1
+  [ "$R_ST" = 200 ] && [ "$R_CC" = "$EXPECT_IN" ]
+}
+
 run_tests() {
   local m i
   say ""
@@ -402,6 +423,12 @@ run_tests() {
     return
   fi
   setup_abd
+  if [ "$ABD_READY" = 1 ] && edge_failsafe_everywhere; then
+    for m in T-A T-B T-D T-F T-E T-C; do
+      add_result "$m" INCONCLUSIVE "the edge function could not load the S3 client (or cannot read the config): every answer shows the fail-safe s-maxage=0, also on a path that should get the long TTL. See README, \"If the S3 client is missing\""
+    done
+    return
+  fi
   t_a; t_b; t_d; t_f; t_e; t_c
 }
 

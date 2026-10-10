@@ -1,7 +1,7 @@
 // Unit tests for edge/index.mjs. No AWS, no SDK: the S3 read is replaced by a function. Run: node --test tests/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeHandler, parseConfig, selectWindow, cacheControlFor, ttlSecondsFor, originForbidsShared, FALLBACK_CACHE_CONTROL } from '../edge/index.mjs';
+import { handler as realHandler, makeHandler, parseConfig, selectWindow, cacheControlFor, ttlSecondsFor, originForbidsShared, FALLBACK_CACHE_CONTROL } from '../edge/index.mjs';
 
 const CFG = { startMin: 780, endMin: 1080, inTtl: 0, outTtl: 14400 }; // 13:00 to 18:00 UTC
 const CFG_TEXT = JSON.stringify({ default: CFG });   // one default window for every path
@@ -145,6 +145,30 @@ test('S3 read failure: fallback s-maxage=0, never a long TTL, nothing leaks into
   assert.equal(FALLBACK_CACHE_CONTROL, IN);
   assert.ok(logs.length > 0);
   assert.ok(!logs.join('\n').includes('secret-name'), 'error message text must not be logged');
+});
+
+test('S3 client missing from the runtime: the function still loads, answers with s-maxage=0, logs one word', async () => {
+  let present = true;
+  try { await import('@aws-sdk/client-s3'); } catch { present = false; }
+  if (present) return;   // the SDK happens to be installed here: this path cannot be exercised
+  const logs = [];
+  const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  let r;
+  try { r = await realHandler(ev('200', {}, '/prices/a')); } finally { console.log = orig; }
+  assert.equal(cc(r), FALLBACK_CACHE_CONTROL);
+  assert.deepEqual(logs, ['s3-client-unavailable']);
+});
+
+test('a loader that reports s3-client-unavailable gives the fallback and logs only that word', async () => {
+  const logs = [];
+  const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  let r;
+  try {
+    const h = makeHandler({ loadText: async () => { throw Object.assign(new Error('Cannot find package @aws-sdk/client-s3 imported from /var/task/x'), { name: 's3-client-unavailable' }); }, now: () => at(0, 30) });
+    r = await h(ev());
+  } finally { console.log = orig; }
+  assert.equal(cc(r), FALLBACK_CACHE_CONTROL);
+  assert.deepEqual(logs, ['s3-client-unavailable']);
 });
 
 test('bad JSON, wrong shape and a bad default all give the fallback', async () => {

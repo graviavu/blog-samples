@@ -24,7 +24,9 @@ export AWS_PAGER=""
 # Names are derived from the run id (set_names). BUCKET = the config bucket (created by the stack), ART_BUCKET = the small bucket that
 # holds the edge code zip (created by this script, because the stack needs the code to exist).
 RUNID="" STACK="" BUCKET="" ART_BUCKET="" EDGE_ROLE="" ORIGIN_FN="" EDGE_FN="" DIST_ID="" CF_DOMAIN="" ORIGIN_HOST=""
-STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 TRY_STACK=0 ART_MADE=0 STACK_GONE=0 LOGS_LEFT=""
+STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 TRY_STACK=0 ART_MADE=0 STACK_GONE=0 LOGS_LEFT="" ACCOUNT_ID="" ST=""
+SETTLE_POLLS="${SETTLE_POLLS:-120}"        # polls while a stack is *_IN_PROGRESS before deleting it ...
+STACK_POLL_SECS="${STACK_POLL_SECS:-30}"   # ... 30 s apart: about 60 minutes
 MODE="${MODE:-run}"
 RES_NAME=() RES_RESULT=() RES_MEAS=()
 NOTES=()
@@ -46,6 +48,7 @@ redact() {
   done
   sed -E \
     -e 's#arn:aws[a-z-]*:[A-Za-z0-9-]*:[a-z0-9-]*:[0-9]*:[^ ",)]*#<arn>#g' \
+    -e 's#(^|[^0-9])[0-9]{12}([^0-9]|$)#\1<account-id>\2#g' \
     -e 's#(^|[^0-9])[0-9]{12}([^0-9]|$)#\1<account-id>\2#g' \
     -e 's#(AKIA|ASIA)[0-9A-Z]{16}#<access-key-id>#g' \
     -e 's#[A-Za-z0-9-]+\.lambda-url\.[a-z0-9-]+\.on\.aws#<origin-host>#g' \
@@ -144,7 +147,7 @@ set_names() {
 tag_of() {
   local kind="$1" id="$2" out rc
   case "$kind" in
-    s3) out="$(aws_ro s3api get-bucket-tagging --bucket "$id" --query "TagSet[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
+    s3) out="$(aws_ro s3api get-bucket-tagging --bucket "$id" --expected-bucket-owner "$ACCOUNT_ID" --query "TagSet[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
     iam) out="$(aws_ro iam list-role-tags --role-name "$id" --query "Tags[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
     lambda) out="$(aws_ro lambda get-function --function-name "$id" --query 'Tags.RunId' --output text)"; rc=$? ;;
     stack) out="$(aws_ro cloudformation describe-stacks --stack-name "$id" --query "Stacks[0].Tags[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
@@ -174,39 +177,69 @@ owned() {
 # ---------------------------------------------------------------------------------------------------- teardown
 # The stack owns everything except the artifact bucket (and, in the Lambda@Edge replica case, the edge function and role that
 # were retained). Order: stack, edge leftovers, artifact bucket, log groups.
+# settle_stack: poll DescribeStacks until the status is no longer *_IN_PROGRESS (it is unverified whether DeleteStack is accepted
+# during CREATE_IN_PROGRESS / ROLLBACK_IN_PROGRESS, so it is never tried). Sets ST. 0 settled, 1 timed out, 2 cannot read.
+settle_stack() {
+  local i=0 st
+  while :; do
+    st="$(aws_ro cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text)" || return 2
+    ST="$st"
+    case "$st" in *_IN_PROGRESS) ;; *) return 0 ;; esac
+    i=$((i + 1))
+    if [ "$i" -ge "$SETTLE_POLLS" ]; then return 1; fi
+    nap "$STACK_POLL_SECS"
+  done
+}
 td_stack() {
   [ "$TRY_STACK" = 1 ] || return 0
-  local st failed rc
+  local failed new retain="" attempt=0 x rc
   owned stack "$STACK" "stack"; rc=$?
   case $rc in 44) STACK_GONE=1; return 0 ;; 0) ;; *) return 0 ;; esac
-  st="$(aws_ro cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text)" || { say "  stack: cannot read its status"; TD_FAIL=1; return 0; }
-  case "$st" in
-    CREATE_IN_PROGRESS) say "  stack: still being created ($st); waiting for it to settle (CloudFront needs several minutes)"; aws_ro cloudformation wait stack-create-complete --stack-name "$STACK" >/dev/null 2>&1 ;;
+  say "  stack: waiting until it is no longer in progress (CloudFront needs several minutes)"
+  settle_stack; rc=$?
+  case $rc in
+    1) say "  stack: still $ST after the waiting time; NOT deleting it. Check the CloudFormation console, then run --cleanup $RUNID."; TD_FAIL=1; return 0 ;;
+    2) if not_found stack; then say "  stack: gone"; STACK_GONE=1; return 0; fi; say "  stack: cannot read its status"; TD_FAIL=1; return 0 ;;
   esac
+  say "  stack: status $ST"
   # The config bucket must be empty before the stack can delete it. Only the one object this script writes is removed, and
   # only from the bucket named for this run that carries this run's tag.
   td_empty_bucket
-  say "  stack: deleting $STACK (CloudFormation disables and deletes the distribution: several minutes)"
-  if [ "$st" != DELETE_IN_PROGRESS ]; then aws_do cloudformation delete-stack --stack-name "$STACK" >/dev/null || { say "  stack: delete-stack failed"; TD_FAIL=1; return 0; }; fi
-  if aws_ro cloudformation wait stack-delete-complete --stack-name "$STACK"; then say "  stack: deleted"; STACK_GONE=1; return 0; fi
-  failed="$(aws_ro cloudformation describe-stack-resources --stack-name "$STACK" --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" --output text)" || failed="?"
-  # shellcheck disable=SC2086  # $failed is a tab separated list of logical ids on purpose
-  if [ -n "$failed" ] && [ "$failed" != "?" ] && only_edge_resources $failed; then
-    say "  stack: only the Lambda@Edge function could not be deleted ($failed): AWS keeps its replicas for some hours after the distribution is gone."
-    say "  stack: retrying with those resources RETAINED (they are deleted later, with the same run id, by --cleanup)"
-    if aws_do cloudformation delete-stack --stack-name "$STACK" --retain-resources EdgeVersion EdgeFunction EdgeRole >/dev/null \
-       && aws_ro cloudformation wait stack-delete-complete --stack-name "$STACK"; then
-      say "  stack: deleted (edge function, version and role retained; they are deleted next, or later by --cleanup)"; STACK_GONE=1
+  while :; do
+    attempt=$((attempt + 1))
+    say "  stack: deleting $STACK (CloudFormation disables and deletes the distribution: several minutes)"
+    if [ -n "$retain" ]; then
+      # shellcheck disable=SC2086  # $retain is a list of logical ids on purpose
+      aws_do cloudformation delete-stack --stack-name "$STACK" --retain-resources $retain >/dev/null || { say "  stack: delete-stack failed"; TD_FAIL=1; return 0; }
+    else
+      aws_do cloudformation delete-stack --stack-name "$STACK" >/dev/null || { say "  stack: delete-stack failed"; TD_FAIL=1; return 0; }
+    fi
+    if aws_ro cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+      STACK_GONE=1
+      if [ -n "$retain" ]; then say "  stack: deleted; retained:$retain (the edge function is deleted next, or later by --cleanup)"; else say "  stack: deleted"; fi
       return 0
     fi
-  fi
-  say "  stack: delete FAILED (resources: ${failed:-unknown}). Look at the stack events in the CloudFormation console; stack $STACK is kept."
-  TD_FAIL=1
+    # RetainResources is only for resources that are in DELETE_FAILED: read which ones failed and retain exactly those (plus the ones
+    # retained before). Only the Lambda@Edge replica case is retried; anything else stays as it is.
+    failed="$(aws_ro cloudformation describe-stack-resources --stack-name "$STACK" --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" --output text)" || failed="?"
+    new=""
+    for x in $failed; do case " $retain " in *" $x "*) ;; *) new="$new $x" ;; esac; done
+    # shellcheck disable=SC2086  # $failed is a tab separated list of logical ids on purpose
+    if [ -n "$failed" ] && [ "$failed" != "?" ] && [ -n "$new" ] && only_edge_resources $failed && [ "$attempt" -lt 4 ]; then
+      say "  stack: only the Lambda@Edge function could not be deleted ($failed): AWS keeps its replicas for some hours after the distribution is gone."
+      say "  stack: retrying with exactly the failed resources RETAINED:$retain$new"
+      retain="$retain$new"
+      continue
+    fi
+    say "  stack: delete FAILED (resources: ${failed:-unknown}${retain:+, retained before:$retain}). Look at the stack events in the CloudFormation console; stack $STACK is kept."
+    TD_FAIL=1
+    return 0
+  done
 }
 only_edge_resources() { local x; for x in "$@"; do case "$x" in EdgeFunction|EdgeVersion) ;; *) return 1 ;; esac; done; }
 td_empty_bucket() {
   owned s3 "$BUCKET" "config bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null 2>&1
+  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null 2>&1
   return 0
 }
 td_edge() {  # the retained edge function (only exists after the replica case)
@@ -224,7 +257,6 @@ td_edge() {  # the retained edge function (only exists after the replica case)
 }
 td_edge_role() {  # the retained edge role
   [ "$STACK_GONE" = 1 ] || return 0
-  if [ "$TD_PENDING" = 1 ]; then say "  edge role: kept (the edge function still exists)"; return 0; fi
   owned iam "$EDGE_ROLE" "edge role"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
   aws_do iam delete-role-policy --role-name "$EDGE_ROLE" --policy-name bhc-inline >/dev/null 2>&1
   if aws_do iam delete-role --role-name "$EDGE_ROLE" >/dev/null; then say "  edge role: deleted"; else say "  edge role: delete failed"; TD_FAIL=1; fi
@@ -255,8 +287,8 @@ td_art_bucket() {
   # In a run, only a bucket this run created (ART_MADE) is looked at. In --cleanup the tag check below is the guard.
   if [ "$MODE" = run ] && [ "$ART_MADE" != 1 ]; then return 0; fi
   owned s3 "$ART_BUCKET" "artifact bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  aws_do s3api delete-object --bucket "$ART_BUCKET" --key "$CODE_KEY" >/dev/null 2>&1
-  if aws_do s3api delete-bucket --bucket "$ART_BUCKET" >/dev/null; then say "  artifact bucket: deleted"; else say "  artifact bucket: delete failed"; TD_FAIL=1; fi
+  aws_do s3api delete-object --bucket "$ART_BUCKET" --key "$CODE_KEY" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null 2>&1
+  if aws_do s3api delete-bucket --bucket "$ART_BUCKET" --expected-bucket-owner "$ACCOUNT_ID" >/dev/null; then say "  artifact bucket: deleted"; else say "  artifact bucket: delete failed"; TD_FAIL=1; fi
 }
 teardown() {
   say "teardown: deleting only resources of stack $STACK (tagged RunId=$RUNID)"
