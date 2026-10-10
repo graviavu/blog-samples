@@ -103,7 +103,7 @@ check "exit 0" is "$RC" 0
 for t in T-A T-B T-C T-D T-E; do check "$t PASS in the table" grep -Eq "^$t +PASS" "$OUT"; done
 check "summary line PASS=5" has "$OUT" "PASS=5 FAIL=0 INCONCLUSIVE=0"
 check "results file written" test -n "$(first_res)"
-check "results file has the table and the T-C note" bash -c "grep -q '^| T-C | PASS' '$(first_res)' && grep -q 'boundary expiry gap observed' '$(first_res)'"
+check "results file has the table and the T-C note" bash -c "grep -q '^| T-C | PASS' '$(first_res)' && grep -q 'was gone 5s after the opening' '$(first_res)'"
 check "results file says teardown complete" has "$(first_res)" "Complete: every resource"
 check "results file is redacted" clean "$(first_res)"
 check "screen output is redacted" clean "$OUT"
@@ -116,6 +116,10 @@ check "state file removed after a clean teardown" bash -c "[ ! -e '$RESULTS_DIR/
 check "distribution disabled before delete" bash -c "grep -n -E '^cloudfront (update-distribution|delete-distribution)' '$STUB_DIR/calls.log' | head -n 2 | tr '\n' ' ' | grep -q 'update-distribution.*delete-distribution'"
 check "distribution created with the RunId tag" bash -c "grep -q 'create-distribution-with-tags' '$STUB_DIR/calls.log'"
 check "T-A window is now-5..now+30 (clock 12:00 UTC = 720)" has "$STUB_DIR/puts.log" '"startMin":715,"endMin":750,"inTtl":0,"outTtl":14400'
+check "T-A also shows /rates/a outside its window at the same moment, with the long TTL" bash -c "grep -E '^T-A +PASS' '$OUT' | grep -q 'at the same moment /rates/a (outside its window): cache-control=\"public, max-age=0, s-maxage=14400\"'"
+check "the config has one rule per path pattern (/prices/*, /rates/*, /err*)" bash -c "grep -q '\"path\":\"/prices/\*\",\"startMin\":715' '$STUB_DIR/puts.log' && grep -q '\"path\":\"/rates/\*\",\"startMin\":660' '$STUB_DIR/puts.log' && grep -q '\"path\":\"/err\*\"' '$STUB_DIR/puts.log'"
+check "the first upload is a valid default-only config" bash -c "head -n 1 '$STUB_DIR/puts.log' | jq -e '.default.startMin == 0 and (.rules // []) == []'"
+check "T-C uses its own /c/* rule" bash -c "grep -qF '\"path\":\"/c/*\"' '$STUB_DIR/puts.log'"
 check "T-B window is now-60..now-30" has "$STUB_DIR/puts.log" '"startMin":660,"endMin":690,"inTtl":0,"outTtl":14400'
 check "T-C window opens a few minutes after now" bash -c "grep -Eq '\"startMin\":72[0-9],\"endMin\":78[0-9]' '$STUB_DIR/puts.log'"
 check "the window is never overnight (start < end in every upload)" bash -c "! sed -n 's/.*startMin\":\([0-9]*\),\"endMin\":\([0-9]*\).*/\1 \2/p' '$STUB_DIR/puts.log' | awk '\$1 >= \$2' | grep -q ."
@@ -131,6 +135,9 @@ reset_env; export STUB_CDN=cacheall; go cacheall "$PHRASE\n"
 check "T-A FAIL" grep -Eq "^T-A +FAIL" "$OUT"
 check "rc 1" is "$RC" 1
 check "teardown still complete" has "$OUT" "teardown: complete"
+reset_env; export STUB_CDN=nocap; go nocap "$PHRASE\n"
+check "without the cap an object cached before the opening is served after it: T-C FAIL" grep -Eq "^T-C +FAIL" "$OUT"
+check "...and the message says the TTL is not capped" has "$OUT" "not capped to the time until the opening"
 reset_env; export STUB_CDN=rewrite-errors; go rewrite "$PHRASE\n"
 check "T-D FAIL when errors get the long TTL" grep -Eq "^T-D +FAIL" "$OUT"
 reset_env; export STUB_CDN=stale-config; go stale "$PHRASE\n"
@@ -266,7 +273,7 @@ check "a run id that is not <10 digits>-<4 hex> is refused before any change" ba
 check "...only the identity call was made" only_sts
 
 echo "review round: T-B stray miss, T-E both cases"
-reset_env; export STUB_STRAY_MISS=/b:3; go stray "$PHRASE\n"
+reset_env; export STUB_STRAY_MISS=/rates/b:3; go stray "$PHRASE\n"
 check "T-B: one stray Miss with a flat origin counter is INCONCLUSIVE, not FAIL" grep -Eq "^T-B +INCONCLUSIVE" "$OUT"
 check "...exit code 3" is "$RC" 3
 reset_env; go ebase "$PHRASE\n"

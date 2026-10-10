@@ -1,15 +1,38 @@
 # No cache in business hours, long cache outside, with one Lambda@Edge function
 
 **The problem.** Your content changes during the working day and you want visitors to see it at once, but at night and at
-weekends nobody edits anything and you would rather serve from the cache for hours. CloudFront has no schedule for TTLs.
-This sample sets the cache lifetime per response from the time of day: a Lambda@Edge origin-response function reads one
-small JSON object from S3 (`{"startMin":780,"endMin":1080,"inTtl":0,"outTtl":14400}`), compares the current UTC minute with the
-window, and sets `Cache-Control: public, max-age=0, s-maxage=<ttl>`. Inside the window `inTtl` is 0, so CloudFront does not
-cache. Outside it, `outTtl` (4 hours here) applies. Changing the window is a one-object S3 upload, not a deploy.
+weekends nobody edits anything and you would rather serve from the cache for hours. Different parts of a site have different
+hours (prices are edited 08:00-17:00, rates 10:00-11:00). CloudFront has no schedule for TTLs. This sample sets the cache
+lifetime per response from the time of day and the request path: a Lambda@Edge origin-response function reads one small JSON
+object from S3 with a window per path pattern, finds the rule for the request, and sets
+`Cache-Control: public, max-age=0, s-maxage=<ttl>`. Inside the rule's window `inTtl` applies (0 = CloudFront does not cache).
+Outside it, `outTtl` (4 hours here) applies **but never longer than the time until the window opens next**, so an object cached
+shortly before the opening expires at the opening. Changing a window is a one-object S3 upload, not a deploy.
 
 `run-test.sh` builds a temporary stack, **measures** whether this really behaves that way (Hit/Miss, Age, how often the origin is
-reached, what the viewer sees) and deletes the stack again. It also measures the one thing that does not work the way people
-hope: an object cached before the window opens stays cached after it opens (T-C below).
+reached, what the viewer sees, two paths with different windows at the same moment, an object that must expire at the opening)
+and deletes the stack again.
+
+## The config object
+
+```json
+{
+  "rules": [
+    {"path": "/prices/*", "startMin": 480, "endMin": 1020, "inTtl": 0, "outTtl": 14400},
+    {"path": "/rates/*",  "startMin": 600, "endMin": 660,  "inTtl": 0, "outTtl": 14400},
+    {"path": "/rates/archive/*", "startMin": 0, "endMin": 1, "inTtl": 0, "outTtl": 86400}
+  ],
+  "default": {"startMin": 480, "endMin": 1020, "inTtl": 0, "outTtl": 3600}
+}
+```
+
+- `startMin`, `endMin`: minutes since 00:00 UTC, `0 <= startMin < endMin <= 1440`, `startMin` inclusive, `endMin` exclusive. One window per rule, same UTC day.
+- `inTtl`, `outTtl`: integer seconds, `0` to `31536000`.
+- `path`: an exact path (`/prices/gold`) or a prefix ending in `*` (`/prices/*`, which matches `/prices/` and everything below it, not `/prices`; `/*` matches everything). A `*` anywhere else is a malformed rule.
+- **Matching** uses the request URI of the origin-response event (`event.Records[0].cf.request.uri`) with the query string stripped, **case-sensitive**, not URL-decoded. An **exact** path beats any prefix; among prefixes the **longest** wins; of identical patterns the first in the file wins. The order of the rules otherwise does not matter.
+- `default` is optional. **No matching rule and no default: `s-maxage=0`** (fail safe).
+- **Malformed rules are skipped** (bad window, bad numbers, bad pattern, not an object); the others keep working. The log line names only the rule's index, never its content. A malformed `default` is skipped the same way. A config that is not JSON, or whose `rules` is not an array, is unusable: `s-maxage=0` for everything.
+- The whole parsed config is cached in memory for 30 seconds (not per-path results). The time-dependent part (in the window, seconds until the next opening) is computed on every invocation from the current time, per matched rule.
 
 ## What is in this folder
 
@@ -23,11 +46,13 @@ hope: an object cached before the window opens stays cached after it opens (T-C 
 
 ## Function rules
 
-- Minutes since 00:00 UTC `m`. `startMin <= m < endMin` is in the window (`startMin` inclusive, `endMin` exclusive). `inTtl` applies inside, `outTtl` outside.
-- One fixed daily window, `startMin < endMin`, same UTC day. A window across midnight is rejected as invalid config (see Limitations).
+- Seconds since 00:00 UTC `t` (milliseconds included). `startMin*60 <= t < endMin*60` is in the window (start inclusive, end exclusive): `inTtl` applies.
+- Outside the window the TTL is `min(outTtl, seconds until the next opening)`, floored, never below 0. The next opening is today's `startMin` if it is still ahead, otherwise tomorrow's (`86400 - t + startMin*60`). One second before the opening the object gets `s-maxage=1`, in the last half second `0`.
+- **Clock skew.** The Lambda clock and the CloudFront edge clock can differ by a few seconds, and CloudFront counts the TTL from when it receives the response. Remaining time is floored, so an object may expire a few seconds early, by design not late. `Age` and the TTL are whole seconds.
+- One fixed daily window per rule, `startMin < endMin`, same UTC day. A window across midnight is rejected as invalid (see Limitations).
 - Only responses with status 200, 203, 204 and 206 are rewritten. Errors (400 and above), redirects and 304 are left exactly as the origin sent them.
 - A response is also left untouched when the origin sends `Cache-Control` with `private`, `no-store` or `no-cache`, or sets a cookie (`Set-Cookie`). The origin knows better than a clock, and a shared cache must not keep per-user content. (The cache policy also keeps cookies out of the cache key, so this guard matters if you reuse the function elsewhere.)
-- Config is kept in memory for 30 seconds. If S3 cannot be read, or the JSON is bad or out of range, the function sets `public, max-age=0, s-maxage=0`: never a long TTL, and it does not fall back to an older config either. A failure is remembered for 5 seconds so an S3 outage does not mean one S3 call per request.
+- Config is kept in memory for 30 seconds. If S3 cannot be read, or the JSON is unusable, the function sets `public, max-age=0, s-maxage=0`: never a long TTL, and it does not fall back to an older config either. A failure is remembered for 5 seconds so an S3 outage does not mean one S3 call per request.
 - The log line on failure holds the error name only. No config, bucket name or error message is logged.
 
 ## Safety, read first
@@ -66,13 +91,13 @@ Every test uses its own URL path, so an earlier test cannot leave a cached objec
 
 | Test | What it does | PASS means |
 |---|---|---|
-| T-A | Window set to now-5 min .. now+30 min. 5 requests, one second apart. | Never a Hit; five different nonces; the origin counter went up by one each time; the viewer sees `Cache-Control: public, max-age=0, s-maxage=0`, exactly what the function set. |
-| T-B | Window moved to now-60 .. now-30 min. 5 requests, 3 seconds apart. | First request Miss, the next four Hit; same nonce and flat origin counter; `Age` grows; the viewer sees `s-maxage=14400`. One stray Miss among the Hits while the origin was not reached again (same nonce, flat counter) is reported INCONCLUSIVE, not FAIL: a POP with several cache servers can answer from another layer. |
-| T-D | The origin answers 500 on `/err` (window still in the past, so a normal response would get 14400). 3 requests. | HTTP 500 each time, never a Hit, a new nonce each time, and no `s-maxage=14400` in the header: errors are not rewritten and not cached for `outTtl`. (The distribution sets the 500 error caching minimum TTL to 0, otherwise CloudFront would hold the error for 10 seconds on its own.) |
-| T-E | Two cases, 3 requests each: **E1** the config object is deleted from S3 (a missing key, `NoSuchKey`); **E2** the object is replaced by text that is not JSON. | In both cases Cache-Control is `s-maxage=0` on all requests and no Hit, although the window in the past would have given 14400: the fail-safe fallback works. |
-| T-C | Window set to open in about 2-3 minutes. `/c` is requested (Miss, cached for 14400 s), then again (Hit). After the window has opened, `/c` is requested again, and a new path `/c2` is requested twice. | The known boundary-expiry limitation is reproduced: `/c` is **still served from cache after the window opened** (the report states how many seconds after the opening and how long it will stay), while the new object `/c2` is not cached. |
+| T-A | One config for T-A, T-B and T-D: `/prices/*` has now inside its window (now-5 .. now+30 min), `/rates/*` and `/err*` are outside theirs (now-60 .. now-30 min). 5 requests to `/prices/a`, one second apart, then one to `/rates/a`. | Never a Hit on `/prices/a`; five different nonces; the origin counter went up by one each time; the viewer sees `Cache-Control: public, max-age=0, s-maxage=0`, exactly what the function set. At the same moment `/rates/a` (outside its window) gets `s-maxage=14400`: two paths, two windows, one clock. |
+| T-B | Same config. 5 requests to `/rates/b`, 3 seconds apart. | First request Miss, the next four Hit; same nonce and flat origin counter; `Age` grows; the viewer sees `s-maxage=14400` (the next opening is far away, so the cap does not bite). One stray Miss among the Hits while the origin was not reached again (same nonce, flat counter) is reported INCONCLUSIVE, not FAIL: a POP with several cache servers can answer from another layer. |
+| T-D | Same config (`/err*` is outside its window, so a normal response would get 14400). The origin answers 500 on `/err`. 3 requests. | HTTP 500 each time, never a Hit, a new nonce each time, and no `s-maxage=14400` in the header: errors are not rewritten and not cached for `outTtl`. (The distribution sets the 500 error caching minimum TTL to 0, otherwise CloudFront would hold the error for 10 seconds on its own.) |
+| T-E | Two cases on `/rates/e` and `/rates/e2` (3 requests each): **E1** the config object is deleted from S3 (a missing key, `NoSuchKey`); **E2** the object is replaced by text that is not JSON. | In both cases Cache-Control is `s-maxage=0` on all requests and no Hit, although a working config would have given 14400: the fail-safe fallback works. |
+| T-C | A `/c/*` rule that opens in about 2-3 minutes. `/c/old` is requested (Miss; `s-maxage` must be a small number, at most the time left until the opening, not 14400), then again (Hit). 10 seconds before the opening it is requested again; 5 seconds after the opening again; `/c/new` is requested twice after the opening. | The cap works: the object cached before the opening is **gone 5 seconds after the opening** (Miss, new nonce, `s-maxage=0`), the Age 10 seconds before the opening was below its TTL, and the new object `/c/new` is not cached. If it is still a Hit after the opening, that is a FAIL and the report says how many seconds late. |
 
-`PASS` = measured as expected. `FAIL` = measured something else. `INCONCLUSIVE` = the test could not run cleanly (no answer, too close to midnight, the object was refreshed in T-C), so it says nothing either way. A T-C result of PASS is not a success of the design: it records honestly that the limitation exists.
+`PASS` = measured as expected. `FAIL` = measured something else. `INCONCLUSIVE` = the test could not run cleanly (no answer, too close to midnight, too little time before the opening in T-C), so it says nothing either way. T-C allows 5 seconds of clock skew between your machine and the Lambda clock when it checks the cap, and it checks 5 seconds after the opening, not at the exact second: expiry is whole seconds and the edge clocks differ.
 
 The tests prove the behavior of `s-maxage` plus Lambda@Edge with a Function URL origin and this cache policy. They do not measure how long CloudFront needs to pick up a changed window across all edge locations, and the edge location your requests reach is not necessarily the one a visitor elsewhere reaches.
 
@@ -118,8 +143,9 @@ Custom: min TTL 0, default TTL 0, max TTL 86400 (above `outTtl`), no query strin
 ## Limitations
 
 - **UTC only.** The window is minutes since 00:00 UTC. There is no time zone and no daylight saving handling; a business-hours window in a local zone moves by an hour twice a year, in UTC terms. Change the JSON when the clocks change.
-- **One window per day.** `startMin < endMin` in the same UTC day. No overnight window, no weekends, no holidays. (A second window or a day-of-week mask would be a change to the config and `cacheControlFor`, not to the architecture.)
-- **Boundary expiry (T-C).** The TTL is decided when the object is fetched from the origin and is fixed for that copy. An object cached at 12:55 with a 4 hour TTL is still served at 13:05 although the window (no cache) opened at 13:00. The longer `outTtl`, the longer the gap (at most `outTtl`). Options: a shorter `outTtl`, an invalidation when the window opens, or `outTtl` capped so that it does not reach past the next opening. The function does not do the last one: it would need the time to the next opening and would make the TTL vary per request.
+- **One window per rule, per day.** `startMin < endMin` in the same UTC day. No overnight window, no weekends, no holidays (day-of-week and date rules would be a change to the config and `ttlSecondsFor`, not to the architecture).
+- **Boundary expiry is capped, not exact.** An object cached before the opening gets `s-maxage` = the time left until the opening, so it expires at the opening, give or take a few seconds of clock skew (it can expire early, not late by design). The *other* boundary needs nothing: inside the window nothing is cached. An object cached before you *change* the config keeps the TTL it was given; the new window applies to objects fetched after the change (and only after each edge's 30 second config cache).
+- **Path rules match the URI as CloudFront gives it:** no URL decoding, no normalisation, case-sensitive. `/Prices/x` and `/prices/x` are different paths; `/prices/%61` is not `/prices/a`.
 - **The config is read per edge cache region, at most every 30 seconds** (5 seconds after a failure). A changed window is not live at every location at the same instant.
 - Only responses that reach the origin are rewritten (origin-response runs on a cache miss). Objects already cached with another `Cache-Control` keep it until they expire.
 - The function sets only `Cache-Control`. Other headers from the origin, including an `Expires` header, are left alone; remove them at the origin.
@@ -136,4 +162,4 @@ node --test tests/*.test.mjs  # only the edge function logic
 
 `tests/run.sh` covers (see the file for the full list; this is the shape): `--dry-run` makes no call except `sts get-caller-identity`; the typed phrase is required, exact and case sensitive; a full run where everything passes; a CDN that ignores the function (T-A FAIL), a function that rewrites errors (T-D FAIL), a function that keeps a stale config on an S3 failure (T-E FAIL), no answer at all (INCONCLUSIVE); teardown after an injected failure at the first, the middle and the last create call; teardown on SIGINT and SIGTERM, including a signal that arrives while the distribution or cache policy is being created; teardown never touches resources of another run id (and refuses a resource whose tag differs); `--cleanup` after a Lambda@Edge replica error; redaction of account ids, ARNs, access keys, hosts, tokens and the distribution id on screen and in the results file; the baked-in bucket in the packaged edge code; windows and midnight guard; the leftover-bucket case (created but never tagged), error-code based not-found, failed lookups keeping the state file, exit code 4 winning over 130, the account guard, reserved concurrency failing without aborting, the two roles and their policies, log group cleanup with look-alike names left alone, the T-B stray Miss, T-E with a missing key and with bad JSON, `--cleanup` without a state file, and an existing bucket of the same name stopping the run.
 
-`tests/edge.test.mjs` covers: inside, outside, `startMin` inclusive and `endMin` exclusive, 00:00 and 23:59, only 200/203/204/206 rewritten (4xx/5xx, redirects and 304 untouched), origin `private`/`no-store`/`no-cache` and `Set-Cookie` left untouched, S3 failure, bad JSON and out-of-range values, config memory cache of 30 seconds, no stale config after expiry, and that the error message is not logged. The fake `aws` and `curl` model CloudFront and S3 closely enough to exercise the script's logic; **they are not a proof of what real CloudFront does**. That is what the real run is for.
+`tests/edge.test.mjs` covers: path rules (longest prefix, exact beats prefix, case sensitivity, query string stripped, no match with and without a default, malformed rules skipped with only the index logged, the whole config cached once for several paths), the seconds-until-opening cap (1 s before the opening, exactly at `startMin`, last second before `endMin`, after the close to tomorrow's opening, midnight wrap, milliseconds floored, never negative or NaN, computed per request), inside, outside, `startMin` inclusive and `endMin` exclusive, 00:00 and 23:59, only 200/203/204/206 rewritten (4xx/5xx, redirects and 304 untouched), origin `private`/`no-store`/`no-cache` and `Set-Cookie` left untouched, S3 failure, bad JSON and out-of-range values, config memory cache of 30 seconds, no stale config after expiry, and that the error message is not logged. The fake `aws` and `curl` model CloudFront and S3 closely enough to exercise the script's logic; **they are not a proof of what real CloudFront does**. That is what the real run is for.

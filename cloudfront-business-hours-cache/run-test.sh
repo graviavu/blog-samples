@@ -88,7 +88,7 @@ Plan for run $id (every resource below is tagged RunId=$id and is deleted at the
   4. Lambda@Edge function   bhc-$id-edge         Node.js 22, us-east-1, one published version, origin-response
   5. Cache policy           bhc-$id-cp           min 0, default 0, max 86400; no query strings, headers or cookies in the key
   6. CloudFront distribution (PriceClass_100)    origin = the function URL, edge function on origin-response, 500 not cached
-Tests:  T-A in window, T-B out of window, T-D error status, T-E S3 failure fallback, T-C window boundary.
+Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-D error status, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
 Teardown: disable the distribution, wait, delete it, then the cache policy, both functions, both roles, the log groups and the bucket.
 Cost: an estimate of a few cents at most (a few hundred requests; Lambda@Edge, S3 and CloudFront free-tier or cent-level charges).
 Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to disable it).
@@ -111,7 +111,7 @@ create_all() {
   aws_do s3api put-public-access-block --bucket "$BUCKET" \
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null || fail "public access block"
   aws_do s3api put-bucket-tagging --bucket "$BUCKET" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
-  put_config 0 1 "$IN_TTL" "$OUT_TTL" || fail "initial config upload"
+  put_json "{\"default\":$(win_json 0 1)}" || fail "initial config upload"
 
   say "[2/7] IAM roles (edge role with S3 read, origin role without)"
   # Logs only for this run's log groups (the edge function logs as /aws/lambda/us-east-1.<name> in the region of the edge location).
@@ -200,16 +200,31 @@ create_all() {
   say "stack is ready"
 }
 
-# put_config START END IN OUT: write the window JSON to S3
-put_config() {
+# win_json START END -> {"startMin":..,"endMin":..,"inTtl":..,"outTtl":..}
+win_json() { printf '{"startMin":%s,"endMin":%s,"inTtl":%s,"outTtl":%s}' "$1" "$2" "$IN_TTL" "$OUT_TTL"; }
+# put_json JSON: write the config object to S3
+put_json() {
   local f="$WORK/window.json"
-  printf '{"startMin":%s,"endMin":%s,"inTtl":%s,"outTtl":%s}\n' "$1" "$2" "$3" "$4" > "$f"
+  printf '%s\n' "$1" > "$f"
   aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json >/dev/null
 }
-set_window() { # START END: IN_TTL/OUT_TTL fixed; waits for the edge function's 30 s memory cache to expire
-  put_config "$1" "$2" "$IN_TTL" "$OUT_TTL" || fail "cannot upload the window config"
-  say "  window set to minutes $1..$2 UTC (inTtl=$IN_TTL, outTtl=$OUT_TTL); waiting ${SETTLE_SECS}s for the edge config cache"
+# set_rules JSON TEXT: upload the config, then wait for the edge function's 30 s memory cache to expire
+set_rules() {
+  put_json "$1" || fail "cannot upload the config"
+  say "  config set: $2; waiting ${SETTLE_SECS}s for the edge config cache"
   nap "$SETTLE_SECS"
+}
+# One config for T-A, T-B and T-D, so one path is inside its window and others are outside at the SAME moment:
+#   /prices/*  window now-5 .. now+30 min   (inside)       /rates/*, /err*  window now-60 .. now-30 min (outside)
+ABD_READY=0
+setup_abd() {
+  local m cfg; m="$(minute_of_day)"
+  if [ "$m" -lt 60 ] || [ "$m" -gt 1410 ]; then return 0; fi
+  cfg="$(jq -nc --argjson p "$(win_json $((m - 5)) $((m + 30)))" --argjson r "$(win_json $((m - 60)) $((m - 30)))" \
+    '{rules:[({path:"/prices/*"}+$p), ({path:"/rates/*"}+$r), ({path:"/err*"}+$r)]}')"
+  say "path rules: /prices/* is inside its window now, /rates/* and /err* are outside theirs"
+  set_rules "$cfg" "/prices/* minutes $((m - 5))..$((m + 30)), /rates/* and /err* minutes $((m - 60))..$((m - 30)) (UTC)"
+  ABD_READY=1
 }
 
 # ---------------------------------------------------------------------------------------------------- requests
@@ -267,25 +282,24 @@ meas() { echo "xcache=[$(csv "${S_XC[@]}")] age=[$(csv "${S_AGE[@]}")] origin-co
 TOO_CLOSE="too close to UTC midnight for this window (one window per UTC day); rerun at another time of day"
 
 t_a() {
-  local m; m="$(minute_of_day)"
-  if [ "$m" -lt 5 ] || [ "$m" -gt 1410 ]; then add_result T-A INCONCLUSIVE "$TOO_CLOSE"; return; fi
-  say "T-A: window contains now, 5 requests, every one must reach the origin"
-  set_window $((m - 5)) $((m + 30))
-  series /a 5 1
+  if [ "$ABD_READY" != 1 ]; then add_result T-A INCONCLUSIVE "$TOO_CLOSE"; return; fi
+  say "T-A: /prices/* has now inside its window, 5 requests, every one must reach the origin"
+  series /prices/a 5 1
+  local other_cc="" other_xc=""
+  if req /rates/a; then other_cc="$R_CC"; other_xc="$R_XC"; fi   # another path, outside its window, at the same moment
   if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-A INCONCLUSIVE "no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"
   elif has_hit "${S_XC[@]}"; then add_result T-A FAIL "a request was served from cache: $(meas)"
   elif [ "$(distinct "${S_NONCE[@]}")" != 5 ]; then add_result T-A FAIL "origin nonce repeated, so the origin was not hit every time: $(meas)"
   elif ! all_eq "$EXPECT_IN" "${S_CC[@]}"; then add_result T-A FAIL "viewer Cache-Control is not what the function sets: $(meas)"
   elif ! steps_of_one "${S_CNT[@]}"; then add_result T-A INCONCLUSIVE "distinct nonces but the counter did not step by 1 (new origin instance or other traffic): $(meas)"
-  else add_result T-A PASS "$(meas)"; fi
+  elif [ "$other_cc" != "$EXPECT_OUT" ]; then add_result T-A FAIL "at the same moment /rates/a (outside its window) should get s-maxage=$OUT_TTL, got \"$other_cc\": $(meas)"
+  else add_result T-A PASS "/prices/a: $(meas); at the same moment /rates/a (outside its window): cache-control=\"$other_cc\" xcache=$other_xc"; fi
 }
 
 t_b() {
-  local m; m="$(minute_of_day)"
-  if [ "$m" -lt 60 ]; then add_result T-B INCONCLUSIVE "$TOO_CLOSE"; return; fi
-  say "T-B: window in the past, first request Miss, repeats Hit, origin counter flat"
-  set_window $((m - 60)) $((m - 30))
-  series /b 5 "$HIT_GAP_SECS"
+  if [ "$ABD_READY" != 1 ]; then add_result T-B INCONCLUSIVE "$TOO_CLOSE"; return; fi
+  say "T-B: /rates/* is outside its window, first request Miss, repeats Hit, origin counter flat"
+  series /rates/b 5 "$HIT_GAP_SECS"
   local n=${#S_XC[@]} i ok=1 stray=0 other=0
   if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-B INCONCLUSIVE "no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"; return; fi
   [ "$(lc "${S_XC[0]}")" = miss ] || { ok=0; other=1; }
@@ -304,7 +318,8 @@ t_b() {
 }
 
 t_d() {
-  say "T-D: origin answers 500 on /err; the long TTL must not be applied or cached"
+  say "T-D: origin answers 500 on /err (a rule for /err* is outside its window); the long TTL must not be applied or cached"
+  if [ "$ABD_READY" != 1 ]; then add_result T-D INCONCLUSIVE "$TOO_CLOSE"; return; fi
   series /err 3 1
   if [ "$S_BAD" = 1 ] || ! all_status 500; then add_result T-D INCONCLUSIVE "expected HTTP 500 from every request: status=[$(csv "${S_ST[@]}")]"
   elif has_hit "${S_XC[@]}"; then add_result T-D FAIL "the 500 was served from cache: $(meas)"
@@ -330,51 +345,60 @@ t_e() {
   aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null || fail "cannot delete the config object"
   say "  E1: config object deleted; waiting ${SETTLE_SECS}s for the edge config cache"
   nap "$SETTLE_SECS"
-  e_phase /e; r1="$E_RES"; m1="$E_MEAS"
+  e_phase /rates/e; r1="$E_RES"; m1="$E_MEAS"
   f="$WORK/notjson.txt"; printf 'this is not json\n' > "$f"
   aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json >/dev/null || fail "cannot upload the bad config"
   say "  E2: config object replaced by text that is not JSON; waiting ${SETTLE_SECS}s"
   nap "$SETTLE_SECS"
-  e_phase /e2; r2="$E_RES"; m2="$E_MEAS"
+  e_phase /rates/e2; r2="$E_RES"; m2="$E_MEAS"
   if [ "$r1" = PASS ] && [ "$r2" = PASS ]; then add_result T-E PASS "fallback s-maxage=0 in both cases. E1 missing key: $m1. E2 bad JSON: $m2"
   elif [ "$r1" = FAIL ] || [ "$r2" = FAIL ]; then add_result T-E FAIL "E1 missing key: $r1 $m1. E2 bad JSON: $r2 $m2"
   else add_result T-E INCONCLUSIVE "E1 missing key: $r1 $m1. E2 bad JSON: $r2 $m2"; fi
 }
 
 t_c() {
-  local m start end open t0 t1 gap age rem first_nonce c2a c2b
+  local m start end open t0 ttl0 pre_age pre_xc post_xc post_cc post_age first_nonce c2a c2b t1
   m="$(minute_of_day)"
   if [ "$m" -gt 1375 ]; then add_result T-C INCONCLUSIVE "$TOO_CLOSE"; return; fi
-  say "T-C: window opens in about 2-3 minutes; an object cached before that stays cached"
+  say "T-C: window opens in about 2-3 minutes; an object cached just before must expire by the opening"
   start=$((m + 3)); end=$((start + 60))
-  put_config "$start" "$end" "$IN_TTL" "$OUT_TTL" || fail "cannot upload the window config"
-  say "  window set to minutes $start..$end UTC; waiting ${SETTLE_SECS}s for the edge config cache"
-  nap "$SETTLE_SECS"
+  set_rules "$(jq -nc --argjson w "$(win_json "$start" "$end")" '{rules:[({path:"/c/*"}+$w)]}')" "/c/* opens at minute $start, closes at $end (UTC)"
   open=$(( $(day_start_epoch) + start * 60 ))
   t0="$(now_epoch)"
-  if [ "$t0" -ge "$open" ]; then add_result T-C INCONCLUSIVE "the window opened before the first request (slow start)"; return; fi
-  if ! req /c; then add_result T-C INCONCLUSIVE "no answer for /c"; return; fi
+  if [ $((open - t0)) -lt 30 ]; then add_result T-C INCONCLUSIVE "less than 30 s left before the opening at the first request (slow start)"; return; fi
+  if ! req /c/old; then add_result T-C INCONCLUSIVE "no answer for /c"; return; fi
   first_nonce="$R_NONCE"
-  if [ "$(lc "$R_XC")" != miss ] || [ "$R_CC" != "$EXPECT_OUT" ]; then add_result T-C INCONCLUSIVE "first request not a Miss with s-maxage=$OUT_TTL (xcache=$R_XC cache-control=\"$R_CC\")"; return; fi
-  nap "$HIT_GAP_SECS"
-  req /c || { add_result T-C INCONCLUSIVE "no answer for /c"; return; }
-  case "$(lc "$R_XC")" in hit|refreshhit) ;; *) add_result T-C INCONCLUSIVE "object not cached before the opening (xcache=$R_XC)"; return ;; esac
-  say "  cached before the opening; waiting for the window to open at $((open - t0))s from the first request"
-  wait_until_epoch $((open + 10))
-  req /c || { add_result T-C INCONCLUSIVE "no answer for /c after opening"; return; }
-  t1="$(now_epoch)"; gap=$((t1 - open)); age="${R_AGE:-0}"
-  if [ "$R_NONCE" != "$first_nonce" ]; then
-    add_result T-C INCONCLUSIVE "object was refreshed ${gap}s after the opening (xcache=$R_XC); the stale-until-TTL behaviour was NOT reproduced"; return
+  ttl0="${R_CC##*s-maxage=}"
+  case "$ttl0" in ''|*[!0-9]*) add_result T-C INCONCLUSIVE "no s-maxage number in the first answer (cache-control=\"$R_CC\")"; return ;; esac
+  if [ "$(lc "$R_XC")" != miss ]; then add_result T-C INCONCLUSIVE "first request was not a Miss (xcache=$R_XC)"; return; fi
+  # The cap: s-maxage is the time until the opening (here 30 s .. ~3 min), far below outTtl=$OUT_TTL. 5 s tolerance for clock skew.
+  if [ "$ttl0" -le 0 ] || [ "$ttl0" -gt $((open - t0 + 5)) ]; then
+    add_result T-C FAIL "s-maxage=$ttl0 is not capped to the time until the opening (${open}-${t0} = $((open - t0)) s left; outTtl=$OUT_TTL)"; return
   fi
-  rem=$((OUT_TTL - age))
-  series /c2 2 1
+  nap "$HIT_GAP_SECS"
+  req /c/old || { add_result T-C INCONCLUSIVE "no answer for /c"; return; }
+  case "$(lc "$R_XC")" in hit|refreshhit) ;; *) add_result T-C INCONCLUSIVE "object not cached before the opening (xcache=$R_XC)"; return ;; esac
+  say "  cached with s-maxage=$ttl0; the window opens $((open - t0))s after the first request"
+  wait_until_epoch $((open - 10))
+  req /c/old || { add_result T-C INCONCLUSIVE "no answer for /c before the opening"; return; }
+  pre_xc="$R_XC"; pre_age="${R_AGE:--}"
+  wait_until_epoch $((open + 5))
+  req /c/old || { add_result T-C INCONCLUSIVE "no answer for /c after the opening"; return; }
+  t1="$(now_epoch)"; post_xc="$R_XC"; post_cc="$R_CC"; post_age="${R_AGE:--}"
+  case "$(lc "$post_xc")" in
+    hit|refreshhit) add_result T-C FAIL "/c was still served from cache $((t1 - open))s after the opening (age=${post_age}s, s-maxage was $ttl0): the cap did not work"; return ;;
+  esac
+  if [ "$R_NONCE" = "$first_nonce" ] || [ "$post_cc" != "$EXPECT_IN" ]; then
+    add_result T-C INCONCLUSIVE "after the opening: xcache=$post_xc nonce-changed=$([ "$R_NONCE" != "$first_nonce" ] && echo yes || echo no) cache-control=\"$post_cc\""; return
+  fi
+  series /c/new 2 1
   c2a="${S_XC[0]}"; c2b="${S_XC[1]}"
   if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-C INCONCLUSIVE "no HTTP 200 for /c2"
   elif has_hit "${S_XC[@]}" || [ "$(distinct "${S_NONCE[@]}")" != 2 ] || ! all_eq "$EXPECT_IN" "${S_CC[@]}"; then
     add_result T-C FAIL "a NEW object after the opening was cached or not marked s-maxage=0 (xcache=$c2a,$c2b)"
   else
-    add_result T-C PASS "limitation reproduced: /c cached before the opening was still served from cache (xcache=$R_XC, age=${age}s) ${gap}s after the window opened and stays so for about ${rem}s more (until its TTL ends, outTtl=${OUT_TTL}s); new object /c2 after the opening was not cached (xcache=$c2a,$c2b)"
-    note "T-C: boundary expiry gap observed: at least ${gap}s after the window opened, an object cached before the opening was still served from cache; remaining life about ${rem}s of ${OUT_TTL}s. Lower outTtl, or invalidate, if you need the opening to take effect sooner."
+    add_result T-C PASS "cap works: /c was cached with s-maxage=${ttl0} (outTtl is $OUT_TTL; the window opened $((open - t0))s after the first request); 10s before the opening xcache=$pre_xc age=${pre_age}s; 5s after the opening xcache=$post_xc (new nonce, cache-control=\"$post_cc\"); new object /c/new after the opening not cached (xcache=$c2a,$c2b)"
+    note "T-C: an object cached $((open - t0))s before the opening got s-maxage=$ttl0 (outTtl is $OUT_TTL) and was gone 5s after the opening. Client and Lambda clocks differ by seconds, and Age and the TTL are whole seconds, so the check allows 5s of skew and an object can expire a few seconds before the opening, not after."
   fi
 }
 
@@ -390,6 +414,7 @@ run_tests() {
     for m in T-A T-B T-D T-E T-C; do add_result "$m" INCONCLUSIVE "CloudFront did not answer 200 after the warm-up (origin, function URL permission or edge function problem)"; done
     return
   fi
+  setup_abd
   t_a; t_b; t_d; t_e; t_c
 }
 

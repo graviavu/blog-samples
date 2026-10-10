@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake curl: a small model of CloudFront + the edge function + the origin. Needs jq.
 #   STUB_CDN=ok (default) | cacheall (ignores the function, caches everything 14400 s) | rewrite-errors (long TTL on 500)
-#            | stale-config (keeps using the last good config when S3 fails)
+#            | nocap (outTtl without the cap to the next opening) | stale-config (keeps using the last good config when S3 fails)
 # shellcheck source=stub-lib.sh
 # shellcheck source-path=SCRIPTDIR
 . "$(dirname "$0")/stub-lib.sh"
@@ -54,9 +54,18 @@ if [ "$status" -lt 400 ] || [ "$mode" = rewrite-errors ]; then
   else
     cfg=""; [ -e "$S/s3obj" ] && cfg="$(cat "$S/s3obj")"
     if [ -n "$cfg" ]; then put lastcfg "$cfg"; elif [ "$mode" = stale-config ]; then cfg="$(get lastcfg)"; fi
-    if [ -n "$cfg" ] && echo "$cfg" | jq -e '.startMin and .endMin' >/dev/null 2>&1; then
-      m=$(( (now % 86400) / 60 ))
-      ttl="$(echo "$cfg" | jq -r --argjson m "$m" 'if $m >= .startMin and $m < .endMin then .inTtl else .outTtl end')"
+    if [ -n "$cfg" ] && echo "$cfg" | jq -e '(.rules // .default) != null' >/dev/null 2>&1; then
+      secs=$(( now % 86400 ))
+      # same rules as the edge function: exact beats prefix, longest prefix wins, then "default", else 0
+      ttl="$(echo "$cfg" | jq -r --argjson s "$secs" --arg p "$path" --arg nocap "$([ "$mode" = nocap ] && echo 1 || echo 0)" '
+        def win: ((.rules // []) | map(select((.path | endswith("*") | not) and .path == $p)) | .[0])
+          // ((.rules // []) | map(select(.path as $pat | ($pat | endswith("*")) and ($p | startswith($pat[0:(($pat | length) - 1)])))) | sort_by(-(.path | length)) | .[0])
+          // .default;
+        win as $w
+        | if $w == null then 0
+          elif ($s >= ($w.startMin * 60) and $s < ($w.endMin * 60)) then $w.inTtl
+          else (if $s < ($w.startMin * 60) then ($w.startMin * 60) - $s else 86400 - $s + ($w.startMin * 60) end) as $until
+            | (if $nocap == "1" then $w.outTtl else ([$w.outTtl, $until] | min) end) end')"
     else
       ttl=0
     fi
