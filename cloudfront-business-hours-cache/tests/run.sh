@@ -21,7 +21,8 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_FAIL STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
 # newdir NAME -> STUB_DIR and RESULTS_DIR for that scenario
@@ -31,8 +32,17 @@ seed_foreign() {
   echo "$OTHER" > "$STUB_DIR/res/s3__bhc-$OTHER-cfg"; echo "$OTHER" > "$STUB_DIR/res/lambda__bhc-$OTHER-edge"
   echo "$OTHER" > "$STUB_DIR/res/iam__bhc-$OTHER-role"; echo "$OTHER" > "$STUB_DIR/res/lambda__bhc-$OTHER-origin"
 }
+# seed_logs: log groups of this run (must go) and look-alikes (must stay). File names: "/" written as "%".
+seed_logs() {
+  mkdir -p "$STUB_DIR/logs/us-east-1" "$STUB_DIR/logs/eu-west-1"
+  : > "$STUB_DIR/logs/us-east-1/%aws%lambda%bhc-$RUNID_A-origin"
+  : > "$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge"
+  : > "$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge-extra"
+  : > "$STUB_DIR/logs/us-east-1/%aws%lambda%bhc-$OTHER-origin"
+}
+logs_decoys_intact() { [ -e "$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge-extra" ] && [ -e "$STUB_DIR/logs/us-east-1/%aws%lambda%bhc-$OTHER-origin" ]; }
 # go NAME "stdin" args... -> RC, OUT
-go() { local name="$1" input="$2"; shift 2; newdir "$name"; [ "${SEED:-0}" = 1 ] && seed_foreign; printf '%b' "$input" | "$RT" "$@" > "$OUT" 2>&1; RC=$?; }
+go() { local name="$1" input="$2"; shift 2; newdir "$name"; [ "${SEED:-0}" = 1 ] && seed_foreign; [ "${SEED_LOGS:-0}" = 1 ] && seed_logs; printf '%b' "$input" | "$RT" "$@" > "$OUT" 2>&1; RC=$?; }
 calls() { cat "$STUB_DIR/calls.log" 2>/dev/null; }
 only_sts() { calls | grep -q . && ! calls | grep -qv '^sts get-caller-identity'; }
 no_leftovers() {   # nothing of this run in the fake account (files of $OTHER do not count)
@@ -200,6 +210,90 @@ printf 'delete cloudfront test stack\n' | "$RT" --cleanup "../../etc" > "$OUT" 2
 check "cleanup refuses a malformed run id" is "$RC" 2
 printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
 check "cleanup without a state file refuses" is "$RC" 2
+
+echo "review round: leftover bucket, lookups, exit codes"
+reset_env; export STUB_FAIL=put-bucket-tagging; go notagset "$PHRASE\n"
+check "bucket created but never tagged (NoSuchTagSet) is still deleted, as ours" has "$STUB_DIR/deleted.log" "DELETE s3 bhc-$RUNID_A-cfg"
+check "...nothing left, teardown complete, rc 1" bash -c "[ '$RC' = 1 ] && grep -q 'teardown: complete' '$OUT'"
+newdir untagged; mkdir -p "$STUB_DIR/res"; : > "$STUB_DIR/res/s3__bhc-$RUNID_A-cfg"
+printf 'RUNID=%s\nBUCKET=bhc-%s-cfg\n' "$RUNID_A" "$RUNID_A" > "$RESULTS_DIR/state-$RUNID_A.env"   # no BUCKET_MADE
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "untagged bucket without the create-bucket flag is NOT deleted" bash -c "[ -e '$STUB_DIR/res/s3__bhc-$RUNID_A-cfg' ] && ! grep -q 'DELETE s3 ' '$STUB_DIR/deleted.log' 2>/dev/null"
+check "...rc 4 and the state file is kept" bash -c "[ '$RC' = 4 ] && [ -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+reset_env; export STUB_FAIL=get-bucket-tagging STUB_FAIL_CODE=AccessDenied STUB_FAIL_TEXT="the bucket does not exist"; go freetext "$PHRASE\n"
+check "free text 'does not exist' under another error code is not 'already gone'" has "$OUT" "bucket: cannot read its tags, NOT deleting"
+check "...bucket kept, rc 4, state file kept" bash -c "[ -e '$STUB_DIR/res/s3__bhc-$RUNID_A-cfg' ] && [ '$RC' = 4 ] && [ -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+reset_env; export STUB_SIG=INT STUB_SIG_AT=create-distribution-with-tags STUB_FAIL=list-distributions; go lookupfail "$PHRASE\n"
+check "failed distribution lookup: reported, rc 4, state file kept" bash -c "grep -q 'lookup by name failed' '$OUT' && [ '$RC' = 4 ] && [ -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+reset_env; export STUB_SIG=TERM STUB_SIG_AT=create-cache-policy STUB_FAIL=list-cache-policies; go lookupfail2 "$PHRASE\n"
+check "failed cache policy lookup: reported, rc 4, state file kept" bash -c "grep -q 'cache policy: lookup by name failed' '$OUT' && [ '$RC' = 4 ] && [ -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+reset_env; export STUB_SIG=INT STUB_SIG_AT=publish-version STUB_REPLICA=1; go rc_mask "$PHRASE\n"
+check "SIGINT plus an incomplete teardown reports rc 4, not 130" is "$RC" 4
+reset_env; export STUB_DIST_NULL=1; go distnull "$PHRASE\n"
+check "a null distribution id is refused" has "$OUT" "no distribution id returned"
+check "...and the distribution that was created is still found and deleted" bash -c "grep -q 'DELETE cf' '$STUB_DIR/deleted.log'"
+newdir bucketexists2; echo "$OTHER" > "$STUB_DIR/res/s3__bhc-$RUNID_A-cfg"
+printf '%s\n' "$PHRASE" | "$RT" > "$OUT" 2>&1; RC=$?
+check "an existing bucket with the planned name stops the run before anything is created" bash -c "[ '$RC' = 1 ] && grep -q 'already exists' '$OUT' && ! grep -qE '^(s3api create-bucket|iam |lambda |cloudfront )' '$STUB_DIR/calls.log'"
+check "...and that bucket is not touched" bash -c "[ -e '$STUB_DIR/res/s3__bhc-$RUNID_A-cfg' ] && ! grep -q 'DELETE s3 ' '$STUB_DIR/deleted.log' 2>/dev/null"
+
+echo "review round: confirmation screen and account guard"
+reset_env; go acct_dry "" --dry-run
+check "dry run shows the profile and the LAST 4 digits only" bash -c "grep -q 'profile testprof' '$OUT' && grep -q 'account \*\*\*\*\*\*\*\*9012' '$OUT'"
+reset_env; export EXPECT_ACCOUNT_LAST4=0000; go acct_bad "$PHRASE\n"
+check "EXPECT_ACCOUNT_LAST4 that differs: refused, rc 2, nothing created" bash -c "[ '$RC' = 2 ] && grep -q 'does not end in EXPECT_ACCOUNT_LAST4' '$STUB_DIR/../out.txt'" 
+check "...only the identity call was made" only_sts
+reset_env; export EXPECT_ACCOUNT_LAST4=12; go acct_fmt "$PHRASE\n"
+check "EXPECT_ACCOUNT_LAST4 that is not 4 digits: refused" is "$RC" 2
+reset_env; export EXPECT_ACCOUNT_LAST4=9012; go acct_ok "$PHRASE\n"
+check "matching EXPECT_ACCOUNT_LAST4: run proceeds" is "$RC" 0
+check "the confirmation screen shows profile, region and last 4" bash -c "grep -q 'Target:  profile testprof   region us-east-1   account ending in 9012' '$OUT'"
+check "results file has no profile and no account digits" bash -c "! grep -qE 'testprof|9012|ending in' '$(first_res)'"
+check "no profile or account digits in the state file" bash -c "! grep -qE 'testprof|9012' '$RESULTS_DIR'/state-*.env 2>/dev/null"
+check "screen output still redacted" clean "$OUT"
+
+echo "review round: public origin, roles, policies"
+check "reserved concurrency 5 requested on the origin" has "$STUB_DIR/calls.log" "put-function-concurrency --function-name bhc-$RUNID_A-origin --reserved-concurrent-executions 5"
+reset_env; export STUB_FAIL=put-function-concurrency; go noconc "$PHRASE\n"
+check "reserved concurrency failure does not abort the run" bash -c "[ '$RC' = 0 ] && grep -q 'reserved concurrency was not set' '$OUT'"
+check "two roles are created (edge and origin)" bash -c "grep -c '^iam create-role' '$STUB_DIR/calls.log' | grep -q '^2$'"
+check "edge role: trust lambda and edgelambda, S3 GetObject and ListBucket" bash -c "grep -q edgelambda '$STUB_DIR/trust-bhc-$RUNID_A-erole.json' && grep -q ListBucket '$STUB_DIR/policy-bhc-$RUNID_A-erole.json' && grep -q GetObject '$STUB_DIR/policy-bhc-$RUNID_A-erole.json'"
+check "origin role: no edgelambda trust, no S3 permission" bash -c "! grep -q edgelambda '$STUB_DIR/trust-bhc-$RUNID_A-orole.json' && ! grep -q s3: '$STUB_DIR/policy-bhc-$RUNID_A-orole.json'"
+check "logs permission scoped to this run's log groups, no bare *" bash -c "grep -q 'log-group:/aws/lambda/\*bhc-$RUNID_A-\*' '$STUB_DIR/policy-bhc-$RUNID_A-erole.json' && ! grep -q '\"Resource\": \"\*\"' '$STUB_DIR/policy-bhc-$RUNID_A-erole.json'"
+reset_env; export RT_RUNID='x;rm -rf'; go badrunid "$PHRASE\n"
+check "a run id that is not <10 digits>-<4 hex> is refused before any change" bash -c "[ '$RC' = 2 ] && grep -q 'is not of the form' '$OUT'"
+check "...only the identity call was made" only_sts
+
+echo "review round: T-B stray miss, T-E both cases"
+reset_env; export STUB_STRAY_MISS=/b:3; go stray "$PHRASE\n"
+check "T-B: one stray Miss with a flat origin counter is INCONCLUSIVE, not FAIL" grep -Eq "^T-B +INCONCLUSIVE" "$OUT"
+check "...exit code 3" is "$RC" 3
+reset_env; go ebase "$PHRASE\n"
+check "T-E covers the missing key and the bad JSON" bash -c "grep -q 'E1 missing key' '$(first_res)' && grep -q 'E2 bad JSON' '$(first_res)'"
+check "the bad config was really uploaded" has "$STUB_DIR/puts.log" "this is not json"
+
+echo "review round: log groups"
+reset_env; SEED_LOGS=1 go logs "$PHRASE\n"; unset SEED_LOGS
+check "origin log group and edge log group (in the other region) deleted" bash -c "grep -q 'DELETE loggroup us-east-1 /aws/lambda/bhc-$RUNID_A-origin' '$STUB_DIR/deleted.log' && grep -q 'DELETE loggroup eu-west-1 /aws/lambda/us-east-1.bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log'"
+check "look-alike and other-run log groups untouched" logs_decoys_intact
+check "log groups looked up in every region" has "$STUB_DIR/calls.log" "ec2 describe-regions"
+
+echo "review round: --cleanup without a state file"
+reset_env; export STUB_REPLICA=1; SEED_LOGS=1 go fb "$PHRASE\n"; unset SEED_LOGS
+check "edge log group kept while the edge function exists" bash -c "[ -e '$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge' ]"
+rm -f "$RESULTS_DIR/state-$RUNID_A.env"; export STUB_REPLICA=0; OUT="$TMP/fb-clean.txt"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" --dry-run > "$OUT" 2>&1; RC=$?
+check "fallback --dry-run lists by tag and deletes nothing" bash -c "[ '$RC' = 0 ] && grep -q 'falling back to a read-only listing' '$OUT' && ! grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && [ ! -e '$RESULTS_DIR/state-$RUNID_A.env' ]"
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "fallback --cleanup finishes the job from the tag listing" bash -c "[ '$RC' = 0 ] && grep -q 'DELETE lambda bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-erole' '$STUB_DIR/deleted.log' && grep -q 'DELETE iam bhc-$RUNID_A-orole' '$STUB_DIR/deleted.log'"
+check "...including the edge log group, and only exact names" bash -c "grep -q 'DELETE loggroup eu-west-1 /aws/lambda/us-east-1.bhc-$RUNID_A-edge' '$STUB_DIR/deleted.log' && [ -e '$STUB_DIR/logs/eu-west-1/%aws%lambda%us-east-1.bhc-$RUNID_A-edge-extra' ]"
+check "...output redacted" clean "$OUT"
+newdir fb_none
+printf 'delete cloudfront test stack\n' | "$RT" --cleanup "$RUNID_A" > "$OUT" 2>&1; RC=$?
+check "fallback with nothing tagged: refuses (rc 2)" is "$RC" 2
+
+echo "review round: .gitignore"
+check "results and state files are git-ignored" bash -c "grep -q 'results-\*.md' '$root/.gitignore' && grep -q 'state-\*.env' '$root/.gitignore'"
 
 echo "arguments"
 newdir args; "$RT" --nope > "$OUT" 2>&1; RC=$?

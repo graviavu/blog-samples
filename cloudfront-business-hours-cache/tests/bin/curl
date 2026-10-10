@@ -29,9 +29,14 @@ emit() { # status xcache age cc body
   printf '%s' "$5" > "${out:-/dev/null}"
 }
 
+# STUB_STRAY_MISS=<path>:<n>: the n-th request for that path is answered from the cache but labelled Miss (a POP with several cache servers)
+nreq=$(( $(get "nreq_$(printf '%s' "$path" | tr '/' '_')" 0) + 1 )); put "nreq_$(printf '%s' "$path" | tr '/' '_')" "$nreq"
 if [ -e "$key" ]; then   # cached?
   stored="$(sed -n 1p "$key")"; ttl="$(sed -n 2p "$key")"; cc="$(sed -n 3p "$key")"
-  if [ "$now" -lt $((stored + ttl)) ]; then emit 200 Hit $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0; fi
+  if [ "$now" -lt $((stored + ttl)) ]; then
+    if [ "${STUB_STRAY_MISS:-}" = "$path:$nreq" ]; then emit 200 Miss "" "$cc" "$(sed -n 4p "$key")"; exit 0; fi
+    emit 200 Hit $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0
+  fi
   rm -f "$key"
 fi
 

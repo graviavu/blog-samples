@@ -21,8 +21,8 @@ EXPECT_OUT="public, max-age=0, s-maxage=14400"
 RESULTS_DIR="${RESULTS_DIR:-.}"
 export AWS_PAGER=""
 
-RUNID="" BUCKET="" ROLE="" ORIGIN_FN="" EDGE_FN="" EDGE_VER="" CP_ID="" DIST_ID="" CF_DOMAIN="" ORIGIN_HOST=""
-STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 DIST_GONE=0 TRY_DIST=0 TRY_CP=0
+RUNID="" BUCKET="" ROLE="" ORIGIN_ROLE="" ORIGIN_FN="" EDGE_FN="" EDGE_VER="" CP_ID="" DIST_ID="" CF_DOMAIN="" ORIGIN_HOST=""
+STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 DIST_GONE=0 TRY_DIST=0 TRY_CP=0 BUCKET_MADE=0 LOGS_LEFT=""
 RES_NAME=() RES_RESULT=() RES_MEAS=()
 NOTES=()
 
@@ -30,13 +30,13 @@ NOTES=()
 # Everything that reaches the screen or a results file goes through redact(). Best effort: read the file before you share it.
 redact() {
   local extra=() lit name
-  for name in BUCKET ROLE ORIGIN_FN EDGE_FN CP_ID DIST_ID CF_DOMAIN ORIGIN_HOST; do
+  for name in BUCKET ROLE ORIGIN_ROLE ORIGIN_FN EDGE_FN CP_ID DIST_ID CF_DOMAIN ORIGIN_HOST; do
     eval "lit=\${$name:-}"
     [ -n "$lit" ] || continue
     lit="$(printf '%s' "$lit" | sed -e 's/[][\.*^$/|+?(){}]/\\&/g')"
     case "$name" in
       BUCKET) extra+=(-e "s|$lit|<bucket>|g") ;;
-      ROLE) extra+=(-e "s|$lit|<role>|g") ;;
+      ROLE|ORIGIN_ROLE) extra+=(-e "s|$lit|<role>|g") ;;
       ORIGIN_FN|EDGE_FN) extra+=(-e "s|$lit|<function>|g") ;;
       CP_ID) extra+=(-e "s|$lit|<cache-policy-id>|g") ;;
       DIST_ID) extra+=(-e "s|$lit|<distribution-id>|g") ;;
@@ -72,9 +72,21 @@ aws_do() {
   [ "$DRY_RUN" = 0 ] || { echo "internal error: aws_do called in --dry-run: $1 $2" >&2; exit 99; }
   _aws "$@"
 }
-# not_found: did the last aws call fail because the resource does not exist? (reads the file, so it also works across subshells)
-not_found() { grep -Eq 'NoSuchBucket|NoSuchEntity|ResourceNotFoundException|NoSuchDistribution|NoSuchCachePolicy|NotFound|does not exist' "$WORK/aws.err" 2>/dev/null; }
+# not_found KIND: did the last aws call fail with the error CODE that means "this resource does not exist"? Codes only, never free
+# text (an AccessDenied message that happens to say "does not exist" is not a not-found). Reads the file, so it works across subshells.
+not_found() {
+  local code
+  case "$1" in
+    s3) code=NoSuchBucket ;; iam) code=NoSuchEntity ;; lambda) code=ResourceNotFoundException ;;
+    cf) code=NoSuchDistribution ;; cp) code=NoSuchCachePolicy ;; *) return 1 ;;
+  esac
+  grep -Eq "\\($code\\)" "$WORK/aws.err" 2>/dev/null
+}
+# error_code: the code of the last failed aws call, or empty
+error_code() { sed -n 's/^[^(]*An error occurred (\([A-Za-z0-9]*\)).*/\1/p' "$WORK/aws.err" 2>/dev/null | head -n 1; }
 
+# with_region REGION cmd...: run cmd with another region (log groups of the edge function live in the regions that served requests)
+with_region() { local old="$REGION" rc; REGION="$1"; shift; "$@"; rc=$?; REGION="$old"; return $rc; }
 nap() { sleep "$1"; }
 retry() { # tries pause cmd...
   local n="$1" p="$2" i=1; shift 2
@@ -94,7 +106,7 @@ state_set() { # KEY VALUE (also sets the variable)
 state_load() { # file: only well-formed lines are read, nothing is sourced
   local k v
   while IFS='=' read -r k v; do
-    case "$k" in RUNID|BUCKET|ROLE|ORIGIN_FN|EDGE_FN|EDGE_VER|CP_ID|DIST_ID|CF_DOMAIN|ORIGIN_HOST|DIST_GONE|TRY_DIST|TRY_CP) ;; *) continue ;; esac
+    case "$k" in RUNID|BUCKET|ROLE|ORIGIN_FN|EDGE_FN|EDGE_VER|CP_ID|DIST_ID|CF_DOMAIN|ORIGIN_HOST|DIST_GONE|TRY_DIST|TRY_CP|BUCKET_MADE|ORIGIN_ROLE) ;; *) continue ;; esac
     printf '%s' "$v" | grep -Eq '^[A-Za-z0-9._:/-]*$' || continue
     eval "$k=\$v"
   done < "$1"
@@ -134,7 +146,15 @@ tag_of() {
       if [ "$rc" = 0 ] && [ "$out" = "bhc-$RUNID-cp" ]; then out="$RUNID"; fi ;;
     *) return 1 ;;
   esac
-  if [ "$rc" -ne 0 ]; then if not_found; then return 44; fi; return 1; fi
+  if [ "$rc" -ne 0 ]; then
+    if not_found "$kind"; then return 44; fi
+    # A bucket whose tagging call never succeeded has no tag set. It is ours only if its name is exactly this run's bucket name
+    # AND create-bucket of this run reported success (BUCKET_MADE).
+    if [ "$kind" = s3 ] && [ "$(error_code)" = NoSuchTagSet ] && [ "$id" = "bhc-$RUNID-cfg" ] && [ "$BUCKET_MADE" = 1 ]; then
+      printf '%s' "$RUNID"; return 0
+    fi
+    return 1
+  fi
   printf '%s' "$out"
 }
 # owned KIND ID LABEL -> 0: ours, delete it. 44: already gone. 1: not ours or unknown, leave it alone (TD_FAIL=1).
@@ -152,7 +172,8 @@ owned() {
 # teardown looks the resource up again by its run-id name. The ownership check below still applies to what it finds.
 td_dist() {
   if [ -z "$DIST_ID" ] && [ "$TRY_DIST" = 1 ]; then
-    DIST_ID="$(aws_ro cloudfront list-distributions --query "DistributionList.Items[?Comment=='bhc test $RUNID'].Id | [0]" --output text)"
+    DIST_ID="$(aws_ro cloudfront list-distributions --query "DistributionList.Items[?Comment=='bhc test $RUNID'].Id | [0]" --output text)" \
+      || { say "  distribution: lookup by name failed, so a distribution of this run may exist and was NOT checked"; TD_FAIL=1; DIST_ID=""; }
     case "$DIST_ID" in None|null|'') DIST_ID="" ;; *) say "  distribution: found by its run-id comment" ;; esac
   fi
   [ -n "$DIST_ID" ] || return 0
@@ -178,7 +199,8 @@ td_dist() {
 }
 td_cache_policy() {
   if [ -z "$CP_ID" ] && [ "$TRY_CP" = 1 ]; then
-    CP_ID="$(aws_ro cloudfront list-cache-policies --type custom --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='bhc-$RUNID-cp'].CachePolicy.Id | [0]" --output text)"
+    CP_ID="$(aws_ro cloudfront list-cache-policies --type custom --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='bhc-$RUNID-cp'].CachePolicy.Id | [0]" --output text)" \
+      || { say "  cache policy: lookup by name failed, so a policy of this run may exist and was NOT checked"; TD_FAIL=1; CP_ID=""; }
     case "$CP_ID" in None|null|'') CP_ID="" ;; *) say "  cache policy: found by its run-id name" ;; esac
   fi
   [ -n "$CP_ID" ] || return 0
@@ -194,7 +216,7 @@ td_edge() {
   if [ -n "$DIST_ID" ] && [ "$DIST_GONE" != 1 ]; then say "  edge function: kept (distribution still exists)"; TD_FAIL=1; TD_PENDING=1; return 0; fi
   if retry "$EDGE_DELETE_TRIES" "$EDGE_DELETE_PAUSE" aws_do lambda delete-function --function-name "$EDGE_FN" >/dev/null; then
     say "  edge function: deleted"
-  elif not_found; then
+  elif not_found lambda; then
     say "  edge function: already gone"
   else
     say "  edge function: NOT deleted yet. AWS removes Lambda@Edge replicas some hours after the distribution is gone."
@@ -207,12 +229,38 @@ td_origin() {
   owned lambda "$ORIGIN_FN" "origin function"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
   if aws_do lambda delete-function --function-name "$ORIGIN_FN" >/dev/null; then say "  origin function: deleted"; else say "  origin function: delete failed"; TD_FAIL=1; fi
 }
-td_role() {
+td_role() { # LABEL ROLE_NAME
+  [ -n "$2" ] || return 0
+  owned iam "$2" "$1"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
+  aws_do iam delete-role-policy --role-name "$2" --policy-name bhc-inline >/dev/null 2>&1
+  if aws_do iam delete-role --role-name "$2" >/dev/null; then say "  $1: deleted"; else say "  $1: delete failed"; TD_FAIL=1; fi
+}
+td_origin_role() { td_role "origin role" "$ORIGIN_ROLE"; }
+td_edge_role() {
   [ -n "$ROLE" ] || return 0
-  if [ "$TD_PENDING" = 1 ]; then say "  role: kept (the edge function still exists)"; return 0; fi
-  owned iam "$ROLE" "role"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  aws_do iam delete-role-policy --role-name "$ROLE" --policy-name bhc-inline >/dev/null 2>&1
-  if aws_do iam delete-role --role-name "$ROLE" >/dev/null; then say "  role: deleted"; else say "  role: delete failed"; TD_FAIL=1; fi
+  if [ "$TD_PENDING" = 1 ]; then say "  edge role: kept (the edge function still exists)"; return 0; fi
+  td_role "edge role" "$ROLE"
+}
+# CloudWatch log groups. Only groups whose name is EXACTLY one of this run's names are deleted (log groups carry no tag here).
+# The edge function logs in the region of the edge location that ran it, as /aws/lambda/us-east-1.<function>.
+td_log_group() { # region name
+  local found g
+  found="$(with_region "$1" aws_ro logs describe-log-groups --log-group-name-prefix "$2" --query 'logGroups[].logGroupName' --output text)" \
+    || { LOGS_LEFT="$LOGS_LEFT $2@$1(lookup failed)"; return 0; }
+  for g in $found; do
+    [ "$g" = "$2" ] || continue
+    if with_region "$1" aws_do logs delete-log-group --log-group-name "$g" >/dev/null; then say "  log group $2 in $1: deleted"; else LOGS_LEFT="$LOGS_LEFT $2@$1"; fi
+  done
+}
+td_logs() {
+  local regions r
+  if [ -n "$ORIGIN_FN" ]; then td_log_group "$REGION" "/aws/lambda/$ORIGIN_FN"; fi
+  if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" = 1 ]; then say "  edge log groups: kept until the edge function is deleted (--cleanup removes them)"; fi
+  if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" != 1 ]; then
+    regions="$(aws_ro ec2 describe-regions --query 'Regions[].RegionName' --output text)" || regions="$REGION"
+    for r in $regions; do td_log_group "$r" "/aws/lambda/us-east-1.$EDGE_FN"; done
+  fi
+  if [ -n "$LOGS_LEFT" ]; then say "  log groups NOT deleted:$LOGS_LEFT (a few cents of stored logs at most; delete them in the console)"; fi
 }
 td_bucket() {
   [ -n "$BUCKET" ] || return 0
@@ -222,7 +270,7 @@ td_bucket() {
 }
 teardown() {
   say "teardown: deleting only resources tagged RunId=$RUNID"
-  td_dist; td_cache_policy; td_edge; td_origin; td_role; td_bucket
+  td_dist; td_cache_policy; td_edge; td_origin; td_edge_role; td_origin_role; td_logs; td_bucket
   if [ "$TD_FAIL" = 0 ]; then
     say "teardown: complete"
   else

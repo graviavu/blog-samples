@@ -41,7 +41,7 @@ on_exit() {
       { printf '\n## Teardown\n\n'; if [ "$TD_FAIL" = 0 ]; then echo "Complete: every resource of this run was deleted."; else echo "INCOMPLETE: some resources of this run may still exist. See the screen output."; fi; } | redact >> "$RESULTS_FILE"
     fi
     if [ "$TD_FAIL" = 0 ] && [ -n "$STATE_FILE" ]; then rm -f "$STATE_FILE"; fi
-    if [ "$TD_FAIL" != 0 ] && [ "$rc" = 0 ]; then rc=4; fi
+    if [ "$TD_FAIL" != 0 ]; then rc=4; fi   # an incomplete teardown always wins: leftovers must not be hidden by an earlier code
   fi
   rm -rf "$WORK"
   exit "$rc"
@@ -57,8 +57,15 @@ preflight() {
   local t
   for t in aws jq curl zip; do command -v "$t" >/dev/null 2>&1 || die "$t not found in PATH"; done
   aws --version 2>&1 | grep -q 'aws-cli/2' || die "AWS CLI v2 is required"
-  aws_ro sts get-caller-identity --query Account --output text >/dev/null || die "cannot read the AWS identity (are you logged in?)"
-  say "AWS identity: account ************ (hidden), region $REGION"
+  local acct
+  acct="$(aws_ro sts get-caller-identity --query Account --output text)" || die "cannot read the AWS identity (are you logged in?)"
+  printf '%s' "$acct" | grep -Eq '^[0-9]{12}$' || die "unexpected answer from sts get-caller-identity"
+  ACCT_LAST4="${acct: -4}"   # screen only: never written to the results file, the state file or a log
+  say "AWS identity: profile ${AWS_PROFILE:-<none, default credentials>}, account ********$ACCT_LAST4, region $REGION"
+  if [ -n "${EXPECT_ACCOUNT_LAST4:-}" ]; then
+    printf '%s' "$EXPECT_ACCOUNT_LAST4" | grep -Eq '^[0-9]{4}$' || die "EXPECT_ACCOUNT_LAST4 must be exactly 4 digits"
+    [ "$EXPECT_ACCOUNT_LAST4" = "$ACCT_LAST4" ] || die "the account does not end in EXPECT_ACCOUNT_LAST4: wrong profile? Nothing was done."
+  fi
   local m; m="$(minute_of_day)"
   if [ "$m" -lt 90 ] || [ "$m" -gt 1320 ]; then
     MIDNIGHT_BAD=1
@@ -67,6 +74,7 @@ preflight() {
   fi
 }
 MIDNIGHT_BAD=0
+ACCT_LAST4=""
 
 print_plan() {
   local id="$1"
@@ -74,13 +82,14 @@ print_plan() {
 
 Plan for run $id (every resource below is tagged RunId=$id and is deleted at the end):
   1. S3 bucket              bhc-$id-cfg          holds $CONFIG_KEY (the window), private
-  2. IAM role               bhc-$id-role         read that one object, write logs
-  3. Lambda (origin)        bhc-$id-origin       Node.js 22 + public function URL, returns {now, counter, nonce}, no Cache-Control
+  2. IAM roles (two)        bhc-$id-erole        edge: read that one object (+ list the bucket), write logs; trusts lambda and edgelambda
+                            bhc-$id-orole        origin: write logs only; trusts lambda
+  3. Lambda (origin)        bhc-$id-origin       Node.js 22 + PUBLIC function URL (test only), reserved concurrency 5 if the account allows
   4. Lambda@Edge function   bhc-$id-edge         Node.js 22, us-east-1, one published version, origin-response
   5. Cache policy           bhc-$id-cp           min 0, default 0, max 86400; no query strings, headers or cookies in the key
   6. CloudFront distribution (PriceClass_100)    origin = the function URL, edge function on origin-response, 500 not cached
 Tests:  T-A in window, T-B out of window, T-D error status, T-E S3 failure fallback, T-C window boundary.
-Teardown: disable the distribution, wait, delete it, then the cache policy, both functions, the role and the bucket.
+Teardown: disable the distribution, wait, delete it, then the cache policy, both functions, both roles, the log groups and the bucket.
 Cost: an estimate of a few cents at most (a few hundred requests; Lambda@Edge, S3 and CloudFront free-tier or cent-level charges).
 Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to disable it).
 The origin function URL is PUBLIC (auth NONE) while the stack exists; it returns only a timestamp and a counter.
@@ -88,34 +97,53 @@ EOF
 }
 
 # ---------------------------------------------------------------------------------------------------- create
-write_json() { printf '%s\n' "$2" > "$1"; }
 
 create_all() {
-  local d="$WORK/pkg" role_arn edge_arn
+  local d="$WORK/pkg" role_arn origin_role_arn edge_arn
   mkdir -p "$d"
   say "[1/7] S3 bucket"
+  # Bucket names are global: if this one already exists it is not ours, so stop before anything is created.
+  if aws_ro s3api head-bucket --bucket "bhc-$RUNID-cfg" >/dev/null 2>&1; then fail "a bucket named bhc-$RUNID-cfg already exists; refusing to use it"; fi
+  case "$(error_code)" in 404|NotFound|NoSuchBucket) ;; *) fail "cannot tell whether bucket bhc-$RUNID-cfg exists (code: $(error_code)); refusing to continue" ;; esac
   state_set BUCKET "bhc-$RUNID-cfg"
   aws_do s3api create-bucket --bucket "$BUCKET" >/dev/null || fail "create-bucket"
+  state_set BUCKET_MADE 1   # from here on an untagged bucket of exactly this name is ours (tagging may not have run yet)
   aws_do s3api put-public-access-block --bucket "$BUCKET" \
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null || fail "public access block"
   aws_do s3api put-bucket-tagging --bucket "$BUCKET" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
   put_config 0 1 "$IN_TTL" "$OUT_TTL" || fail "initial config upload"
 
-  say "[2/7] IAM role"
-  state_set ROLE "bhc-$RUNID-role"
-  write_json "$d/trust.json" '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["lambda.amazonaws.com","edgelambda.amazonaws.com"]},"Action":"sts:AssumeRole"}]}'
-  role_arn="$(aws_do iam create-role --role-name "$ROLE" --assume-role-policy-document "file://$d/trust.json" \
-    --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" --query Role.Arn --output text)" || fail "create-role"
-  write_json "$d/policy.json" "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$BUCKET/$CONFIG_KEY\"},{\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\"],\"Resource\":\"*\"}]}"
-  aws_do iam put-role-policy --role-name "$ROLE" --policy-name bhc-inline --policy-document "file://$d/policy.json" >/dev/null || fail "put-role-policy"
+  say "[2/7] IAM roles (edge role with S3 read, origin role without)"
+  # Logs only for this run's log groups (the edge function logs as /aws/lambda/us-east-1.<name> in the region of the edge location).
+  local lg="arn:aws:logs:*:*:log-group:/aws/lambda/*bhc-$RUNID-*"
+  jq -n '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{Service:["lambda.amazonaws.com","edgelambda.amazonaws.com"]},Action:"sts:AssumeRole"}]}' > "$d/trust-edge.json"
+  jq -n '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{Service:"lambda.amazonaws.com"},Action:"sts:AssumeRole"}]}' > "$d/trust-origin.json"
+  jq -n --arg b "arn:aws:s3:::$BUCKET" --arg o "arn:aws:s3:::$BUCKET/$CONFIG_KEY" --arg l "$lg" --arg l2 "$lg:*" \
+    '{Version:"2012-10-17",Statement:[
+      {Effect:"Allow",Action:"s3:GetObject",Resource:$o},
+      {Effect:"Allow",Action:"s3:ListBucket",Resource:$b},
+      {Effect:"Allow",Action:["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],Resource:[$l,$l2]}]}' > "$d/policy-edge.json" || fail "building the edge policy"
+  jq -n --arg l "$lg" --arg l2 "$lg:*" \
+    '{Version:"2012-10-17",Statement:[{Effect:"Allow",Action:["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],Resource:[$l,$l2]}]}' > "$d/policy-origin.json" || fail "building the origin policy"
+  state_set ROLE "bhc-$RUNID-erole"
+  role_arn="$(aws_do iam create-role --role-name "$ROLE" --assume-role-policy-document "file://$d/trust-edge.json" \
+    --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" --query Role.Arn --output text)" || fail "create-role (edge)"
+  aws_do iam put-role-policy --role-name "$ROLE" --policy-name bhc-inline --policy-document "file://$d/policy-edge.json" >/dev/null || fail "put-role-policy (edge)"
+  state_set ORIGIN_ROLE "bhc-$RUNID-orole"
+  origin_role_arn="$(aws_do iam create-role --role-name "$ORIGIN_ROLE" --assume-role-policy-document "file://$d/trust-origin.json" \
+    --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" --query Role.Arn --output text)" || fail "create-role (origin)"
+  aws_do iam put-role-policy --role-name "$ORIGIN_ROLE" --policy-name bhc-inline --policy-document "file://$d/policy-origin.json" >/dev/null || fail "put-role-policy (origin)"
   nap 10   # IAM is eventually consistent
 
   say "[3/7] origin function and function URL"
   package_origin "$d" || fail "packaging the origin"
   state_set ORIGIN_FN "bhc-$RUNID-origin"
   retry 6 10 aws_do lambda create-function --function-name "$ORIGIN_FN" --runtime nodejs22.x --handler index.handler --timeout 5 \
-    --role "$role_arn" --zip-file "fileb://$d/origin.zip" --tags "RunId=$RUNID,Purpose=bhc-test" >/dev/null || fail "create origin function"
+    --role "$origin_role_arn" --zip-file "fileb://$d/origin.zip" --tags "RunId=$RUNID,Purpose=bhc-test" >/dev/null || fail "create origin function"
   aws_do lambda wait function-active-v2 --function-name "$ORIGIN_FN" || fail "origin function not active"
+  # Best effort: caps what a stranger who finds the public URL can run up. Many accounts cannot reserve (the unreserved pool must stay at 100).
+  aws_do lambda put-function-concurrency --function-name "$ORIGIN_FN" --reserved-concurrent-executions 5 >/dev/null \
+    || say "  note: reserved concurrency was not set (account limit?); continuing without it"
   local url
   url="$(aws_do lambda create-function-url-config --function-name "$ORIGIN_FN" --auth-type NONE --query FunctionUrl --output text)" || fail "create-function-url-config"
   aws_do lambda add-permission --function-name "$ORIGIN_FN" --statement-id url-invoke-url --action lambda:InvokeFunctionUrl \
@@ -135,7 +163,9 @@ create_all() {
   state_set EDGE_VER "${edge_arn##*:}"
 
   say "[5/7] cache policy"
-  write_json "$d/cp.json" "{\"Name\":\"bhc-$RUNID-cp\",\"Comment\":\"bhc test $RUNID\",\"DefaultTTL\":0,\"MinTTL\":0,\"MaxTTL\":86400,\"ParametersInCacheKeyAndForwardedToOrigin\":{\"EnableAcceptEncodingGzip\":false,\"EnableAcceptEncodingBrotli\":false,\"HeadersConfig\":{\"HeaderBehavior\":\"none\"},\"CookiesConfig\":{\"CookieBehavior\":\"none\"},\"QueryStringsConfig\":{\"QueryStringBehavior\":\"none\"}}}"
+  jq -n --arg name "bhc-$RUNID-cp" --arg comment "bhc test $RUNID" '{Name:$name,Comment:$comment,DefaultTTL:0,MinTTL:0,MaxTTL:86400,
+    ParametersInCacheKeyAndForwardedToOrigin:{EnableAcceptEncodingGzip:false,EnableAcceptEncodingBrotli:false,
+      HeadersConfig:{HeaderBehavior:"none"},CookiesConfig:{CookieBehavior:"none"},QueryStringsConfig:{QueryStringBehavior:"none"}}}' > "$d/cp.json" || fail "building the cache policy"
   local cpid
   state_set TRY_CP 1
   cpid="$(aws_do cloudfront create-cache-policy --cache-policy-config "file://$d/cp.json" --query CachePolicy.Id --output text)" || fail "create-cache-policy"
@@ -158,9 +188,12 @@ create_all() {
   local out
   state_set TRY_DIST 1
   out="$(aws_do cloudfront create-distribution-with-tags --distribution-config-with-tags "file://$d/dist.json" --output json)" || fail "create-distribution-with-tags"
-  state_set DIST_ID "$(printf '%s' "$out" | jq -r '.Distribution.Id')"
-  CF_DOMAIN="$(printf '%s' "$out" | jq -r '.Distribution.DomainName')"
-  [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] || fail "no distribution id returned"
+  local did
+  did="$(printf '%s' "$out" | jq -r '.Distribution.Id // empty')"
+  [ -n "$did" ] && [ "$did" != null ] || fail "no distribution id returned"
+  state_set DIST_ID "$did"
+  CF_DOMAIN="$(printf '%s' "$out" | jq -r '.Distribution.DomainName // empty')"
+  [ -n "$CF_DOMAIN" ] || fail "no distribution domain returned"
 
   say "[7/7] waiting until CloudFront has deployed the distribution (usually 5-15 minutes)"
   aws_do cloudfront wait distribution-deployed --id "$DIST_ID" || fail "the distribution did not reach Deployed"
@@ -253,11 +286,16 @@ t_b() {
   say "T-B: window in the past, first request Miss, repeats Hit, origin counter flat"
   set_window $((m - 60)) $((m - 30))
   series /b 5 "$HIT_GAP_SECS"
-  local n=${#S_XC[@]} i ok=1
+  local n=${#S_XC[@]} i ok=1 stray=0 other=0
   if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-B INCONCLUSIVE "no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"; return; fi
-  [ "$(lc "${S_XC[0]}")" = miss ] || ok=0
-  for ((i = 1; i < n; i++)); do case "$(lc "${S_XC[$i]}")" in hit|refreshhit) ;; *) ok=0 ;; esac; done
-  if [ "$ok" = 0 ]; then add_result T-B FAIL "expected Miss then Hit: $(meas)"
+  [ "$(lc "${S_XC[0]}")" = miss ] || { ok=0; other=1; }
+  for ((i = 1; i < n; i++)); do
+    case "$(lc "${S_XC[$i]}")" in hit|refreshhit) ;; miss) ok=0; stray=$((stray + 1)) ;; *) ok=0; other=1 ;; esac
+  done
+  if [ "$ok" = 0 ] && [ "$stray" = 1 ] && [ "$other" = 0 ] && [ "$(distinct "${S_NONCE[@]}")" = 1 ] && [ "$(distinct "${S_CNT[@]}")" = 1 ]; then
+    # One Miss between Hits while the origin was NOT reached again: a POP with several cache servers answered from another layer.
+    add_result T-B INCONCLUSIVE "one stray Miss among Hits, but the origin was not reached again (same nonce, flat counter): likely another cache server in the same POP, not a failure of the function: $(meas)"
+  elif [ "$ok" = 0 ]; then add_result T-B FAIL "expected Miss then Hit: $(meas)"
   elif [ "$(distinct "${S_NONCE[@]}")" != 1 ] || [ "$(distinct "${S_CNT[@]}")" != 1 ]; then add_result T-B FAIL "origin was hit again (nonce or counter changed): $(meas)"
   elif ! all_eq "$EXPECT_OUT" "${S_CC[@]}"; then add_result T-B FAIL "viewer Cache-Control is not what the function sets: $(meas)"
   elif ! age_grows "${S_AGE[1]}" "${S_AGE[$((n - 1))]}"; then
@@ -275,17 +313,32 @@ t_d() {
   else add_result T-D PASS "status=500 on all, not cached for outTtl; $(meas)"; fi
 }
 
+# e_phase PATH: 3 requests while the window cannot be used -> E_RES, E_MEAS
+e_phase() {
+  series "$1" 3 1
+  E_MEAS="$(meas)"
+  if [ "$S_BAD" = 1 ] || ! all_status 200; then E_RES=INCONCLUSIVE; E_MEAS="no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"
+  elif has_hit "${S_XC[@]}"; then E_RES=FAIL; E_MEAS="served from cache although the config could not be used: $E_MEAS"
+  elif ! all_eq "$EXPECT_IN" "${S_CC[@]}"; then E_RES=FAIL; E_MEAS="fallback Cache-Control is not s-maxage=0: $E_MEAS"
+  elif [ "$(distinct "${S_NONCE[@]}")" != 3 ]; then E_RES=FAIL; E_MEAS="origin nonce repeated: $E_MEAS"
+  else E_RES=PASS; fi
+}
+
 t_e() {
-  say "T-E: window object missing in S3 -> fallback s-maxage=0"
+  local r1 m1 r2 m2 f
+  say "T-E: window cannot be used -> fallback s-maxage=0 (E1 object missing, E2 object is not JSON)"
   aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null || fail "cannot delete the config object"
-  say "  config object deleted; waiting ${SETTLE_SECS}s for the edge config cache"
+  say "  E1: config object deleted; waiting ${SETTLE_SECS}s for the edge config cache"
   nap "$SETTLE_SECS"
-  series /e 3 1
-  if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-E INCONCLUSIVE "no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"
-  elif has_hit "${S_XC[@]}"; then add_result T-E FAIL "served from cache although the config could not be read: $(meas)"
-  elif ! all_eq "$EXPECT_IN" "${S_CC[@]}"; then add_result T-E FAIL "fallback Cache-Control is not s-maxage=0: $(meas)"
-  elif [ "$(distinct "${S_NONCE[@]}")" != 3 ]; then add_result T-E FAIL "origin nonce repeated: $(meas)"
-  else add_result T-E PASS "fallback s-maxage=0 on all; $(meas)"; fi
+  e_phase /e; r1="$E_RES"; m1="$E_MEAS"
+  f="$WORK/notjson.txt"; printf 'this is not json\n' > "$f"
+  aws_do s3api put-object --bucket "$BUCKET" --key "$CONFIG_KEY" --body "$f" --content-type application/json >/dev/null || fail "cannot upload the bad config"
+  say "  E2: config object replaced by text that is not JSON; waiting ${SETTLE_SECS}s"
+  nap "$SETTLE_SECS"
+  e_phase /e2; r2="$E_RES"; m2="$E_MEAS"
+  if [ "$r1" = PASS ] && [ "$r2" = PASS ]; then add_result T-E PASS "fallback s-maxage=0 in both cases. E1 missing key: $m1. E2 bad JSON: $m2"
+  elif [ "$r1" = FAIL ] || [ "$r2" = FAIL ]; then add_result T-E FAIL "E1 missing key: $r1 $m1. E2 bad JSON: $r2 $m2"
+  else add_result T-E INCONCLUSIVE "E1 missing key: $r1 $m1. E2 bad JSON: $r2 $m2"; fi
 }
 
 t_c() {
@@ -389,6 +442,7 @@ confirm() { # phrase
 
 main_run() {
   RUNID="${RT_RUNID:-$(date -u +%y%m%d%H%M)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')}"
+  printf '%s' "$RUNID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "run id '$RUNID' is not of the form 2610101200-ab12"
   print_plan "$RUNID"
   if [ "$MIDNIGHT_BAD" = 1 ]; then
     say ""
@@ -403,6 +457,8 @@ main_run() {
   [ "$MIDNIGHT_BAD" = 0 ] || die "outside 01:30-22:00 UTC, see the note above"
   say ""
   say "This creates real AWS resources in your account. It costs cents and takes about 15-25 minutes."
+  say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
+  say "         (set EXPECT_ACCOUNT_LAST4=<4 digits> to make the script refuse any other account)"
   confirm "$PHRASE"
   STATE_FILE="$RESULTS_DIR/state-$RUNID.env"
   : > "$STATE_FILE"
@@ -414,16 +470,43 @@ main_run() {
   exit "$RUN_RC"
 }
 
+# discover_by_tag: no state file (lost, or another directory). Read-only listing of everything tagged RunId=<id>; the deletes
+# that follow are the same tag-checked ones as always. Cache policies cannot be tagged, so they are looked up by name.
+discover_by_tag() {
+  local arns a n
+  arns="$(aws_ro resourcegroupstaggingapi get-resources --tag-filters "Key=RunId,Values=$RUNID" --query 'ResourceTagMappingList[].ResourceARN' --output text)" \
+    || die "cannot list resources by tag (needs tag:GetResources)"
+  for a in $arns; do
+    n="${a##*[:/]}"
+    case "$a" in
+      arn:aws:s3:::*) [ "$n" = "bhc-$RUNID-cfg" ] && BUCKET="$n" ;;
+      arn:aws:iam::*:role/*) case "$n" in "bhc-$RUNID-erole") ROLE="$n" ;; "bhc-$RUNID-orole") ORIGIN_ROLE="$n" ;; esac ;;
+      arn:aws:lambda:*:function:*) case "$n" in "bhc-$RUNID-edge") EDGE_FN="$n" ;; "bhc-$RUNID-origin") ORIGIN_FN="$n" ;; esac ;;
+      arn:aws:cloudfront::*:distribution/*) DIST_ID="$n" ;;
+    esac
+  done
+  TRY_CP=1; TRY_DIST=1
+  if [ -z "$BUCKET$ROLE$ORIGIN_ROLE$EDGE_FN$ORIGIN_FN$DIST_ID" ]; then die "nothing tagged RunId=$RUNID was found (already deleted?)"; fi
+}
+
 main_cleanup() {
   printf '%s' "$CLEANUP_ID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "--cleanup needs a run id like 2610101200-ab12"
   STATE_FILE="$RESULTS_DIR/state-$CLEANUP_ID.env"
-  [ -f "$STATE_FILE" ] || die "no state file $STATE_FILE (it is written by the run that created the resources)"
-  state_load "$STATE_FILE"
-  [ "$RUNID" = "$CLEANUP_ID" ] || die "state file does not belong to run $CLEANUP_ID"
+  if [ -f "$STATE_FILE" ]; then
+    state_load "$STATE_FILE"
+    [ "$RUNID" = "$CLEANUP_ID" ] || die "state file does not belong to run $CLEANUP_ID"
+  else
+    say "no state file $STATE_FILE (it is written next to where the run started: RESULTS_DIR, default the current directory)."
+    say "falling back to a read-only listing by the RunId tag"
+    RUNID="$CLEANUP_ID"
+    discover_by_tag
+  fi
   say "cleanup of run $RUNID: will delete only resources tagged RunId=$RUNID:"
-  say "  distribution ${DIST_ID:-none}, cache policy ${CP_ID:-none}, functions ${EDGE_FN:-none} ${ORIGIN_FN:-none}, role ${ROLE:-none}, bucket ${BUCKET:-none}"
+  say "  distribution ${DIST_ID:-none}, cache policy ${CP_ID:-by name}, functions ${EDGE_FN:-none} ${ORIGIN_FN:-none}, roles ${ROLE:-none} ${ORIGIN_ROLE:-none}, bucket ${BUCKET:-none}"
   if [ "$DRY_RUN" = 1 ]; then say "dry run: nothing was deleted."; return 0; fi
+  say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
   confirm "$CLEANUP_PHRASE"
+  [ -f "$STATE_FILE" ] || : > "$STATE_FILE"
   CREATE_STARTED=1
 }
 

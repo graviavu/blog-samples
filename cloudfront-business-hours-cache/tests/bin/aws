@@ -4,7 +4,7 @@
 # shellcheck source-path=SCRIPTDIR
 . "$(dirname "$0")/stub-lib.sh"
 if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
-[ "$1" = "--region" ] && shift 2
+REG=us-east-1; if [ "$1" = "--region" ]; then REG="$2"; shift 2; fi
 svc="$1"; cmd="$2"; shift 2
 echo "$svc $cmd $*" >> "$S/calls.log"
 mkdir -p "$S/res"
@@ -18,7 +18,8 @@ if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
   n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
   want="${STUB_FAIL#*:}"; [ "$want" = "$STUB_FAIL" ] && want=1
   if [ "$n" = "$want" ]; then
-    echo "An error occurred (AccessDenied) when calling $cmd: arn:aws:iam::$acct12:role/x not allowed, account $acct12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(fake_domain), $(fake_origin), x-amz-security-token: $(printf '%s' abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ)" >&2
+    # STUB_FAIL_CODE / STUB_FAIL_TEXT: another error code and wording (default AccessDenied)
+    echo "An error occurred (${STUB_FAIL_CODE:-AccessDenied}) when calling $cmd: ${STUB_FAIL_TEXT:-denied} arn:aws:iam::$acct12:role/x not allowed, account $acct12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(fake_domain), $(fake_origin), x-amz-security-token: $(printf '%s' abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ)" >&2
     exit 254
   fi
 fi
@@ -47,13 +48,18 @@ case "$svc $cmd" in
   "s3api create-bucket") reg "" s3 "$(arg --bucket "$@")"; okjson ;;
   "s3api put-public-access-block") okjson ;;
   "s3api put-bucket-tagging") b="$(arg --bucket "$@")"; reg "$(tag_from "$@")" s3 "$b"; okjson ;;
-  "s3api get-bucket-tagging") t="$(tagof s3 "$(arg --bucket "$@")")" || notfound NoSuchBucket; echo "${t:-None}" ;;
+  "s3api head-bucket")
+    if [ -e "$S/res/s3__$(arg --bucket "$@")" ]; then okjson; else echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254; fi ;;
+  "s3api get-bucket-tagging")
+    t="$(tagof s3 "$(arg --bucket "$@")")" || notfound NoSuchBucket
+    [ -n "$t" ] || { echo "An error occurred (NoSuchTagSet) when calling the GetBucketTagging operation: The TagSet does not exist" >&2; exit 254; }
+    echo "$t" ;;
   "s3api put-object") cp "$(arg --body "$@")" "$S/s3obj"; cat "$S/s3obj" >> "$S/puts.log"; okjson ;;
   "s3api delete-object") rm -f "$S/s3obj"; echo "DELETE s3object $(arg --key "$@")" >> "$S/deleted.log"; okjson ;;
   "s3api delete-bucket") b="$(arg --bucket "$@")"; tagof s3 "$b" >/dev/null || notfound NoSuchBucket; del s3 "$b"; okjson ;;
   # ---- IAM
-  "iam create-role") n="$(arg --role-name "$@")"; reg "$(tag_from "$@")" iam "$n"; echo "arn:aws:iam::$acct12:role/$n" ;;
-  "iam put-role-policy") okjson ;;
+  "iam create-role") n="$(arg --role-name "$@")"; jq -e . "$(fileof --assume-role-policy-document "$@")" >/dev/null 2>&1 || { echo "stub: invalid trust JSON" >&2; exit 254; }; cp "$(fileof --assume-role-policy-document "$@")" "$S/trust-$n.json"; reg "$(tag_from "$@")" iam "$n"; echo "arn:aws:iam::$acct12:role/$n" ;;
+  "iam put-role-policy") jq -e . "$(fileof --policy-document "$@")" >/dev/null 2>&1 || { echo "stub: invalid policy JSON" >&2; exit 254; }; cp "$(fileof --policy-document "$@")" "$S/policy-$(arg --role-name "$@").json"; okjson ;;
   "iam list-role-tags") t="$(tagof iam "$(arg --role-name "$@")")" || notfound NoSuchEntity; echo "${t:-None}" ;;
   "iam delete-role-policy") okjson ;;
   "iam delete-role") n="$(arg --role-name "$@")"; tagof iam "$n" >/dev/null || notfound NoSuchEntity; del iam "$n"; okjson ;;
@@ -62,6 +68,21 @@ case "$svc $cmd" in
     n="$(arg --function-name "$@")"; reg "$(tag_from "$@")" lambda "$n"
     echo "arn:aws:lambda:us-east-1:$acct12:function:$n" ;;
   "lambda wait") ;;
+  "lambda put-function-concurrency") okjson ;;
+  "ec2 describe-regions") echo "us-east-1	eu-west-1" ;;
+  "logs describe-log-groups")
+    for f in "$S/logs/$REG"/*; do [ -e "$f" ] || continue; g="$(basename "$f" | tr '%' '/')"; case "$g" in "$(arg --log-group-name-prefix "$@")"*) printf '%s\t' "$g" ;; esac; done; echo ;;
+  "logs delete-log-group") g="$(arg --log-group-name "$@")"; rm -f "$S/logs/$REG/$(printf '%s' "$g" | tr '/' '%')"; echo "DELETE loggroup $REG $g" >> "$S/deleted.log"; okjson ;;
+  "resourcegroupstaggingapi get-resources")
+    want="$(arg --tag-filters "$@" | sed 's/.*Values=//')"
+    for f in "$S"/res/*__*; do
+      [ -e "$f" ] || continue; b="$(basename "$f")"; k="${b%%__*}"; n="${b#*__}"
+      [ "$(cat "$f")" = "$want" ] || continue
+      case "$k" in
+        s3) printf 'arn:aws:s3:::%s\t' "$n" ;; iam) printf 'arn:aws:iam::%s:role/%s\t' "$acct12" "$n" ;;
+        lambda) printf 'arn:aws:lambda:us-east-1:%s:function:%s\t' "$acct12" "$n" ;; cf) printf 'arn:aws:cloudfront::%s:distribution/%s\t' "$acct12" "$n" ;;
+      esac
+    done; echo ;;
   "lambda create-function-url-config") echo "https://$(fake_origin)/" ;;
   "lambda add-permission") okjson ;;
   "lambda publish-version") echo "arn:aws:lambda:us-east-1:$acct12:function:$(arg --function-name "$@"):1" ;;
@@ -87,7 +108,8 @@ case "$svc $cmd" in
   "cloudfront create-distribution-with-tags")
     f="$(fileof --distribution-config-with-tags "$@")"
     reg "$(jq -r '.Tags.Items[] | select(.Key=="RunId") | .Value' "$f")" cf "$(fake_dist_id)"; put cf_enabled true
-    jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" '{Distribution:{Id:$id,DomainName:$d}}' ;;
+    if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '{"Distribution":{"Id":null,"DomainName":null}}'; else
+    jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" '{Distribution:{Id:$id,DomainName:$d}}'; fi ;;
   "cloudfront list-distributions") if [ -e "$S/res/cf__$(fake_dist_id)" ]; then fake_dist_id; echo; else echo None; fi ;;
   "cloudfront list-cache-policies") if [ -e "$S/res/cp__CPFAKE1" ]; then echo CPFAKE1; else echo None; fi ;;
   "cloudfront get-distribution")
