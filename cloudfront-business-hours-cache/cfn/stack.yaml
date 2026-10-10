@@ -8,7 +8,7 @@ Description: >-
   origin behind CloudFront origin access control with AuthType AWS_IAM.
 
 # Deploy by hand (without run-test.sh), see README "Use the template by itself":
-#   1. zip edge/index.mjs (with __CONFIG_BUCKET__ and __CONFIG_KEY__ replaced) and put it in an S3 bucket in us-east-1
+#   1. zip edge/index.py (with __CONFIG_BUCKET__ and __CONFIG_KEY__ replaced, index.py at the root of the zip) and put it in an S3 bucket in us-east-1
 #   2. aws cloudformation create-stack --region us-east-1 --stack-name bhc-<RunId> --template-body file://cfn/stack.yaml
 #        --capabilities CAPABILITY_NAMED_IAM --parameters ParameterKey=RunId,ParameterValue=<RunId> ...
 #   3. upload your window JSON to s3://<ConfigBucketName>/<ConfigKey>
@@ -40,11 +40,11 @@ Parameters:
     AllowedPattern: '[A-Za-z0-9._/-]{1,256}'
   EdgeRuntime:
     Type: String
-    Default: nodejs22.x
-    AllowedPattern: 'nodejs[0-9]+\.x'
+    Default: python3.12
+    AllowedPattern: 'python3\.[0-9]+'
     Description: >-
-      Runtime of the Lambda@Edge function. Lambda@Edge supports the latest Node.js and Python runtimes but the list is not
-      fixed; if nodejs22.x is refused for Lambda@Edge, use the newest one it accepts.
+      Python runtime of the Lambda@Edge function (edge/index.py, uses boto3 which the Python runtime includes). Lambda@Edge
+      supports the current Python runtimes; check the exact version against the Lambda runtimes page and use the newest it accepts.
   OriginRuntime:
     Type: String
     Default: nodejs22.x
@@ -228,14 +228,14 @@ Resources:
       Principal: '*'
       InvokedViaFunctionUrl: true
 
-  # ---- The Lambda@Edge function (edge/index.mjs, zipped with the bucket and key baked in) and the published version
-  #      that CloudFront needs. The code is too big for inline ZipFile (4096 characters) and needs the S3 client, so it is a zip in S3.
+  # ---- The Lambda@Edge function (edge/index.py, zipped with the bucket and key baked in) and the published version
+  #      that CloudFront needs. The code is too big for inline ZipFile (4096 characters), so it is a zip in S3.
   EdgeFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'bhc-${RunId}-edge'
       Runtime: !Ref EdgeRuntime
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt EdgeRole.Arn
       Timeout: 5
       MemorySize: 128

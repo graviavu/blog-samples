@@ -303,14 +303,14 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------------------------------- packaging
-# package_edge DIR: copy edge/index.mjs with the config bucket and key baked in (Lambda@Edge has no environment variables).
+# package_edge DIR: copy edge/index.py with the config bucket and key baked in (Lambda@Edge has no environment variables).
 CODE_KEY="edge.zip"
 package_edge() {
   local d="$1"
   mkdir -p "$d/edge"
-  sed -e "s|__CONFIG_BUCKET__|$BUCKET|" -e "s|__CONFIG_KEY__|$CONFIG_KEY|" "$SCRIPT_DIR/edge/index.mjs" > "$d/edge/index.mjs"
-  if grep -q '__CONFIG_' "$d/edge/index.mjs"; then return 1; fi
-  (cd "$d/edge" && zip -q -j "$d/$CODE_KEY" index.mjs)
+  sed -e "s|__CONFIG_BUCKET__|$BUCKET|" -e "s|__CONFIG_KEY__|$CONFIG_KEY|" "$SCRIPT_DIR/edge/index.py" > "$d/edge/index.py"
+  if grep -q "'__CONFIG_" "$d/edge/index.py"; then return 1; fi   # the two assignments must have been replaced
+  (cd "$d/edge" && zip -q -j "$d/$CODE_KEY" index.py)
 }
 
 # ---------------------------------------------------------------------------------------------------- results

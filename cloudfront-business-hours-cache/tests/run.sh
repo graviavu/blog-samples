@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh - tests for cloudfront-business-hours-cache. No AWS, no network: run-test.sh runs against a fake aws, curl, date,
-# sleep and zip (tests/bin). The edge function logic is tested with node (tests/edge.test.mjs) when node is installed.
+# sleep and zip (tests/bin). The edge function logic is tested with python unittest (tests/test_edge.py).
 # Usage: tests/run.sh      Exit 0 only if every check passes.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -136,9 +136,9 @@ check "reserved concurrency failure does not abort the run" bash -c "[ '$RC' = 0
 
 echo "packaging and the template"
 reset_env; go pkg "$PHRASE\n"
-check "edge code has the config bucket baked in" has "$STUB_DIR/zipped/edge-index.mjs" "bhc-$RUNID_A-cfg"
-check "edge code has the key baked in" has "$STUB_DIR/zipped/edge-index.mjs" "window.json"
-check "edge code has no placeholder left" hasnot "$STUB_DIR/zipped/edge-index.mjs" "__CONFIG_"
+check "edge code has the config bucket baked in" has "$STUB_DIR/zipped/edge-index.py" "bhc-$RUNID_A-cfg"
+check "edge code has the key baked in" has "$STUB_DIR/zipped/edge-index.py" "window.json"
+check "edge code has no placeholder left" hasnot "$STUB_DIR/zipped/edge-index.py" "__CONFIG_"
 TPL="$root/cfn/stack.yaml"
 inline="$TMP/inline-origin.js"
 awk '/ZipFile: \|/{f=1;next} f&&/^$/{exit} f{sub(/^          /,""); print}' "$TPL" > "$inline"
@@ -147,6 +147,7 @@ check "the inline origin code fits CloudFormation's 4096 character limit" bash -
 check "the origin sends no Cache-Control" hasnot "$root/origin/index.js" -i "cache-control"
 check "the template creates the resources the README lists" bash -c "for t in AWS::S3::Bucket AWS::IAM::Role AWS::Lambda::Function AWS::Lambda::Url AWS::Lambda::Version AWS::Lambda::Permission AWS::CloudFront::CachePolicy AWS::CloudFront::Distribution; do grep -q \"Type: \$t\" '$TPL' || exit 1; done"
 check "config bucket: public access block, encryption, and no bucket policy but the TLS-only deny" bash -c "grep -q BlockPublicAcls '$TPL' && grep -q SSEAlgorithm '$TPL' && [ \$(grep -c 'Type: AWS::S3::BucketPolicy' '$TPL') = 1 ] && grep -q 'aws:SecureTransport' '$TPL'"
+check "the edge function is Python: handler index.lambda_handler, runtime parameter default python3.12" bash -c "grep -q 'Handler: index.lambda_handler' '$TPL' && grep -q 'Default: python3.12' '$TPL'"
 check "edge role trusts edgelambda, origin role does not" bash -c "[ \$(grep -c edgelambda.amazonaws.com '$TPL') = 1 ]"
 check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL' && grep -q 'log-group:/aws/lambda/\*bhc-\${RunId}-\*' '$TPL'"
 check "cache policy: min 0, default 0, max 86400, nothing in the key" bash -c "grep -q 'MinTTL: 0' '$TPL' && grep -q 'DefaultTTL: 0' '$TPL' && grep -q 'MaxTTL: 86400' '$TPL' && grep -q 'HeaderBehavior: none' '$TPL' && grep -q 'QueryStringBehavior: none' '$TPL'"
@@ -389,17 +390,24 @@ echo "arguments"
 newdir args; "$RT" --nope > "$OUT" 2>&1; RC=$?
 check "unknown argument rc 2" is "$RC" 2
 
-echo "edge function logic (node)"
-if command -v node >/dev/null 2>&1; then
-  node_out="$TMP/node.txt"
-  node --test "$here"/*.test.mjs > "$node_out" 2>&1; NRC=$?
-  np="$(sed -n 's/^# pass \([0-9]*\)/\1/p;s/^ℹ pass \([0-9]*\)/\1/p' "$node_out" | head -n 1)"
-  nf="$(sed -n 's/^# fail \([0-9]*\)/\1/p;s/^ℹ fail \([0-9]*\)/\1/p' "$node_out" | head -n 1)"
-  check "node unit tests pass (pass=${np:-?} fail=${nf:-?})" is "$NRC" 0
-  NODE_PASS="${np:-0}"
+echo "edge function logic (python unittest)"
+if command -v python3 >/dev/null 2>&1; then
+  py_out="$TMP/py.txt"
+  (cd "$root" && python3 -I -m unittest discover -s tests -p 'test_*.py') > "$py_out" 2>&1; PRC=$?
+  pn="$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$py_out" | head -n 1)"
+  check "python unit tests pass (ran ${pn:-?})" is "$PRC" 0
+  PY_PASS="${pn:-0}"
+  check "the zip built by the real zip has index.py at its root, with the bucket and key baked in" bash -c "
+    d=\$(mktemp -d '$TMP/zip.XXXXXX'); PATH=\"\${PATH#'$here/bin:'}\"
+    SCRIPT_DIR='$root' BUCKET=bhc-x-cfg bash -c \". '$root/lib.sh'; BUCKET=bhc-x-cfg; package_edge \$d\" &&
+    python3 -I -c \"
+import zipfile, sys, importlib.util
+z = zipfile.ZipFile('\$d/edge.zip'); assert z.namelist() == ['index.py'], z.namelist()
+z.extractall('\$d/x'); spec = importlib.util.spec_from_file_location('m', '\$d/x/index.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.CONFIG_BUCKET == 'bhc-x-cfg' and m.CONFIG_KEY == 'window.json' and callable(m.lambda_handler)\""
 else
-  NODE_PASS=0
-  echo "  SKIP node not found: the edge function logic (window, boundaries, error skip, S3 and JSON fallback) was NOT tested"
+  PY_PASS=0
+  echo "  SKIP python3 not found: the edge function logic (window, cap, path rules, URI variants, error skip, S3 and JSON fallback) was NOT tested"
 fi
 
 echo "shellcheck"
@@ -410,5 +418,5 @@ else
 fi
 
 echo
-echo "shell checks: $PASS passed, $FAIL failed; node unit tests passed: $NODE_PASS"
+echo "shell checks: $PASS passed, $FAIL failed; python unit tests run: $PY_PASS"
 [ "$FAIL" = 0 ]
