@@ -1,7 +1,7 @@
 // Unit tests for edge/index.mjs. No AWS, no SDK: the S3 read is replaced by a function. Run: node --test tests/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeHandler, parseConfig, cacheControlFor, FALLBACK_CACHE_CONTROL } from '../edge/index.mjs';
+import { makeHandler, parseConfig, cacheControlFor, originForbidsShared, FALLBACK_CACHE_CONTROL } from '../edge/index.mjs';
 
 const CFG = { startMin: 780, endMin: 1080, inTtl: 0, outTtl: 14400 }; // 13:00 to 18:00 UTC
 const CFG_TEXT = JSON.stringify(CFG);
@@ -57,9 +57,41 @@ test('error statuses are not rewritten', async () => {
   assert.equal(clock.loads, 0, 'errors do not even read the config');
 });
 
-test('status below 400 (200, 301, 304) is rewritten', async () => {
+test('only 200, 203, 204 and 206 are rewritten', async () => {
   const { handler } = build({ time: at(12, 0) });
-  for (const status of ['200', '301', '304']) assert.equal(cc(await handler(ev(status))), OUT, status);
+  for (const status of ['200', '203', '204', '206', 200]) assert.equal(cc(await handler(ev(status))), OUT, String(status));
+});
+
+test('redirects, 304 and other statuses are left untouched', async () => {
+  const { handler, clock } = build({ time: at(12, 0) });
+  for (const status of ['201', '205', '301', '302', '304']) {
+    const r = await handler(ev(status, {}));
+    assert.equal(r.headers['cache-control'], undefined, status);
+  }
+  assert.equal(clock.loads, 0);
+});
+
+test('origin private, no-store or no-cache: response left untouched', async () => {
+  for (const v of ['private', 'no-store', 'no-cache', 'public, no-cache', 'max-age=0, No-Store', 'private, max-age=60', 'no-cache="set-cookie"']) {
+    const { handler } = build({ time: at(12, 0) });
+    const r = await handler(ev('200', { 'cache-control': [{ key: 'Cache-Control', value: v }] }));
+    assert.equal(cc(r), v, v);
+  }
+});
+
+test('origin set-cookie: response left untouched, no Cache-Control added', async () => {
+  const { handler } = build({ time: at(12, 0) });
+  const r = await handler(ev('200', { 'set-cookie': [{ key: 'Set-Cookie', value: 'a=b' }] }));
+  assert.equal(r.headers['cache-control'], undefined);
+});
+
+test('harmless origin Cache-Control (public, max-age) is replaced; look-alike words do not count', async () => {
+  for (const v of ['public, max-age=60', 'max-age=0', 'x-private-ish=1', 'privately=1']) {
+    const { handler } = build({ time: at(12, 0) });
+    const r = await handler(ev('200', { 'cache-control': [{ key: 'Cache-Control', value: v }] }));
+    assert.equal(cc(r), OUT, v);
+  }
+  assert.equal(originForbidsShared(undefined), false);
 });
 
 test('S3 read failure: fallback s-maxage=0, never a long TTL, nothing leaks into the log', async () => {
