@@ -5,7 +5,7 @@
 umask 077   # state and results files are readable by the owner only
 
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-REGION="us-east-1"                        # Lambda@Edge functions must live here
+REGION="us-east-1"                        # Lambda@Edge functions (and so the whole stack) must live here
 PHRASE="create cloudfront test stack"
 CLEANUP_PHRASE="delete cloudfront test stack"
 SETTLE_SECS="${SETTLE_SECS:-40}"          # wait after a config change: the edge function keeps the config in memory up to 30 s
@@ -21,8 +21,11 @@ EXPECT_OUT="public, max-age=0, s-maxage=14400"
 RESULTS_DIR="${RESULTS_DIR:-.}"
 export AWS_PAGER=""
 
-RUNID="" BUCKET="" ROLE="" ORIGIN_ROLE="" ORIGIN_FN="" EDGE_FN="" EDGE_VER="" CP_ID="" DIST_ID="" CF_DOMAIN="" ORIGIN_HOST=""
-STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 DIST_GONE=0 TRY_DIST=0 TRY_CP=0 BUCKET_MADE=0 LOGS_LEFT=""
+# Names are derived from the run id (set_names). BUCKET = the config bucket (created by the stack), ART_BUCKET = the small bucket that
+# holds the edge code zip (created by this script, because the stack needs the code to exist).
+RUNID="" STACK="" BUCKET="" ART_BUCKET="" EDGE_ROLE="" ORIGIN_FN="" EDGE_FN="" DIST_ID="" CF_DOMAIN="" ORIGIN_HOST=""
+STATE_FILE="" WORK="" DRY_RUN=0 CREATE_STARTED=0 TEARDOWN_DONE=0 TD_FAIL=0 TD_PENDING=0 REPORT_WRITTEN=0 TRY_STACK=0 ART_MADE=0 STACK_GONE=0 LOGS_LEFT=""
+MODE="${MODE:-run}"
 RES_NAME=() RES_RESULT=() RES_MEAS=()
 NOTES=()
 
@@ -30,15 +33,13 @@ NOTES=()
 # Everything that reaches the screen or a results file goes through redact(). Best effort: read the file before you share it.
 redact() {
   local extra=() lit name
-  for name in BUCKET ROLE ORIGIN_ROLE ORIGIN_FN EDGE_FN CP_ID DIST_ID CF_DOMAIN ORIGIN_HOST; do
+  for name in BUCKET ART_BUCKET ORIGIN_FN EDGE_FN DIST_ID CF_DOMAIN ORIGIN_HOST; do
     eval "lit=\${$name:-}"
     [ -n "$lit" ] || continue
     lit="$(printf '%s' "$lit" | sed -e 's/[][\.*^$/|+?(){}]/\\&/g')"
     case "$name" in
-      BUCKET) extra+=(-e "s|$lit|<bucket>|g") ;;
-      ROLE|ORIGIN_ROLE) extra+=(-e "s|$lit|<role>|g") ;;
+      BUCKET|ART_BUCKET) extra+=(-e "s|$lit|<bucket>|g") ;;
       ORIGIN_FN|EDGE_FN) extra+=(-e "s|$lit|<function>|g") ;;
-      CP_ID) extra+=(-e "s|$lit|<cache-policy-id>|g") ;;
       DIST_ID) extra+=(-e "s|$lit|<distribution-id>|g") ;;
       *) extra+=(-e "s|$lit|<host>|g") ;;
     esac
@@ -54,7 +55,8 @@ redact() {
     -e 's#[A-Za-z0-9+/=_-]{40,}#<redacted-token>#g' \
     ${extra[@]+"${extra[@]}"}
 }
-say() { printf '%s\n' "$*" | redact; }
+# say uses a here-string, not a pipe: after Ctrl-C, bash kills pipelines started in the EXIT trap, and the teardown messages vanish.
+say() { redact <<< "$*"; }
 die() { say "ERROR: $*" >&2; exit 2; }
 note() { NOTES+=("$*"); }
 
@@ -74,11 +76,14 @@ aws_do() {
 }
 # not_found KIND: did the last aws call fail with the error CODE that means "this resource does not exist"? Codes only, never free
 # text (an AccessDenied message that happens to say "does not exist" is not a not-found). Reads the file, so it works across subshells.
+# The one exception is a CloudFormation stack: it has no not-found code (ValidationError), so the exact message for THIS stack's
+# name is matched.
 not_found() {
   local code
   case "$1" in
     s3) code=NoSuchBucket ;; iam) code=NoSuchEntity ;; lambda) code=ResourceNotFoundException ;;
-    cf) code=NoSuchDistribution ;; cp) code=NoSuchCachePolicy ;; *) return 1 ;;
+    stack) grep -Fq "(ValidationError)" "$WORK/aws.err" 2>/dev/null && grep -Fq "Stack with id $STACK does not exist" "$WORK/aws.err" 2>/dev/null; return ;;
+    *) return 1 ;;
   esac
   grep -Eq "\\($code\\)" "$WORK/aws.err" 2>/dev/null
 }
@@ -106,7 +111,7 @@ state_set() { # KEY VALUE (also sets the variable)
 state_load() { # file: only well-formed lines are read, nothing is sourced
   local k v
   while IFS='=' read -r k v; do
-    case "$k" in RUNID|BUCKET|ROLE|ORIGIN_FN|EDGE_FN|EDGE_VER|CP_ID|DIST_ID|CF_DOMAIN|ORIGIN_HOST|DIST_GONE|TRY_DIST|TRY_CP|BUCKET_MADE|ORIGIN_ROLE) ;; *) continue ;; esac
+    case "$k" in RUNID|TRY_STACK|ART_MADE) ;; *) continue ;; esac   # everything else is derived from the run id (set_names)
     printf '%s' "$v" | grep -Eq '^[A-Za-z0-9._:/-]*$' || continue
     eval "$k=\$v"
   done < "$1"
@@ -128,29 +133,28 @@ wait_until_epoch() { # epoch: sleep in steps of at most 30 s
 }
 
 # ---------------------------------------------------------------------------------------------------- ownership check
-# tag_of KIND ID -> prints the RunId tag (cache policies cannot be tagged: their name carries the run id, printed as RunId
-# when it matches). Returns 0 ok, 44 resource not found, 1 other error. Nothing is deleted unless this prints our RUNID.
+# set_names: every name of a run is derived from the run id, so --cleanup needs nothing but the id.
+set_names() {
+  STACK="bhc-$RUNID"; BUCKET="bhc-$RUNID-cfg"; ART_BUCKET="bhc-$RUNID-art"
+  EDGE_FN="bhc-$RUNID-edge"; ORIGIN_FN="bhc-$RUNID-origin"; EDGE_ROLE="bhc-$RUNID-erole"
+}
+
+# tag_of KIND ID -> prints the RunId tag. Returns 0 ok, 44 resource not found, 1 other error. Nothing is deleted unless this
+# prints our RUNID (and the name is the one derived from the run id).
 tag_of() {
-  local kind="$1" id="$2" out arn rc
+  local kind="$1" id="$2" out rc
   case "$kind" in
     s3) out="$(aws_ro s3api get-bucket-tagging --bucket "$id" --query "TagSet[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
     iam) out="$(aws_ro iam list-role-tags --role-name "$id" --query "Tags[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
     lambda) out="$(aws_ro lambda get-function --function-name "$id" --query 'Tags.RunId' --output text)"; rc=$? ;;
-    cf)
-      arn="$(aws_ro cloudfront get-distribution --id "$id" --query 'Distribution.ARN' --output text)"; rc=$?
-      if [ "$rc" = 0 ]; then
-        out="$(aws_ro cloudfront list-tags-for-resource --resource "$arn" --query "Tags.Items[?Key=='RunId'].Value | [0]" --output text)"; rc=$?
-      fi ;;
-    cp)
-      out="$(aws_ro cloudfront get-cache-policy --id "$id" --query 'CachePolicy.CachePolicyConfig.Name' --output text)"; rc=$?
-      if [ "$rc" = 0 ] && [ "$out" = "bhc-$RUNID-cp" ]; then out="$RUNID"; fi ;;
+    stack) out="$(aws_ro cloudformation describe-stacks --stack-name "$id" --query "Stacks[0].Tags[?Key=='RunId'].Value | [0]" --output text)"; rc=$? ;;
     *) return 1 ;;
   esac
   if [ "$rc" -ne 0 ]; then
     if not_found "$kind"; then return 44; fi
-    # A bucket whose tagging call never succeeded has no tag set. It is ours only if its name is exactly this run's bucket name
-    # AND create-bucket of this run reported success (BUCKET_MADE).
-    if [ "$kind" = s3 ] && [ "$(error_code)" = NoSuchTagSet ] && [ "$id" = "bhc-$RUNID-cfg" ] && [ "$BUCKET_MADE" = 1 ]; then
+    # The artifact bucket is created by this script; if its tagging call never succeeded it has no tag set. It is ours only if
+    # its name is exactly this run's artifact bucket name AND create-bucket of this run reported success (ART_MADE).
+    if [ "$kind" = s3 ] && [ "$(error_code)" = NoSuchTagSet ] && [ "$id" = "$ART_BUCKET" ] && [ "$ART_MADE" = 1 ]; then
       printf '%s' "$RUNID"; return 0
     fi
     return 1
@@ -168,52 +172,46 @@ owned() {
 }
 
 # ---------------------------------------------------------------------------------------------------- teardown
-# A Ctrl-C can arrive while a create call is running, before its id was saved. TRY_* is saved before such a call, so the
-# teardown looks the resource up again by its run-id name. The ownership check below still applies to what it finds.
-td_dist() {
-  if [ -z "$DIST_ID" ] && [ "$TRY_DIST" = 1 ]; then
-    DIST_ID="$(aws_ro cloudfront list-distributions --query "DistributionList.Items[?Comment=='bhc test $RUNID'].Id | [0]" --output text)" \
-      || { say "  distribution: lookup by name failed, so a distribution of this run may exist and was NOT checked"; TD_FAIL=1; DIST_ID=""; }
-    case "$DIST_ID" in None|null|'') DIST_ID="" ;; *) say "  distribution: found by its run-id comment" ;; esac
+# The stack owns everything except the artifact bucket (and, in the Lambda@Edge replica case, the edge function and role that
+# were retained). Order: stack, edge leftovers, artifact bucket, log groups.
+td_stack() {
+  [ "$TRY_STACK" = 1 ] || return 0
+  local st failed rc
+  owned stack "$STACK" "stack"; rc=$?
+  case $rc in 44) STACK_GONE=1; return 0 ;; 0) ;; *) return 0 ;; esac
+  st="$(aws_ro cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text)" || { say "  stack: cannot read its status"; TD_FAIL=1; return 0; }
+  case "$st" in
+    CREATE_IN_PROGRESS) say "  stack: still being created ($st); waiting for it to settle (CloudFront needs several minutes)"; aws_ro cloudformation wait stack-create-complete --stack-name "$STACK" >/dev/null 2>&1 ;;
+  esac
+  # The config bucket must be empty before the stack can delete it. Only the one object this script writes is removed, and
+  # only from the bucket named for this run that carries this run's tag.
+  td_empty_bucket
+  say "  stack: deleting $STACK (CloudFormation disables and deletes the distribution: several minutes)"
+  if [ "$st" != DELETE_IN_PROGRESS ]; then aws_do cloudformation delete-stack --stack-name "$STACK" >/dev/null || { say "  stack: delete-stack failed"; TD_FAIL=1; return 0; }; fi
+  if aws_ro cloudformation wait stack-delete-complete --stack-name "$STACK"; then say "  stack: deleted"; STACK_GONE=1; return 0; fi
+  failed="$(aws_ro cloudformation describe-stack-resources --stack-name "$STACK" --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" --output text)" || failed="?"
+  # shellcheck disable=SC2086  # $failed is a tab separated list of logical ids on purpose
+  if [ -n "$failed" ] && [ "$failed" != "?" ] && only_edge_resources $failed; then
+    say "  stack: only the Lambda@Edge function could not be deleted ($failed): AWS keeps its replicas for some hours after the distribution is gone."
+    say "  stack: retrying with those resources RETAINED (they are deleted later, with the same run id, by --cleanup)"
+    if aws_do cloudformation delete-stack --stack-name "$STACK" --retain-resources EdgeVersion EdgeFunction EdgeRole >/dev/null \
+       && aws_ro cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+      say "  stack: deleted (edge function, version and role retained; they are deleted next, or later by --cleanup)"; STACK_GONE=1
+      return 0
+    fi
   fi
-  [ -n "$DIST_ID" ] || return 0
-  [ "$DIST_GONE" = 1 ] && return 0
-  owned cf "$DIST_ID" "distribution"; case $? in 44) DIST_GONE=1; return 0 ;; 0) ;; *) return 0 ;; esac
-  local cfg etag enabled
-  cfg="$(aws_ro cloudfront get-distribution-config --id "$DIST_ID" --output json)" || { say "  distribution: cannot read config"; TD_FAIL=1; return 0; }
-  etag="$(printf '%s' "$cfg" | jq -r '.ETag')"; enabled="$(printf '%s' "$cfg" | jq -r '.DistributionConfig.Enabled')"
-  if [ "$enabled" = true ]; then
-    say "  distribution: disabling"
-    printf '%s' "$cfg" | jq '.DistributionConfig | .Enabled = false' > "$WORK/dist-off.json"
-    aws_do cloudfront update-distribution --id "$DIST_ID" --distribution-config "file://$WORK/dist-off.json" --if-match "$etag" >/dev/null \
-      || { say "  distribution: disable failed"; TD_FAIL=1; return 0; }
-  fi
-  say "  distribution: waiting until the disable is deployed (several minutes)"
-  retry 3 5 aws_ro cloudfront wait distribution-deployed --id "$DIST_ID" || { say "  distribution: wait failed"; TD_FAIL=1; return 0; }
-  etag="$(aws_ro cloudfront get-distribution-config --id "$DIST_ID" --query ETag --output text)"
-  if aws_do cloudfront delete-distribution --id "$DIST_ID" --if-match "$etag" >/dev/null; then
-    say "  distribution: deleted"; state_set DIST_GONE 1
-  else
-    say "  distribution: delete failed"; TD_FAIL=1
-  fi
+  say "  stack: delete FAILED (resources: ${failed:-unknown}). Look at the stack events in the CloudFormation console; stack $STACK is kept."
+  TD_FAIL=1
 }
-td_cache_policy() {
-  if [ -z "$CP_ID" ] && [ "$TRY_CP" = 1 ]; then
-    CP_ID="$(aws_ro cloudfront list-cache-policies --type custom --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='bhc-$RUNID-cp'].CachePolicy.Id | [0]" --output text)" \
-      || { say "  cache policy: lookup by name failed, so a policy of this run may exist and was NOT checked"; TD_FAIL=1; CP_ID=""; }
-    case "$CP_ID" in None|null|'') CP_ID="" ;; *) say "  cache policy: found by its run-id name" ;; esac
-  fi
-  [ -n "$CP_ID" ] || return 0
-  if [ -n "$DIST_ID" ] && [ "$DIST_GONE" != 1 ]; then say "  cache policy: kept (distribution still exists)"; return 0; fi
-  owned cp "$CP_ID" "cache policy"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  local etag
-  etag="$(aws_ro cloudfront get-cache-policy --id "$CP_ID" --query ETag --output text)"
-  if aws_do cloudfront delete-cache-policy --id "$CP_ID" --if-match "$etag" >/dev/null; then say "  cache policy: deleted"; else say "  cache policy: delete failed"; TD_FAIL=1; fi
+only_edge_resources() { local x; for x in "$@"; do case "$x" in EdgeFunction|EdgeVersion) ;; *) return 1 ;; esac; done; }
+td_empty_bucket() {
+  owned s3 "$BUCKET" "config bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
+  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null 2>&1
+  return 0
 }
-td_edge() {
-  [ -n "$EDGE_FN" ] || return 0
+td_edge() {  # the retained edge function (only exists after the replica case)
+  [ "$STACK_GONE" = 1 ] || return 0
   owned lambda "$EDGE_FN" "edge function"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  if [ -n "$DIST_ID" ] && [ "$DIST_GONE" != 1 ]; then say "  edge function: kept (distribution still exists)"; TD_FAIL=1; TD_PENDING=1; return 0; fi
   if retry "$EDGE_DELETE_TRIES" "$EDGE_DELETE_PAUSE" aws_do lambda delete-function --function-name "$EDGE_FN" >/dev/null; then
     say "  edge function: deleted"
   elif not_found lambda; then
@@ -224,22 +222,12 @@ td_edge() {
     TD_PENDING=1; TD_FAIL=1
   fi
 }
-td_origin() {
-  [ -n "$ORIGIN_FN" ] || return 0
-  owned lambda "$ORIGIN_FN" "origin function"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  if aws_do lambda delete-function --function-name "$ORIGIN_FN" >/dev/null; then say "  origin function: deleted"; else say "  origin function: delete failed"; TD_FAIL=1; fi
-}
-td_role() { # LABEL ROLE_NAME
-  [ -n "$2" ] || return 0
-  owned iam "$2" "$1"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  aws_do iam delete-role-policy --role-name "$2" --policy-name bhc-inline >/dev/null 2>&1
-  if aws_do iam delete-role --role-name "$2" >/dev/null; then say "  $1: deleted"; else say "  $1: delete failed"; TD_FAIL=1; fi
-}
-td_origin_role() { td_role "origin role" "$ORIGIN_ROLE"; }
-td_edge_role() {
-  [ -n "$ROLE" ] || return 0
+td_edge_role() {  # the retained edge role
+  [ "$STACK_GONE" = 1 ] || return 0
   if [ "$TD_PENDING" = 1 ]; then say "  edge role: kept (the edge function still exists)"; return 0; fi
-  td_role "edge role" "$ROLE"
+  owned iam "$EDGE_ROLE" "edge role"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
+  aws_do iam delete-role-policy --role-name "$EDGE_ROLE" --policy-name bhc-inline >/dev/null 2>&1
+  if aws_do iam delete-role --role-name "$EDGE_ROLE" >/dev/null; then say "  edge role: deleted"; else say "  edge role: delete failed"; TD_FAIL=1; fi
 }
 # CloudWatch log groups. Only groups whose name is EXACTLY one of this run's names are deleted (log groups carry no tag here).
 # The edge function logs in the region of the edge location that ran it, as /aws/lambda/us-east-1.<function>.
@@ -254,6 +242,7 @@ td_log_group() { # region name
 }
 td_logs() {
   local regions r
+  if [ "$TRY_STACK" != 1 ] && [ "$ART_MADE" != 1 ]; then return 0; fi   # nothing was ever created
   if [ -n "$ORIGIN_FN" ]; then td_log_group "$REGION" "/aws/lambda/$ORIGIN_FN"; fi
   if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" = 1 ]; then say "  edge log groups: kept until the edge function is deleted (--cleanup removes them)"; fi
   if [ -n "$EDGE_FN" ] && [ "$TD_PENDING" != 1 ]; then
@@ -262,16 +251,16 @@ td_logs() {
   fi
   if [ -n "$LOGS_LEFT" ]; then say "  log groups NOT deleted:$LOGS_LEFT (a few cents of stored logs at most; delete them in the console)"; fi
 }
-td_bucket() {
-  [ -n "$BUCKET" ] || return 0
-  if [ -n "$DIST_ID" ] && [ "$DIST_GONE" != 1 ]; then say "  bucket: kept (the distribution and its edge function may still read it)"; return 0; fi
-  owned s3 "$BUCKET" "bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
-  aws_do s3api delete-object --bucket "$BUCKET" --key "$CONFIG_KEY" >/dev/null 2>&1
-  if aws_do s3api delete-bucket --bucket "$BUCKET" >/dev/null; then say "  bucket: deleted"; else say "  bucket: delete failed"; TD_FAIL=1; fi
+td_art_bucket() {
+  # In a run, only a bucket this run created (ART_MADE) is looked at. In --cleanup the tag check below is the guard.
+  if [ "$MODE" = run ] && [ "$ART_MADE" != 1 ]; then return 0; fi
+  owned s3 "$ART_BUCKET" "artifact bucket"; case $? in 44) return 0 ;; 0) ;; *) return 0 ;; esac
+  aws_do s3api delete-object --bucket "$ART_BUCKET" --key "$CODE_KEY" >/dev/null 2>&1
+  if aws_do s3api delete-bucket --bucket "$ART_BUCKET" >/dev/null; then say "  artifact bucket: deleted"; else say "  artifact bucket: delete failed"; TD_FAIL=1; fi
 }
 teardown() {
-  say "teardown: deleting only resources tagged RunId=$RUNID"
-  td_dist; td_cache_policy; td_edge; td_origin; td_edge_role; td_origin_role; td_logs; td_bucket
+  say "teardown: deleting only resources of stack $STACK (tagged RunId=$RUNID)"
+  td_stack; td_edge; td_edge_role; td_art_bucket; td_logs
   if [ "$TD_FAIL" = 0 ] && [ -z "$LOGS_LEFT" ]; then
     say "teardown: complete"
   elif [ "$TD_FAIL" = 0 ]; then
@@ -282,19 +271,14 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------------------------------- packaging
-# package_edge DIR: copy edge/index.mjs with the bucket and key baked in (Lambda@Edge has no environment variables).
+# package_edge DIR: copy edge/index.mjs with the config bucket and key baked in (Lambda@Edge has no environment variables).
+CODE_KEY="edge.zip"
 package_edge() {
   local d="$1"
   mkdir -p "$d/edge"
   sed -e "s|__CONFIG_BUCKET__|$BUCKET|" -e "s|__CONFIG_KEY__|$CONFIG_KEY|" "$SCRIPT_DIR/edge/index.mjs" > "$d/edge/index.mjs"
   if grep -q '__CONFIG_' "$d/edge/index.mjs"; then return 1; fi
-  (cd "$d/edge" && zip -q -j "$d/edge.zip" index.mjs)
-}
-package_origin() {
-  local d="$1"
-  mkdir -p "$d/origin"
-  cp "$SCRIPT_DIR/origin/index.mjs" "$d/origin/index.mjs"
-  (cd "$d/origin" && zip -q -j "$d/origin.zip" index.mjs)
+  (cd "$d/edge" && zip -q -j "$d/$CODE_KEY" index.mjs)
 }
 
 # ---------------------------------------------------------------------------------------------------- results

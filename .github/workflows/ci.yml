@@ -54,6 +54,10 @@ jobs:
         working-directory: cloudfront-request-routing
         run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint template.yaml template-lambda-edge.yaml"
 
+      - name: cfn-lint (business-hours-cache template)
+        working-directory: cloudfront-business-hours-cache
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/stack.yaml"
+
       - name: shellcheck
         run: |
           shellcheck --version

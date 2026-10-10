@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-test.sh - ONE entry point. Builds a temporary CloudFront + Lambda@Edge stack, runs tests T-A..T-E against it,
+# run-test.sh - ONE entry point. Deploys cfn/stack.yaml (CloudFormation: CloudFront + Lambda@Edge + test origin), runs tests T-A..T-F,
 # prints a results table, writes results-<date>.md, and deletes everything it created (also on error and Ctrl-C).
 #
 #   ./run-test.sh --dry-run          print the plan; no AWS call that changes anything
@@ -26,19 +26,30 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/bhc.XXXXXX")" || exit 2
 export RT_MAIN_PID=$$   # lets the test stubs signal this script
+# Keep the real stdout and stderr. A Ctrl-C can arrive while a command runs with "> /dev/null": the EXIT trap would inherit that
+# redirect and every teardown message would vanish. on_exit puts them back first.
+exec 3>&1 4>&2
 RESULTS_FILE=""
 
 # shellcheck disable=SC2329  # runs from the EXIT trap
 on_exit() {
   local rc=$?
   trap '' INT TERM HUP    # a second Ctrl-C must not interrupt the teardown
+  exec >&3 2>&4           # undo any redirect that was active when the signal arrived
   if [ "$CREATE_STARTED" = 1 ] && [ "$TEARDOWN_DONE" = 0 ]; then
     TEARDOWN_DONE=1
     if [ "$REPORT_WRITTEN" = 0 ] && [ "${#RES_NAME[@]}" -gt 0 ]; then write_report "ABORTED (rc=$rc), partial results"; fi
     say ""
     teardown
     if [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
-      { printf '\n## Teardown\n\n'; if [ "$TD_FAIL" = 0 ]; then if [ -z "$LOGS_LEFT" ]; then echo "Complete: every resource of this run was deleted."; else echo "All resources deleted, but log groups left:$LOGS_LEFT"; fi; else echo "INCOMPLETE: some resources of this run may still exist. See the screen output."; fi; } | redact >> "$RESULTS_FILE"
+      local msg
+      if [ "$TD_FAIL" != 0 ]; then msg="INCOMPLETE: some resources of this run may still exist. See the screen output."
+      elif [ -n "$LOGS_LEFT" ]; then msg="All resources deleted, but log groups left:$LOGS_LEFT"
+      else msg="Complete: every resource of this run was deleted."; fi
+      redact <<< "
+## Teardown
+
+$msg" >> "$RESULTS_FILE"
     fi
     if [ "$TD_FAIL" = 0 ] && [ -n "$STATE_FILE" ]; then rm -f "$STATE_FILE"; fi
     if [ "$TD_FAIL" != 0 ]; then rc=4; fi   # an incomplete teardown always wins: leftovers must not be hidden by an earlier code
@@ -80,123 +91,72 @@ print_plan() {
   local id="$1"
   cat <<EOF
 
-Plan for run $id (every resource below is tagged RunId=$id and is deleted at the end):
-  1. S3 bucket              bhc-$id-cfg          holds $CONFIG_KEY (the window), private
-  2. IAM roles (two)        bhc-$id-erole        edge: read that one object (+ list the bucket), write logs; trusts lambda and edgelambda
-                            bhc-$id-orole        origin: write logs only; trusts lambda
-  3. Lambda (origin)        bhc-$id-origin       Node.js 22 + PUBLIC function URL (test only), reserved concurrency 5 if the account allows
-  4. Lambda@Edge function   bhc-$id-edge         Node.js 22, us-east-1, one published version, origin-response
-  5. Cache policy           bhc-$id-cp           min 0, default 0, max 86400; no query strings, headers or cookies in the key
-  6. CloudFront distribution (PriceClass_100)    origin = the function URL, edge function on origin-response, 500 not cached
-Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-F URI variants, T-D error status, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
-Teardown: disable the distribution, wait, delete it, then the cache policy, both functions, both roles, the log groups and the bucket.
+Plan for run $id: ONE CloudFormation stack bhc-$id (cfn/stack.yaml), tagged RunId=$id, deleted at the end.
+  Created by this script before the stack (the stack needs the code to exist):
+    S3 bucket bhc-$id-art   holds the edge function zip (bucket and key baked in), private
+  Created by the stack:
+    S3 bucket bhc-$id-cfg   holds $CONFIG_KEY (the windows), private, encrypted, no bucket policy
+    IAM roles               bhc-$id-erole (edge: read that one object + list the bucket, write logs; trusts lambda and edgelambda)
+                            bhc-$id-orole (origin: write logs only)
+    Lambda (origin)         bhc-$id-origin  Node.js 22, inline code, PUBLIC function URL (test only)
+    Lambda@Edge function    bhc-$id-edge    Node.js 22, us-east-1, code from the art bucket, plus one published version
+    Cache policy            bhc-$id-cp      min 0, default 0, max 86400; no query strings, headers or cookies in the key
+    CloudFront distribution (PriceClass_100) origin = the function URL, edge function on origin-response, 500 not cached
+  Then: a best-effort reserved concurrency of 5 on the origin, and the window JSON uploaded by this script.
+Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-F URI variants, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
+Teardown: empty the config bucket, delete the stack (CloudFormation disables and deletes the distribution), delete the art bucket, the log groups.
+          If AWS still holds the Lambda@Edge replicas, the edge function and its role are retained and --cleanup removes them later.
 Cost: an estimate of a few cents at most (a few hundred requests; Lambda@Edge, S3 and CloudFront free-tier or cent-level charges).
-Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to disable it).
+Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to delete it).
 The origin function URL is PUBLIC (auth NONE) while the stack exists; it returns only a timestamp and a counter.
 EOF
 }
 
+TEMPLATE="$SCRIPT_DIR/cfn/stack.yaml"
+
 # ---------------------------------------------------------------------------------------------------- create
 
 create_all() {
-  local d="$WORK/pkg" role_arn origin_role_arn edge_arn
+  local d="$WORK/pkg" out b
   mkdir -p "$d"
-  say "[1/7] S3 bucket"
-  # Bucket names are global: if this one already exists it is not ours, so stop before anything is created.
-  if aws_ro s3api head-bucket --bucket "bhc-$RUNID-cfg" >/dev/null 2>&1; then fail "a bucket named bhc-$RUNID-cfg already exists; refusing to use it"; fi
-  case "$(error_code)" in 404|NotFound|NoSuchBucket) ;; *) fail "cannot tell whether bucket bhc-$RUNID-cfg exists (code: $(error_code)); refusing to continue" ;; esac
-  state_set BUCKET "bhc-$RUNID-cfg"
-  aws_do s3api create-bucket --bucket "$BUCKET" >/dev/null || fail "create-bucket"
-  state_set BUCKET_MADE 1   # from here on an untagged bucket of exactly this name is ours (tagging may not have run yet)
-  aws_do s3api put-public-access-block --bucket "$BUCKET" \
+  say "[1/5] checking that the bucket names are free"
+  # Bucket names are global: if one of these exists it is not ours, so stop before anything is created.
+  for b in "$ART_BUCKET" "$BUCKET"; do
+    if aws_ro s3api head-bucket --bucket "$b" >/dev/null 2>&1; then fail "a bucket named $b already exists; refusing to continue"; fi
+    case "$(error_code)" in 404|NotFound|NoSuchBucket) ;; *) fail "cannot tell whether bucket $b exists (code: $(error_code)); refusing to continue" ;; esac
+  done
+
+  say "[2/5] artifact bucket and the edge function zip"
+  package_edge "$d" || fail "packaging the edge function"
+  aws_do s3api create-bucket --bucket "$ART_BUCKET" >/dev/null || fail "create-bucket"
+  state_set ART_MADE 1   # from here on an untagged bucket of exactly this name is ours (tagging may not have run yet)
+  aws_do s3api put-public-access-block --bucket "$ART_BUCKET" \
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null || fail "public access block"
-  aws_do s3api put-bucket-tagging --bucket "$BUCKET" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
+  aws_do s3api put-bucket-tagging --bucket "$ART_BUCKET" --tagging "TagSet=[{Key=RunId,Value=$RUNID},{Key=Purpose,Value=bhc-test}]" >/dev/null || fail "bucket tagging"
+  aws_do s3api put-object --bucket "$ART_BUCKET" --key "$CODE_KEY" --body "$d/$CODE_KEY" >/dev/null || fail "uploading the edge function zip"
+
+  say "[3/5] validating the template and creating the stack $STACK"
+  aws_ro cloudformation validate-template --template-body "file://$TEMPLATE" >/dev/null || fail "template validation"
+  jq -n --arg r "$RUNID" --arg cb "$BUCKET" --arg ck "$CONFIG_KEY" --arg ab "$ART_BUCKET" --arg ak "$CODE_KEY" \
+    '[{ParameterKey:"RunId",ParameterValue:$r},{ParameterKey:"ConfigBucketName",ParameterValue:$cb},{ParameterKey:"ConfigKey",ParameterValue:$ck},
+      {ParameterKey:"CodeBucket",ParameterValue:$ab},{ParameterKey:"CodeKey",ParameterValue:$ak}]' > "$d/params.json" || fail "building the parameters"
+  state_set TRY_STACK 1   # saved before the call: a Ctrl-C during it must still delete the stack
+  aws_do cloudformation create-stack --stack-name "$STACK" --template-body "file://$TEMPLATE" --parameters "file://$d/params.json" \
+    --capabilities CAPABILITY_NAMED_IAM --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" >/dev/null || fail "create-stack"
+
+  say "[4/5] waiting for CloudFormation (CloudFront deploys the distribution: usually 5-15 minutes)"
+  aws_do cloudformation wait stack-create-complete --stack-name "$STACK" || fail "the stack did not reach CREATE_COMPLETE"
+  out="$(aws_ro cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Outputs' --output json)" || fail "cannot read the stack outputs"
+  DIST_ID="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="DistributionId") | .OutputValue')"
+  CF_DOMAIN="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="DistributionDomain") | .OutputValue')"
+  # shellcheck disable=SC2034  # used by redact()
+  ORIGIN_HOST="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="OriginHost") | .OutputValue')"
+  [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] && [ -n "$CF_DOMAIN" ] && [ "$CF_DOMAIN" != null ] || fail "the stack outputs have no distribution"
+
+  say "[5/5] initial window config and best-effort reserved concurrency for the public origin"
   put_json "{\"default\":$(win_json 0 1)}" || fail "initial config upload"
-
-  say "[2/7] IAM roles (edge role with S3 read, origin role without)"
-  # Logs only for this run's log groups (the edge function logs as /aws/lambda/us-east-1.<name> in the region of the edge location).
-  local lg="arn:aws:logs:*:*:log-group:/aws/lambda/*bhc-$RUNID-*"
-  jq -n '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{Service:["lambda.amazonaws.com","edgelambda.amazonaws.com"]},Action:"sts:AssumeRole"}]}' > "$d/trust-edge.json"
-  jq -n '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{Service:"lambda.amazonaws.com"},Action:"sts:AssumeRole"}]}' > "$d/trust-origin.json"
-  jq -n --arg b "arn:aws:s3:::$BUCKET" --arg o "arn:aws:s3:::$BUCKET/$CONFIG_KEY" --arg l "$lg" --arg l2 "$lg:*" \
-    '{Version:"2012-10-17",Statement:[
-      {Effect:"Allow",Action:"s3:GetObject",Resource:$o},
-      {Effect:"Allow",Action:"s3:ListBucket",Resource:$b},
-      {Effect:"Allow",Action:["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],Resource:[$l,$l2]}]}' > "$d/policy-edge.json" || fail "building the edge policy"
-  jq -n --arg l "$lg" --arg l2 "$lg:*" \
-    '{Version:"2012-10-17",Statement:[{Effect:"Allow",Action:["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],Resource:[$l,$l2]}]}' > "$d/policy-origin.json" || fail "building the origin policy"
-  state_set ROLE "bhc-$RUNID-erole"
-  role_arn="$(aws_do iam create-role --role-name "$ROLE" --assume-role-policy-document "file://$d/trust-edge.json" \
-    --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" --query Role.Arn --output text)" || fail "create-role (edge)"
-  aws_do iam put-role-policy --role-name "$ROLE" --policy-name bhc-inline --policy-document "file://$d/policy-edge.json" >/dev/null || fail "put-role-policy (edge)"
-  state_set ORIGIN_ROLE "bhc-$RUNID-orole"
-  origin_role_arn="$(aws_do iam create-role --role-name "$ORIGIN_ROLE" --assume-role-policy-document "file://$d/trust-origin.json" \
-    --tags "Key=RunId,Value=$RUNID" "Key=Purpose,Value=bhc-test" --query Role.Arn --output text)" || fail "create-role (origin)"
-  aws_do iam put-role-policy --role-name "$ORIGIN_ROLE" --policy-name bhc-inline --policy-document "file://$d/policy-origin.json" >/dev/null || fail "put-role-policy (origin)"
-  nap 10   # IAM is eventually consistent
-
-  say "[3/7] origin function and function URL"
-  package_origin "$d" || fail "packaging the origin"
-  state_set ORIGIN_FN "bhc-$RUNID-origin"
-  retry 6 10 aws_do lambda create-function --function-name "$ORIGIN_FN" --runtime nodejs22.x --handler index.handler --timeout 5 \
-    --role "$origin_role_arn" --zip-file "fileb://$d/origin.zip" --tags "RunId=$RUNID,Purpose=bhc-test" >/dev/null || fail "create origin function"
-  aws_do lambda wait function-active-v2 --function-name "$ORIGIN_FN" || fail "origin function not active"
-  # Best effort: caps what a stranger who finds the public URL can run up. Many accounts cannot reserve (the unreserved pool must stay at 100).
   aws_do lambda put-function-concurrency --function-name "$ORIGIN_FN" --reserved-concurrent-executions 5 >/dev/null \
     || say "  note: reserved concurrency was not set (account limit?); continuing without it"
-  local url
-  url="$(aws_do lambda create-function-url-config --function-name "$ORIGIN_FN" --auth-type NONE --query FunctionUrl --output text)" || fail "create-function-url-config"
-  aws_do lambda add-permission --function-name "$ORIGIN_FN" --statement-id url-invoke-url --action lambda:InvokeFunctionUrl \
-    --principal '*' --function-url-auth-type NONE >/dev/null || fail "add-permission InvokeFunctionUrl"
-  aws_do lambda add-permission --function-name "$ORIGIN_FN" --statement-id url-invoke-fn --action lambda:InvokeFunction \
-    --principal '*' --invoked-via-function-url >/dev/null || fail "add-permission InvokeFunction (needs a recent AWS CLI v2)"
-  url="${url#https://}"; url="${url%/}"
-  ORIGIN_HOST="$url"   # not saved: the state file keeps names and ids only
-
-  say "[4/7] Lambda@Edge function and version"
-  package_edge "$d" || fail "packaging the edge function"
-  state_set EDGE_FN "bhc-$RUNID-edge"
-  aws_do lambda create-function --function-name "$EDGE_FN" --runtime nodejs22.x --handler index.handler --timeout 5 --memory-size 128 \
-    --role "$role_arn" --zip-file "fileb://$d/edge.zip" --tags "RunId=$RUNID,Purpose=bhc-test" >/dev/null || fail "create edge function"
-  aws_do lambda wait function-active-v2 --function-name "$EDGE_FN" || fail "edge function not active"
-  edge_arn="$(aws_do lambda publish-version --function-name "$EDGE_FN" --query FunctionArn --output text)" || fail "publish-version"
-  state_set EDGE_VER "${edge_arn##*:}"
-
-  say "[5/7] cache policy"
-  jq -n --arg name "bhc-$RUNID-cp" --arg comment "bhc test $RUNID" '{Name:$name,Comment:$comment,DefaultTTL:0,MinTTL:0,MaxTTL:86400,
-    ParametersInCacheKeyAndForwardedToOrigin:{EnableAcceptEncodingGzip:false,EnableAcceptEncodingBrotli:false,
-      HeadersConfig:{HeaderBehavior:"none"},CookiesConfig:{CookieBehavior:"none"},QueryStringsConfig:{QueryStringBehavior:"none"}}}' > "$d/cp.json" || fail "building the cache policy"
-  local cpid
-  state_set TRY_CP 1
-  cpid="$(aws_do cloudfront create-cache-policy --cache-policy-config "file://$d/cp.json" --query CachePolicy.Id --output text)" || fail "create-cache-policy"
-  [ -n "$cpid" ] && [ "$cpid" != None ] || fail "create-cache-policy returned no id"
-  state_set CP_ID "$cpid"
-
-  say "[6/7] CloudFront distribution"
-  jq -n --arg run "$RUNID" --arg host "$ORIGIN_HOST" --arg cp "$CP_ID" --arg fn "$edge_arn" '{
-    DistributionConfig: {
-      CallerReference: $run, Comment: ("bhc test " + $run), Enabled: true, PriceClass: "PriceClass_100",
-      Origins: {Quantity: 1, Items: [{Id: "origin", DomainName: $host,
-        CustomOriginConfig: {HTTPPort: 80, HTTPSPort: 443, OriginProtocolPolicy: "https-only", OriginSslProtocols: {Quantity: 1, Items: ["TLSv1.2"]}}}]},
-      DefaultCacheBehavior: {TargetOriginId: "origin", ViewerProtocolPolicy: "https-only", CachePolicyId: $cp, Compress: false,
-        AllowedMethods: {Quantity: 2, Items: ["GET", "HEAD"], CachedMethods: {Quantity: 2, Items: ["GET", "HEAD"]}},
-        LambdaFunctionAssociations: {Quantity: 1, Items: [{LambdaFunctionARN: $fn, EventType: "origin-response", IncludeBody: false}]}},
-      CustomErrorResponses: {Quantity: 1, Items: [{ErrorCode: 500, ErrorCachingMinTTL: 0}]}
-    },
-    Tags: {Items: [{Key: "RunId", Value: $run}, {Key: "Purpose", Value: "bhc-test"}]}
-  }' > "$d/dist.json" || fail "building the distribution config"
-  local out
-  state_set TRY_DIST 1
-  out="$(aws_do cloudfront create-distribution-with-tags --distribution-config-with-tags "file://$d/dist.json" --output json)" || fail "create-distribution-with-tags"
-  local did
-  did="$(printf '%s' "$out" | jq -r '.Distribution.Id // empty')"
-  [ -n "$did" ] && [ "$did" != null ] || fail "no distribution id returned"
-  state_set DIST_ID "$did"
-  CF_DOMAIN="$(printf '%s' "$out" | jq -r '.Distribution.DomainName // empty')"
-  [ -n "$CF_DOMAIN" ] || fail "no distribution domain returned"
-
-  say "[7/7] waiting until CloudFront has deployed the distribution (usually 5-15 minutes)"
-  aws_do cloudfront wait distribution-deployed --id "$DIST_ID" || fail "the distribution did not reach Deployed"
   say "stack is ready"
 }
 
@@ -447,23 +407,22 @@ run_tests() {
 
 # ---------------------------------------------------------------------------------------------------- report
 write_report() { # title
-  local i f d n=1
+  local i f d n=1 nl='
+' body
   d="$(date -u +%Y%m%d)"; f="$RESULTS_DIR/results-$d.md"
   while [ -e "$f" ]; do n=$((n + 1)); f="$RESULTS_DIR/results-$d-$n.md"; done
-  {
-    echo "# CloudFront business-hours cache: results"
-    echo
-    echo "- Run: $RUNID, finished $(stamp), region $REGION, edge function version $EDGE_VER"
-    echo "- Status: $1"
-    echo "- Config: one daily window in UTC, inTtl=$IN_TTL, outTtl=$OUT_TTL, cache policy min 0 / default 0 / max 86400"
-    echo
-    echo "| Test | Result | Measured |"
-    echo "|---|---|---|"
-    for ((i = 0; i < ${#RES_NAME[@]}; i++)); do echo "| ${RES_NAME[$i]} | ${RES_RESULT[$i]} | $(printf '%s' "${RES_MEAS[$i]}" | tr '|' '/') |"; done
-    echo
-    echo "PASS = measured as expected. FAIL = measured something else. INCONCLUSIVE = the test could not run cleanly, so it says nothing either way."
-    if [ "${#NOTES[@]}" -gt 0 ]; then echo; echo "## Notes"; echo; for ((i = 0; i < ${#NOTES[@]}; i++)); do echo "- ${NOTES[$i]}"; done; fi
-  } | redact > "$f"
+  # Built as one string and redacted with a here-string (no pipes: this also runs from the EXIT trap after Ctrl-C).
+  body="# CloudFront business-hours cache: results$nl$nl- Run: $RUNID, finished $(stamp), region $REGION (CloudFormation stack $STACK)"
+  body="$body$nl- Status: $1"
+  body="$body$nl- Config: path rules in UTC (see README), outTtl=$OUT_TTL capped to the time until the window opens, cache policy min 0 / default 0 / max 86400$nl"
+  body="$body$nl| Test | Result | Measured |$nl|---|---|---|"
+  for ((i = 0; i < ${#RES_NAME[@]}; i++)); do body="$body$nl| ${RES_NAME[$i]} | ${RES_RESULT[$i]} | ${RES_MEAS[$i]//|//} |"; done
+  body="$body$nl${nl}PASS = measured as expected. FAIL = measured something else. INCONCLUSIVE = the test could not run cleanly, so it says nothing either way."
+  if [ "${#NOTES[@]}" -gt 0 ]; then
+    body="$body$nl$nl## Notes$nl"
+    for ((i = 0; i < ${#NOTES[@]}; i++)); do body="$body$nl- ${NOTES[$i]}"; done
+  fi
+  redact <<< "$body" > "$f"
   RESULTS_FILE="$f"; REPORT_WRITTEN=1
   say "results file: $(basename "$f") (in $(basename "$RESULTS_DIR"))"
 }
@@ -473,8 +432,8 @@ report() {
   p="$(count_result PASS)"; f="$(count_result FAIL)"; i="$(count_result INCONCLUSIVE)"
   say ""
   say "==================== RESULTS ===================="
-  printf '%-6s %-13s %s\n' TEST RESULT MEASURED | redact
-  for ((c = 0; c < ${#RES_NAME[@]}; c++)); do printf '%-6s %-13s %s\n' "${RES_NAME[$c]}" "${RES_RESULT[$c]}" "${RES_MEAS[$c]}" | redact; done
+  redact <<< "$(printf '%-6s %-13s %s' TEST RESULT MEASURED)"
+  for ((c = 0; c < ${#RES_NAME[@]}; c++)); do redact <<< "$(printf '%-6s %-13s %s' "${RES_NAME[$c]}" "${RES_RESULT[$c]}" "${RES_MEAS[$c]}")"; done
   say "PASS=$p FAIL=$f INCONCLUSIVE=$i"
   write_report "PASS=$p FAIL=$f INCONCLUSIVE=$i"
   RUN_RC=0
@@ -496,7 +455,10 @@ main_run() {
   # RT_RUNID is a TEST HOOK (the stub tests need a fixed id). It must still match the run id format, checked below.
   RUNID="${RT_RUNID:-$(date -u +%y%m%d%H%M)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')}"
   printf '%s' "$RUNID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "run id '$RUNID' is not of the form 2610101200-ab12"
+  set_names
   print_plan "$RUNID"
+  aws_ro cloudformation validate-template --template-body "file://$TEMPLATE" >/dev/null || die "cfn/stack.yaml did not validate"
+  say "template check: cloudformation validate-template accepted cfn/stack.yaml"
   if [ "$MIDNIGHT_BAD" = 1 ]; then
     say ""
     say "NOTE: it is now $(stamp). The tests need windows of up to 60 minutes on both sides of 'now' inside one UTC day."
@@ -504,7 +466,7 @@ main_run() {
   fi
   if [ "$DRY_RUN" = 1 ]; then
     say ""
-    say "dry run: nothing was created or deleted (only sts get-caller-identity was called)."
+    say "dry run: nothing was created or deleted (only the read-only calls sts get-caller-identity and cloudformation validate-template were made)."
     return 0
   fi
   [ "$MIDNIGHT_BAD" = 0 ] || die "outside 01:30-22:00 UTC, see the note above"
@@ -523,59 +485,18 @@ main_run() {
   exit "$RUN_RC"
 }
 
-# discover_by_tag: no state file (lost, or another directory). Read-only listing of everything tagged RunId=<id>; the deletes
-# that follow are the same tag-checked ones as always. Cache policies cannot be tagged, so they are looked up by name.
-discover_by_tag() {
-  local arns a n
-  arns="$(aws_ro resourcegroupstaggingapi get-resources --tag-filters "Key=RunId,Values=$RUNID" --query 'ResourceTagMappingList[].ResourceARN' --output text)" \
-    || die "cannot list resources by tag (needs tag:GetResources)"
-  for a in $arns; do
-    n="${a##*[:/]}"
-    case "$a" in
-      arn:aws:s3:::*) [ "$n" = "bhc-$RUNID-cfg" ] && BUCKET="$n" ;;
-      arn:aws:iam::*:role/*) case "$n" in "bhc-$RUNID-erole") ROLE="$n" ;; "bhc-$RUNID-orole") ORIGIN_ROLE="$n" ;; esac ;;
-      arn:aws:lambda:*:function:*) case "$n" in "bhc-$RUNID-edge") EDGE_FN="$n" ;; "bhc-$RUNID-origin") ORIGIN_FN="$n" ;; esac ;;
-      arn:aws:cloudfront::*:distribution/*) DIST_ID="$n" ;;
-    esac
-  done
-  TRY_CP=1; TRY_DIST=1
-  if [ -z "$BUCKET$ROLE$ORIGIN_ROLE$EDGE_FN$ORIGIN_FN$DIST_ID" ]; then die "nothing tagged RunId=$RUNID was found (already deleted?)"; fi
-  # The tag listing can lag (IAM especially): also try the exact role names. The tag check before each delete still applies.
-  [ -n "$ROLE" ] || ROLE="bhc-$RUNID-erole"
-  [ -n "$ORIGIN_ROLE" ] || ORIGIN_ROLE="bhc-$RUNID-orole"
-}
-# save_found: write the run id and every name found into the state file, so a second --cleanup (after a partial one) can use it
-save_found() {
-  local k v
-  : > "$STATE_FILE"
-  for k in RUNID BUCKET ROLE ORIGIN_ROLE ORIGIN_FN EDGE_FN DIST_ID TRY_CP TRY_DIST; do
-    eval "v=\${$k:-}"
-    [ -n "$v" ] && [ "$v" != 0 ] && printf '%s=%s\n' "$k" "$v" >> "$STATE_FILE"
-  done
-  return 0
-}
-
-FALLBACK=0
 main_cleanup() {
   printf '%s' "$CLEANUP_ID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "--cleanup needs a run id like 2610101200-ab12"
+  RUNID="$CLEANUP_ID"
   STATE_FILE="$RESULTS_DIR/state-$CLEANUP_ID.env"
-  FALLBACK=0
-  if [ -f "$STATE_FILE" ] && grep -q '^RUNID=' "$STATE_FILE"; then
-    state_load "$STATE_FILE"
-    [ "$RUNID" = "$CLEANUP_ID" ] || die "state file does not belong to run $CLEANUP_ID"
-  else
-    FALLBACK=1
-    say "no usable $(basename "$STATE_FILE") in RESULTS_DIR (default: the directory the run was started in)."
-    say "falling back to a read-only listing by the RunId tag"
-    RUNID="$CLEANUP_ID"
-    discover_by_tag
-  fi
-  say "cleanup of run $RUNID: will delete only resources tagged RunId=$RUNID:"
-  say "  distribution ${DIST_ID:-none}, cache policy ${CP_ID:-by name}, functions ${EDGE_FN:-none} ${ORIGIN_FN:-none}, roles ${ROLE:-none} ${ORIGIN_ROLE:-none}, bucket ${BUCKET:-none}"
+  # Every name is derived from the run id, so the state file is optional (it only carries ART_MADE).
+  if [ -f "$STATE_FILE" ] && grep -q '^RUNID=' "$STATE_FILE"; then state_load "$STATE_FILE"; RUNID="$CLEANUP_ID"; fi
+  set_names
+  TRY_STACK=1
+  say "cleanup of run $RUNID: will delete only stack $STACK (tagged RunId=$RUNID), what it left behind (edge function and role), bucket $ART_BUCKET and the log groups of this run"
   if [ "$DRY_RUN" = 1 ]; then say "dry run: nothing was deleted."; return 0; fi
   say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
   confirm "$CLEANUP_PHRASE"
-  if [ "$FALLBACK" = 1 ]; then save_found; fi
   CREATE_STARTED=1
 }
 

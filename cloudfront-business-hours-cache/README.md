@@ -39,11 +39,41 @@ and deletes the stack again.
 
 | Path | What |
 |---|---|
-| `edge/index.mjs` | The Lambda@Edge function (Node.js, ES module). Bucket and key are baked in at packaging time (Lambda@Edge has no environment variables). |
-| `origin/index.mjs` | Test origin: a Lambda function URL that returns `{now, counter, nonce, path}` and sends no `Cache-Control`. `/err...` answers 500. |
-| `run-test.sh`, `lib.sh` | The one script you run, and its helpers. |
-| `tests/run.sh` | Tests of the script against a fake `aws`, `curl`, `date`, `sleep` and `zip` (no AWS, no network). |
+| `cfn/stack.yaml` | **The CloudFormation template** (YAML, commented). Everything the test needs, in us-east-1. See "The template" below. |
+| `edge/index.mjs` | The Lambda@Edge function (Node.js, ES module). The config bucket and key are baked in when `run-test.sh` zips it (Lambda@Edge has no environment variables). |
+| `origin/index.js` | Test origin: returns `{now, counter, nonce, path}` and no `Cache-Control`; `/err...` answers 500. CommonJS, because it is pasted inline into the template (a test checks the copy is identical). |
+| `run-test.sh`, `lib.sh` | The one script you run: uploads the code, deploys the template, runs the tests, deletes the stack. |
+| `tests/run.sh` | Tests of the script against a fake `aws`, `curl`, `date`, `sleep` and `zip` (no AWS, no network); also checks the template. |
 | `tests/edge.test.mjs` | Unit tests of the function logic (`node --test`). |
+
+## The template (`cfn/stack.yaml`)
+
+One stack, `bhc-<RunId>`, **in us-east-1** (Lambda@Edge functions can only be created there). Parameters: `RunId`, `ConfigBucketName`, `ConfigKey`, `CodeBucket`, `CodeKey`, `OriginReservedConcurrency` (default 0 = none).
+
+| Resource | What and why |
+|---|---|
+| `ConfigBucket` (S3) | Holds the window JSON. Public access block, SSE-S3 encryption, no bucket policy. Its name is a parameter because the edge code has it baked in. |
+| `EdgeRole`, `OriginRole` (IAM) | Edge role: trusts `lambda` and `edgelambda`, reads the one config object, may list that bucket (so a missing key answers `NoSuchKey`, not `AccessDenied`), writes logs of this run's log groups. Origin role: logs only. Explicit names (`bhc-<RunId>-erole`, `-orole`), so the stack needs `CAPABILITY_NAMED_IAM`. |
+| `OriginFunction` (Lambda) + `OriginUrl` + two `Permission`s | The test origin, code inline, behind a **public** function URL (auth `NONE`) for the test only. |
+| `EdgeFunction` (Lambda) + `EdgeVersion` | The Lambda@Edge function and the published version CloudFront needs. The code is a zip in S3: it is about 10 KB, and inline code is limited to 4096 characters and cannot use the S3 client. |
+| `CachePolicy` | Min TTL 0, default 0, max 86400; no query strings, headers or cookies in the cache key. |
+| `Distribution` (CloudFront) | Origin = the function URL, the edge function on origin-response, a 500 is not cached (`ErrorCachingMinTTL: 0`), `PriceClass_100`. |
+
+Why the script uploads the zip first: the stack needs the code to exist when it is created, so `run-test.sh` creates a small artifact bucket `bhc-<RunId>-art` (tagged, private), puts `edge.zip` in it (with `__CONFIG_BUCKET__` and `__CONFIG_KEY__` replaced), and passes it as `CodeBucket`/`CodeKey`. The window JSON is not in the template: the script uploads it after the stack exists, because the tests rewrite it between steps.
+
+### Use the template by itself
+
+```
+# 1. zip edge/index.mjs after replacing __CONFIG_BUCKET__ and __CONFIG_KEY__, put the zip in a bucket you own in us-east-1
+# 2. deploy (us-east-1):
+aws cloudformation create-stack --region us-east-1 --stack-name bhc-<RunId> --template-body file://cfn/stack.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters ParameterKey=RunId,ParameterValue=<RunId> ParameterKey=ConfigBucketName,ParameterValue=<new bucket name> \
+               ParameterKey=CodeBucket,ParameterValue=<your code bucket> ParameterKey=CodeKey,ParameterValue=edge.zip
+# 3. upload your window JSON to s3://<ConfigBucketName>/window.json
+```
+
+`<RunId>` must look like `2610101200-ab12`. For real use change the origin to your own (and put a Function URL origin behind origin access control with `AuthType AWS_IAM`, not `NONE`). To delete: empty the config bucket, then `delete-stack`. If `delete-stack` ends in `DELETE_FAILED` on `EdgeVersion`/`EdgeFunction`, AWS is still holding the Lambda@Edge replicas; try again some hours later, or delete with `--retain-resources EdgeVersion EdgeFunction EdgeRole` and remove those by hand later.
 
 ## Function rules
 
@@ -58,29 +88,29 @@ and deletes the stack again.
 
 ## Safety, read first
 
-- It creates real resources in your account and **costs cents** (estimate: well under 0.10 USD; a few hundred CloudFront requests, a few hundred Lambda and Lambda@Edge invocations, a handful of S3 requests, and a distribution that lives about 30-40 minutes). Use a throwaway or test account.
-- **The origin function URL is public (auth `NONE`) for the test only, while the stack exists.** It returns a timestamp and a counter and nothing else, but anyone who finds the URL can invoke it. The sample sets a small reserved concurrency (5) on the origin function as a best-effort cap on what that could cost; if your account cannot reserve concurrency (the unreserved pool must stay at 100) the script says so and carries on without it. **For real use put the function URL behind CloudFront origin access control with `AuthType AWS_IAM`** and do not use `NONE`. This sample leaves OAC out only to stay small.
+- It creates real resources in your account and **costs cents** (estimate: well under 0.10 USD; a few hundred CloudFront requests, a few hundred Lambda and Lambda@Edge invocations, a handful of S3 requests and CloudFormation calls, and a distribution that lives about 30-40 minutes; CloudFormation itself is free for these resource types). Use a throwaway or test account.
+- **Everything the test needs is ONE CloudFormation stack in us-east-1** (see "The template"). A real CloudFormation deploy of this template has not been run by the author yet: the first run is also the first test of the template (cfn-lint is clean, and the template was validated by the tests' stub only).
+- **The origin function URL is public (auth `NONE`) for the test only, while the stack exists.** It returns a timestamp and a counter and nothing else, but anyone who finds the URL can invoke it. After the stack is up the script tries to set a small reserved concurrency (5) on the origin function as a best-effort cap (if your account cannot reserve concurrency the script says so and carries on; in the template it is the parameter `OriginReservedConcurrency`). **For real use put the function URL behind CloudFront origin access control with `AuthType AWS_IAM`** and do not use `NONE`.
 - **Confirm you are in the right account.** Before you type the phrase the script shows `AWS_PROFILE`, the region and the **last 4 digits** of the account id (on screen only: never in the results file, the state file or a log). Set `EXPECT_ACCOUNT_LAST4=1234` (4 digits) and the script refuses to start, and refuses `--cleanup`, in any other account.
-- Two IAM roles: the edge role (trusts `lambda` and `edgelambda`; reads the one S3 object, may list that bucket so a missing key answers `NoSuchKey`, and writes logs) and a separate origin role (trusts `lambda`; logs only, no S3). Log permissions cover only log groups named for this run.
-- Every resource is tagged `RunId=<id>` (the cache policy cannot be tagged, so its name carries the id). **Teardown only deletes what carries this run's id**: before each delete it reads the tag and refuses on a mismatch. It is the last thing that runs, also after an error, Ctrl-C or SIGTERM.
-- CloudFront needs the distribution disabled and deployed before it can be deleted, which takes several minutes. **AWS releases the Lambda@Edge function replicas some hours after the distribution is gone**, so the function (and the role it uses) may not be deletable at once. The script then says so and exits with code 4. Run `./run-test.sh --cleanup <run id>` later (it asks for the phrase `delete cloudfront test stack`).
-- **State file.** The run id and what to delete are in `state-<run id>.env` (names and ids only) in `RESULTS_DIR`, which defaults to the **current directory**. Run `--cleanup` from the same directory, or set the same `RESULTS_DIR`. If the file is gone, `--cleanup` falls back to a read-only listing by the `RunId` tag (`tag:GetResources`) and then makes the same tag-checked deletes (cache policies cannot be tagged and are looked up by name). Results and state files are git-ignored.
+- **Teardown only touches this run.** Every name is derived from the run id (`bhc-<id>`, `bhc-<id>-cfg`, `-art`, ...) and before deleting the stack or a bucket the script reads its `RunId` tag and refuses on a mismatch. The stack and the resources in it are deleted by CloudFormation (it disables and deletes the distribution itself); the script empties the config bucket first and deletes the artifact bucket and the log groups afterwards. It runs last, also after an error, Ctrl-C or SIGTERM. If you interrupt while the stack is still being created, the teardown waits for the creation to settle (CloudFront needs several minutes) before it deletes.
+- **Lambda@Edge replicas.** AWS releases the Lambda@Edge function replicas some hours after the distribution is gone, so deleting the function can fail and the stack ends in `DELETE_FAILED` on `EdgeVersion`/`EdgeFunction`. The script says so, retries with `--retain-resources EdgeVersion EdgeFunction EdgeRole` (those three only, and only when they are the only ones that failed; any other failure leaves the stack as it is and is reported), then tries to delete the function and role directly. If AWS still holds the replicas, the script exits with code 4 and tells you to run `./run-test.sh --cleanup <run id>` later (it asks for the phrase `delete cloudfront test stack`). This retain-and-retry path has not been exercised against real CloudFormation.
+- **State file.** `state-<run id>.env` (run id and two flags, no names of resources) is written in `RESULTS_DIR`, which defaults to the **current directory**. `--cleanup` does not need it: every name is derived from the run id (the file only records that the artifact bucket was created by this run, which lets an untagged bucket of exactly that name be deleted). Results and state files are git-ignored.
 - **Log groups.** Teardown deletes the origin log group and the edge function's log groups (`/aws/lambda/us-east-1.<function>`, which exist in the regions that served your requests; it looks in every region `ec2:DescribeRegions` returns, and only deletes a group whose name is exactly this run's). Log groups carry no tag, so the name is the check. What can remain: edge log groups while the edge function is still held by AWS (`--cleanup` removes them later), a log group written after the delete, or any group whose delete or lookup was refused (the script lists those). A few cents of stored logs at most.
 - Output on screen and in the results file is redacted (account ids, ARNs, access key ids, `*.cloudfront.net` and function URL hosts, distribution id, bucket and function names of the run, request ids, long token-like strings). It is best effort: read the results file before you share it.
 - Nothing is stored or printed that is a credential. The script uses whatever AWS CLI v2 credentials your shell already has.
 - The window tests need room around "now" inside one UTC day (up to 60 minutes either side). A real run refuses to start between 22:00 and 01:30 UTC.
 - Region `us-east-1` only (Lambda@Edge requirement). Needs: AWS CLI v2, `jq`, `curl`, `zip`, bash 3.2 or newer. Nothing else is installed.
-- Permissions: it creates S3, IAM role, Lambda, CloudFront and cache policy resources and (the first time in an account) the service-linked roles CloudFront and Lambda@Edge use. Run it as an admin of a test account.
+- Permissions: CloudFormation, S3, IAM role, Lambda, CloudFront and cache policy resources, and (the first time in an account) the service-linked roles CloudFront and Lambda@Edge use. Run it as an admin of a test account, or see the policy example below.
 
 ## How to run
 
 ```
-./run-test.sh --dry-run     # prints the plan (names, tests, cost, time). Only sts get-caller-identity is called.
+./run-test.sh --dry-run     # prints the plan and runs cloudformation validate-template. Only read-only calls (sts get-caller-identity, validate-template).
 ./run-test.sh               # asks you to type: create cloudfront test stack
 ```
 
-The run takes roughly 15-25 minutes: CloudFront needs 5-15 minutes to deploy the new distribution, the tests need about 8 minutes of
-waiting (the function keeps its config in memory for up to 30 seconds, so every window change is followed by a 40 second pause, and T-C waits for a window to open), and the teardown waits again for CloudFront.
+The run takes roughly 15-25 minutes: CloudFormation needs 5-15 minutes to create the stack (CloudFront deploys the distribution), the tests need about 8 minutes of
+waiting (the function keeps its config in memory for up to 30 seconds, so every window change is followed by a 40 second pause, and T-C waits for a window to open), and deleting the stack waits again for CloudFront.
 
 Exit codes, in this order of precedence: **4** the teardown is incomplete (always wins, whatever happened before, so leftovers are never hidden); otherwise 130/143 interrupted by Ctrl-C or SIGTERM (teardown still runs); 2 refused to start (usage, missing tool, wrong account, bad time of day); 1 at least one FAIL; 3 no FAIL but something INCONCLUSIVE; 0 all PASS.
 
@@ -105,13 +135,17 @@ The tests prove the behavior of `s-maxage` plus Lambda@Edge with a Function URL 
 
 ## Running it as a person with limited rights (starting point, not tested)
 
-The simplest way is an admin of a test account. If you want less, this is the shape of the policy; adjust and test it in your account, it has not been verified against the real services. Replace `ACCOUNT` with your test account id.
+The simplest way is an admin of a test account. If you want less, this is the shape of the policy; adjust and test it in your account, it has not been verified against the real services. CloudFormation acts with YOUR permissions (the script passes no service role), so the person who runs it needs the permissions for the resources in the stack as well as for CloudFormation itself. Replace `ACCOUNT` with your test account id.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
-    {"Effect": "Allow", "Action": ["sts:GetCallerIdentity", "ec2:DescribeRegions", "tag:GetResources"], "Resource": "*"},
+    {"Effect": "Allow", "Action": ["sts:GetCallerIdentity", "ec2:DescribeRegions", "cloudformation:ValidateTemplate"], "Resource": "*"},
+    {"Effect": "Allow",
+     "Action": ["cloudformation:CreateStack", "cloudformation:DeleteStack", "cloudformation:DescribeStacks", "cloudformation:DescribeStackResources",
+                "cloudformation:DescribeStackEvents", "cloudformation:GetTemplate", "cloudformation:TagResource"],
+     "Resource": "arn:aws:cloudformation:us-east-1:ACCOUNT:stack/bhc-*/*"},
     {"Effect": "Allow", "Action": "s3:*", "Resource": ["arn:aws:s3:::bhc-*", "arn:aws:s3:::bhc-*/*"]},
     {"Effect": "Allow",
      "Action": ["iam:CreateRole", "iam:DeleteRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:TagRole", "iam:ListRoleTags", "iam:GetRole"],
@@ -120,7 +154,8 @@ The simplest way is an admin of a test account. If you want less, this is the sh
      "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
     {"Effect": "Allow",
      "Action": ["lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:TagResource", "lambda:PublishVersion",
-                "lambda:PutFunctionConcurrency", "lambda:ListTags", "lambda:GetFunctionConfiguration", "lambda:CreateFunctionUrlConfig", "lambda:DeleteFunctionUrlConfig", "lambda:AddPermission",
+                "lambda:PutFunctionConcurrency", "lambda:ListTags", "lambda:GetFunctionConfiguration", "lambda:CreateFunctionUrlConfig", "lambda:DeleteFunctionUrlConfig", "lambda:GetFunctionUrlConfig",
+                "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy",
                 "lambda:EnableReplication*", "lambda:DisableReplication*"],
      "Resource": "arn:aws:lambda:*:ACCOUNT:function:bhc-*"},
     {"Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
@@ -136,7 +171,7 @@ The simplest way is an admin of a test account. If you want less, this is the sh
 }
 ```
 
-`lambda:EnableReplication*` is what lets CloudFront replicate the edge function; `iam:CreateServiceLinkedRole` is needed the first time in an account (Lambda replication and CloudFront logging). `iam:PassRole` is limited to Lambda and to roles named `bhc-*`. CloudFront actions mostly cannot be limited by resource, which is one more reason to use a test account.
+`cloudformation:ValidateTemplate` cannot be limited by resource. `lambda:EnableReplication*` is what lets CloudFront replicate the edge function; `iam:CreateServiceLinkedRole` is needed the first time in an account (Lambda replication and CloudFront logging). `iam:PassRole` is limited to Lambda and to roles named `bhc-*`. CloudFront actions mostly cannot be limited by resource, which is one more reason to use a test account.
 
 ## Cache policy
 
@@ -162,6 +197,6 @@ tests/run.sh                  # shell tests (fake aws/curl/date/sleep/zip) + nod
 node --test tests/*.test.mjs  # only the edge function logic
 ```
 
-`tests/run.sh` covers (see the file for the full list; this is the shape): `--dry-run` makes no call except `sts get-caller-identity`; the typed phrase is required, exact and case sensitive; a full run where everything passes; a CDN that ignores the function (T-A FAIL), a function that rewrites errors (T-D FAIL), a function that keeps a stale config on an S3 failure (T-E FAIL), no answer at all (INCONCLUSIVE); teardown after an injected failure at the first, the middle and the last create call; teardown on SIGINT and SIGTERM, including a signal that arrives while the distribution or cache policy is being created; teardown never touches resources of another run id (and refuses a resource whose tag differs); `--cleanup` after a Lambda@Edge replica error; redaction of account ids, ARNs, access keys, hosts, tokens and the distribution id on screen and in the results file; the baked-in bucket in the packaged edge code; windows and midnight guard; the leftover-bucket case (created but never tagged), error-code based not-found, failed lookups keeping the state file, exit code 4 winning over 130, the account guard, reserved concurrency failing without aborting, the two roles and their policies, log group cleanup with look-alike names left alone, the T-B stray Miss, T-E with a missing key and with bad JSON, `--cleanup` without a state file, and an existing bucket of the same name stopping the run.
+`tests/run.sh` covers (see the file for the full list): `--dry-run` makes only read-only calls (identity, `validate-template`); the typed phrase is exact and case sensitive; a full run where everything passes, with ONE `create-stack` call and no hand-rolled resource creation; the stack parameters; a CDN that ignores the function or the cap (T-A, T-C, T-D, T-E, T-F FAIL), no answer at all (INCONCLUSIVE); teardown after an injected failure at the first change, the zip upload, `create-stack` and a stack that does not reach `CREATE_COMPLETE`; teardown on SIGINT and SIGTERM, before the stack exists, during `create-stack` and while waiting for it (the teardown messages must still reach the screen even when the signal arrives during a command whose output goes to `/dev/null`); never touching another run's stack or buckets, or one whose tag differs (and a "does not exist" message about another stack is not "already gone"); the untagged-artifact-bucket case; an existing bucket with a planned name stopping the run; a stack that fails to delete for another reason (reported, not retried); the Lambda@Edge replica case (retain, delete the leftovers, `--cleanup` with and without a state file, a second `--cleanup`); redaction of account ids, ARNs, access keys, hosts, tokens and the distribution id; the account guard; the run id format; leftover log groups; T-B stray Miss, T-E both cases, T-F; and a check that the template is consistent with the README (resource types, inline origin code identical to `origin/index.js` and under 4096 characters, no bucket policy, cache policy numbers) plus `cfn-lint` when it is installed.
 
 `tests/edge.test.mjs` covers: URI variants (`//`, `/./`, `/../`, `%`, trailing dot segments) never cached even with a default, case and no-slash look-alikes getting the default, the 256 KB and 1000 rule limits, the byte order mark, TTLs over 86400 skipped, path rules (longest prefix, exact beats prefix, case sensitivity, query string stripped, no match with and without a default, malformed rules skipped with only the index logged, the whole config cached once for several paths), the seconds-until-opening cap (1 s before the opening, exactly at `startMin`, last second before `endMin`, after the close to tomorrow's opening, midnight wrap, milliseconds floored, never negative or NaN, computed per request), inside, outside, `startMin` inclusive and `endMin` exclusive, 00:00 and 23:59, only 200/203/204/206 rewritten (4xx/5xx, redirects and 304 untouched), origin `private`/`no-store`/`no-cache` and `Set-Cookie` left untouched, S3 failure, bad JSON and out-of-range values, config memory cache of 30 seconds, no stale config after expiry, and that the error message is not logged. The fake `aws` and `curl` model CloudFront and S3 closely enough to exercise the script's logic; **they are not a proof of what real CloudFront does**. That is what the real run is for.

@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Business-hours cache sample. A Lambda@Edge origin-response function sets Cache-Control from a window kept in S3:
+  no cache inside the window, long cache outside (capped to the time until the window opens). Test origin = Lambda function URL.
+  MUST be deployed in us-east-1 (Lambda@Edge functions can only be created there).
+
+# Deploy by hand (without run-test.sh), see README "Use the template by itself":
+#   1. zip edge/index.mjs (with __CONFIG_BUCKET__ and __CONFIG_KEY__ replaced) and put it in an S3 bucket in us-east-1
+#   2. aws cloudformation create-stack --region us-east-1 --stack-name bhc-<RunId> --template-body file://cfn/stack.yaml
+#        --capabilities CAPABILITY_NAMED_IAM --parameters ParameterKey=RunId,ParameterValue=<RunId> ...
+#   3. upload your window JSON to s3://<ConfigBucketName>/<ConfigKey>
+
+Parameters:
+  RunId:
+    Type: String
+    Description: Short id used in every resource name and as the RunId tag, for example 2610101200-ab12.
+    AllowedPattern: '[0-9]{10}-[0-9a-f]{4}'
+    ConstraintDescription: ten digits, a dash, four lowercase hex characters
+  ConfigBucketName:
+    Type: String
+    Description: Name of the (new) bucket that holds the window JSON. The edge code has this name baked in, so it is a parameter.
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
+  ConfigKey:
+    Type: String
+    Default: window.json
+    Description: Object key of the window JSON. Also baked into the edge code.
+  CodeBucket:
+    Type: String
+    Description: Existing bucket in us-east-1 that holds the zip of the edge function.
+  CodeKey:
+    Type: String
+    Default: edge.zip
+    Description: Object key of the edge function zip.
+  OriginReservedConcurrency:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Reserved concurrency for the public test origin (0 = none). A cap on what a stranger who finds the URL can run up.
+      Many new accounts cannot reserve (the unreserved pool must keep 100), which is why the default is 0.
+
+Conditions:
+  ReserveOriginConcurrency: !Not [!Equals [!Ref OriginReservedConcurrency, 0]]
+
+Resources:
+
+  # ---- Config bucket: holds the window JSON. Private, encrypted, no bucket policy.
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ConfigBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+
+  # ---- Roles. The edge role may read ONE object (and list the bucket so that a missing key reads as NoSuchKey) and
+  #      write logs of its own log groups. The origin role writes logs only.
+  EdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bhc-${RunId}-erole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, edgelambda.amazonaws.com]   # Lambda@Edge needs both
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bhc-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/${ConfigKey}'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  # the edge function logs as /aws/lambda/us-east-1.<function> in the region of the edge location
+                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*bhc-${RunId}-*'
+                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*bhc-${RunId}-*:*'
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+
+  OriginRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bhc-${RunId}-orole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bhc-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bhc-${RunId}-origin'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bhc-${RunId}-origin:*'
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+
+  # ---- Test origin: returns {now, counter, nonce, path}, no Cache-Control, 500 on /err*.
+  #      Code is inline (it is tiny); it is a copy of origin/index.js (tests/run.sh checks they are identical).
+  OriginFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bhc-${RunId}-origin'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OriginRole.Arn
+      Timeout: 5
+      ReservedConcurrentExecutions: !If [ReserveOriginConcurrency, !Ref OriginReservedConcurrency, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+      Code:
+        ZipFile: |
+          // Test origin (Lambda function URL). Returns {now, counter, nonce, path} and NO Cache-Control header,
+          // so the Lambda@Edge function alone decides. A repeated nonce means CloudFront answered from its cache.
+          // The counter counts invocations of this execution environment. A path starting with /err answers 500.
+          // CommonJS on purpose: this file is pasted inline into cfn/stack.yaml (inline code is saved as index.js).
+          let counter = 0;
+          const instance = Math.random().toString(36).slice(2, 8);
+          exports.handler = async (event) => {
+            counter += 1;
+            const path = (event && event.rawPath) || '/';
+            const nonce = `${instance}-${counter}-${Math.random().toString(36).slice(2, 8)}`;
+            const body = JSON.stringify({ now: new Date().toISOString(), counter, nonce, path });
+            return {
+              statusCode: path.startsWith('/err') ? 500 : 200,
+              headers: { 'content-type': 'application/json' },
+              body,
+            };
+          };
+
+  # PUBLIC function URL: for this test only. For real use put it behind CloudFront origin access control with AuthType AWS_IAM.
+  OriginUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OriginFunction.Arn
+      AuthType: NONE
+
+  OriginUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  OriginInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OriginFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  # ---- The Lambda@Edge function (edge/index.mjs, zipped with the bucket and key baked in) and the published version
+  #      that CloudFront needs. The code is too big for inline ZipFile (4096 characters) and needs the S3 client, so it is a zip in S3.
+  EdgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bhc-${RunId}-edge'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt EdgeRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+
+  # Lambda@Edge replicas are removed by AWS some hours after the distribution is gone, so deleting the function and this
+  # version can fail with DELETE_FAILED. run-test.sh handles that (retain these resources, delete them later with --cleanup).
+  EdgeVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref EdgeFunction
+
+  # ---- Cache policy: min 0, default 0, max 86400; nothing but the path in the cache key.
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub 'bhc-${RunId}-cp'
+        Comment: !Sub 'bhc test ${RunId}'
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 86400            # rules in the window JSON must not use a TTL above this
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig: {HeaderBehavior: none}
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+
+  # ---- Distribution: origin = the function URL, the edge function on origin-response.
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - {Key: RunId, Value: !Ref RunId}
+        - {Key: Purpose, Value: bhc-test}
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'bhc test ${RunId}'
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: origin
+            DomainName: !Select [2, !Split ['/', !GetAtt OriginUrl.FunctionUrl]]   # https://<id>.lambda-url.<region>.on.aws/
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: origin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          CachePolicyId: !Ref CachePolicy
+          LambdaFunctionAssociations:
+            - EventType: origin-response
+              LambdaFunctionARN: !Ref EdgeVersion    # Ref of a Version is its ARN including the version number
+              IncludeBody: false
+        # CloudFront keeps a 500 for 10 s by default; 0 makes every request of the error test reach the origin.
+        CustomErrorResponses:
+          - ErrorCode: 500
+            ErrorCachingMinTTL: 0
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  OriginHost:
+    Value: !Select [2, !Split ['/', !GetAtt OriginUrl.FunctionUrl]]
+  ConfigBucket:
+    Value: !Ref ConfigBucket

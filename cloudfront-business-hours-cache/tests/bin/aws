@@ -54,77 +54,75 @@ case "$svc $cmd" in
     t="$(tagof s3 "$(arg --bucket "$@")")" || notfound NoSuchBucket
     [ -n "$t" ] || { echo "An error occurred (NoSuchTagSet) when calling the GetBucketTagging operation: The TagSet does not exist" >&2; exit 254; }
     echo "$t" ;;
-  "s3api put-object") cp "$(arg --body "$@")" "$S/s3obj"; cat "$S/s3obj" >> "$S/puts.log"; okjson ;;
+  "s3api put-object")
+    case "$(arg --bucket "$@")" in
+      *-art) cp "$(arg --body "$@")" "$S/art-object" ;;                                  # the edge zip
+      *) cp "$(arg --body "$@")" "$S/s3obj"; cat "$S/s3obj" >> "$S/puts.log" ;;           # the window config
+    esac; okjson ;;
   "s3api delete-object") rm -f "$S/s3obj"; echo "DELETE s3object $(arg --key "$@")" >> "$S/deleted.log"; okjson ;;
   "s3api delete-bucket") b="$(arg --bucket "$@")"; tagof s3 "$b" >/dev/null || notfound NoSuchBucket; del s3 "$b"; okjson ;;
-  # ---- IAM
-  "iam create-role") n="$(arg --role-name "$@")"; jq -e . "$(fileof --assume-role-policy-document "$@")" >/dev/null 2>&1 || { echo "stub: invalid trust JSON" >&2; exit 254; }; cp "$(fileof --assume-role-policy-document "$@")" "$S/trust-$n.json"; reg "$(tag_from "$@")" iam "$n"; echo "arn:aws:iam::$acct12:role/$n" ;;
-  "iam put-role-policy") jq -e . "$(fileof --policy-document "$@")" >/dev/null 2>&1 || { echo "stub: invalid policy JSON" >&2; exit 254; }; cp "$(fileof --policy-document "$@")" "$S/policy-$(arg --role-name "$@").json"; okjson ;;
+  # ---- IAM (only the retained edge role is ever touched directly)
   "iam list-role-tags") t="$(tagof iam "$(arg --role-name "$@")")" || notfound NoSuchEntity; echo "${t:-None}" ;;
   "iam delete-role-policy") okjson ;;
   "iam delete-role") n="$(arg --role-name "$@")"; tagof iam "$n" >/dev/null || notfound NoSuchEntity; del iam "$n"; okjson ;;
-  # ---- Lambda
-  "lambda create-function")
-    n="$(arg --function-name "$@")"; reg "$(tag_from "$@")" lambda "$n"
-    echo "arn:aws:lambda:us-east-1:$acct12:function:$n" ;;
-  "lambda wait") ;;
+  # ---- Lambda (the stack creates the functions; the script only reads tags, deletes the retained edge function, caps concurrency)
   "lambda put-function-concurrency") okjson ;;
+  "lambda get-function") t="$(tagof lambda "$(arg --function-name "$@")")" || notfound ResourceNotFoundException; echo "${t:-None}" ;;
+  "lambda delete-function")
+    n="$(arg --function-name "$@")"; tagof lambda "$n" >/dev/null || notfound ResourceNotFoundException
+    if [ "${STUB_REPLICA_FN:-0}" = 1 ]; then
+      echo "An error occurred (InvalidParameterValueException) when calling the DeleteFunction operation: Lambda was unable to delete arn:aws:lambda:us-east-1:$acct12:function:$n:1 because it is a replicated function. Please see our documentation for Deleting Lambda@Edge Functions and Replicas." >&2; exit 254
+    fi
+    del lambda "$n"; okjson ;;
   "ec2 describe-regions") echo "us-east-1	eu-west-1" ;;
   "logs describe-log-groups")
     for f in "$S/logs/$REG"/*; do [ -e "$f" ] || continue; g="$(basename "$f" | tr '%' '/')"; case "$g" in "$(arg --log-group-name-prefix "$@")"*) printf '%s\t' "$g" ;; esac; done; echo ;;
   "logs delete-log-group") g="$(arg --log-group-name "$@")"; rm -f "$S/logs/$REG/$(printf '%s' "$g" | tr '/' '%')"; echo "DELETE loggroup $REG $g" >> "$S/deleted.log"; okjson ;;
-  "resourcegroupstaggingapi get-resources")
-    want="$(arg --tag-filters "$@" | sed 's/.*Values=//')"
-    for f in "$S"/res/*__*; do
-      [ -e "$f" ] || continue; b="$(basename "$f")"; k="${b%%__*}"; n="${b#*__}"
-      [ "$(cat "$f")" = "$want" ] || continue
-      case " ${STUB_TAG_HIDE:-} " in *" $k "*) continue ;; esac   # STUB_TAG_HIDE="iam": the tag listing lags for that kind
-      case "$k" in
-        s3) printf 'arn:aws:s3:::%s\t' "$n" ;; iam) printf 'arn:aws:iam::%s:role/%s\t' "$acct12" "$n" ;;
-        lambda) printf 'arn:aws:lambda:us-east-1:%s:function:%s\t' "$acct12" "$n" ;; cf) printf 'arn:aws:cloudfront::%s:distribution/%s\t' "$acct12" "$n" ;;
-      esac
-    done; echo ;;
-  "lambda create-function-url-config") echo "https://$(fake_origin)/" ;;
-  "lambda add-permission") okjson ;;
-  "lambda publish-version") echo "arn:aws:lambda:us-east-1:$acct12:function:$(arg --function-name "$@"):1" ;;
-  "lambda get-function") t="$(tagof lambda "$(arg --function-name "$@")")" || notfound ResourceNotFoundException; echo "${t:-None}" ;;
-  "lambda delete-function")
-    n="$(arg --function-name "$@")"; tagof lambda "$n" >/dev/null || notfound ResourceNotFoundException
-    case "$n" in *-edge)
-      if [ "${STUB_REPLICA:-0}" = 1 ] || { [ -e "$S/cf_enabled" ] && [ ! -e "$S/dist_deleted" ]; }; then
-        echo "An error occurred (InvalidParameterValueException) when calling the DeleteFunction operation: Lambda was unable to delete arn:aws:lambda:us-east-1:$acct12:function:$n:1 because it is a replicated function. Please see our documentation for Deleting Lambda@Edge Functions and Replicas." >&2; exit 254
-      fi ;; esac
-    del lambda "$n"; okjson ;;
-  # ---- CloudFront
-  "cloudfront create-cache-policy")
-    f="$(fileof --cache-policy-config "$@")"; reg "$(jq -r '.Name' "$f")" cp CPFAKE1
-    echo CPFAKE1 ;;
-  "cloudfront get-cache-policy")
-    [ -e "$S/res/cp__$(arg --id "$@")" ] || notfound NoSuchCachePolicy
-    case "$q" in ETag) echo ETAGCP ;; *) cat "$S/res/cp__$(arg --id "$@")" ;; esac ;;
-  "cloudfront delete-cache-policy")
-    tagof cp "$(arg --id "$@")" >/dev/null || notfound NoSuchCachePolicy
-    if [ -e "$S/cf_enabled" ] && [ ! -e "$S/dist_deleted" ]; then echo "An error occurred (CachePolicyInUse)" >&2; exit 254; fi
-    del cp "$(arg --id "$@")"; okjson ;;
-  "cloudfront create-distribution-with-tags")
-    f="$(fileof --distribution-config-with-tags "$@")"
-    reg "$(jq -r '.Tags.Items[] | select(.Key=="RunId") | .Value' "$f")" cf "$(fake_dist_id)"; put cf_enabled true
-    if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '{"Distribution":{"Id":null,"DomainName":null}}'; else
-    jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" '{Distribution:{Id:$id,DomainName:$d}}'; fi ;;
-  "cloudfront list-distributions") if [ -e "$S/res/cf__$(fake_dist_id)" ]; then fake_dist_id; echo; else echo None; fi ;;
-  "cloudfront list-cache-policies") if [ -e "$S/res/cp__CPFAKE1" ]; then echo CPFAKE1; else echo None; fi ;;
-  "cloudfront get-distribution")
-    [ -e "$S/res/cf__$(arg --id "$@")" ] || notfound NoSuchDistribution
-    echo "arn:aws:cloudfront::$acct12:distribution/$(arg --id "$@")" ;;
-  "cloudfront list-tags-for-resource")
-    t="$(tagof cf "$(arg --resource "$@" | sed 's#.*/##')")" || notfound NoSuchDistribution; echo "${t:-None}" ;;
-  "cloudfront get-distribution-config")
-    [ -e "$S/res/cf__$(arg --id "$@")" ] || notfound NoSuchDistribution
-    if [ "$q" = ETag ]; then echo ETAGCF; else jq -n --argjson e "$(get cf_enabled true)" '{ETag:"ETAGCF",DistributionConfig:{Enabled:$e}}'; fi ;;
-  "cloudfront update-distribution") f="$(fileof --distribution-config "$@")"; put cf_enabled "$(jq -r '.Enabled' "$f")"; okjson ;;
-  "cloudfront wait") ;;
-  "cloudfront delete-distribution")
-    [ "$(get cf_enabled true)" = false ] || { echo "An error occurred (DistributionNotDisabled)" >&2; exit 254; }
-    del cf "$(arg --id "$@")"; : > "$S/dist_deleted"; okjson ;;
+  # ---- CloudFormation: a stack is a set of virtual resources (files under res/) with the stack's tag
+  "cloudformation validate-template")
+    f="$(fileof --template-body "$@")"; grep -q '^AWSTemplateFormatVersion' "$f" || { echo "An error occurred (ValidationError) when calling the ValidateTemplate operation: Template format error" >&2; exit 254; }
+    okjson ;;
+  "cloudformation create-stack")
+    n="$(arg --stack-name "$@")"; tag="$(tag_from "$@")"
+    jq -e . "$(fileof --parameters "$@")" >/dev/null 2>&1 || { echo "stub: invalid parameters JSON" >&2; exit 254; }
+    cp "$(fileof --parameters "$@")" "$S/stack-params.json"
+    case " $* " in *" CAPABILITY_NAMED_IAM "*) ;; *) echo "An error occurred (InsufficientCapabilitiesException) when calling the CreateStack operation" >&2; exit 254 ;; esac
+    reg "$tag" cfn "$n"; put stack_status CREATE_COMPLETE
+    rid="$(jq -r '.[] | select(.ParameterKey=="RunId") | .ParameterValue' "$S/stack-params.json")"
+    cfg="$(jq -r '.[] | select(.ParameterKey=="ConfigBucketName") | .ParameterValue' "$S/stack-params.json")"
+    for kv in "s3 $cfg" "iam bhc-$rid-erole" "iam bhc-$rid-orole" "lambda bhc-$rid-origin" "lambda bhc-$rid-edge" "cf $(fake_dist_id)"; do reg "$tag" "${kv%% *}" "${kv#* }"; done
+    put cf_enabled true
+    echo "arn:aws:cloudformation:us-east-1:$acct12:stack/$n/x" ;;
+  "cloudformation wait")
+    case "$1" in
+      stack-create-complete) if [ "${STUB_STACK_FAIL:-0}" = 1 ]; then echo "Waiter StackCreateComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi ;;
+      stack-delete-complete) if [ "$(get stack_status)" = DELETE_FAILED ]; then echo "Waiter StackDeleteComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi ;;
+    esac; exit 0 ;;
+  "cloudformation describe-stacks")
+    n="$(arg --stack-name "$@")"
+    [ -e "$S/res/cfn__$n" ] || { echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id $n does not exist" >&2; exit 254; }
+    case "$q" in
+      *StackStatus*) get stack_status; echo ;;
+      *Tags*) t="$(tagof cfn "$n")"; echo "${t:-None}" ;;
+      *Outputs*) if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '[{"OutputKey":"DistributionId","OutputValue":null}]'; else jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" --arg o "$(fake_origin)" '[{OutputKey:"DistributionId",OutputValue:$id},{OutputKey:"DistributionDomain",OutputValue:$d},{OutputKey:"OriginHost",OutputValue:$o}]'; fi ;;
+    esac ;;
+  "cloudformation describe-stack-resources")
+    if [ "$(get stack_status)" = DELETE_FAILED ]; then get fail_cause; echo; else echo; fi ;;
+  "cloudformation delete-stack")
+    n="$(arg --stack-name "$@")"; tagof cfn "$n" >/dev/null || { echo "An error occurred (ValidationError): Stack with id $n does not exist" >&2; exit 254; }
+    retain=0; case " $* " in *" --retain-resources "*) retain=1 ;; esac
+    if [ "${STUB_REPLICA:-0}" = 1 ] && [ "$retain" = 0 ]; then put stack_status DELETE_FAILED; put fail_cause EdgeVersion; exit 0; fi
+    # the config bucket must be empty
+    if [ -e "$S/s3obj" ]; then put stack_status DELETE_FAILED; put fail_cause ConfigBucket; echo "stub: bucket not empty" >&2; exit 0; fi
+    mytag="$(cat "$S/res/cfn__$n")"
+    for r in "$S"/res/*__*; do
+      [ -e "$r" ] || continue; b="$(basename "$r")"; k="${b%%__*}"; nm="${b#*__}"
+      case "$k" in cfn) continue ;; esac
+      case "$nm" in bhc-*-art) continue ;; esac            # not part of the stack
+      [ "$(cat "$r")" = "$mytag" ] || continue               # only what carries the stack's tag
+      if [ "$retain" = 1 ]; then case "$nm" in *-edge|*-erole) continue ;; esac; fi
+      del "$k" "$nm"
+    done
+    : > "$S/dist_deleted"; del cfn "$n"; put stack_status DELETE_COMPLETE ;;
   *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
 esac
