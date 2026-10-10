@@ -28,7 +28,10 @@ const CONFIG_BUCKET = '__CONFIG_BUCKET__';
 const CONFIG_KEY = '__CONFIG_KEY__';
 const CONFIG_CACHE_MS = 30000; // a good config is kept in memory this long
 const FAIL_CACHE_MS = 5000;    // a failure is remembered briefly, so an S3 outage does not mean one S3 call per request
-const MAX_TTL_SECONDS = 31536000;
+// TTLs above the cache policy MaxTTL (86400, see run-test.sh) would be cut down by CloudFront anyway: such a rule is malformed.
+const MAX_TTL_SECONDS = 86400;
+const MAX_CONFIG_BYTES = 256 * 1024;
+const MAX_RULES = 1000;
 const REWRITE_STATUS = new Set([200, 203, 204, 206]);
 export const FALLBACK_CACHE_CONTROL = 'public, max-age=0, s-maxage=0';
 
@@ -56,10 +59,13 @@ export function parsePattern(path) {
 // Returns {rules:[{path,prefix,key,window}], default: window|null}, or null when the text is not a usable config at all.
 // Bad rules are skipped; only the index is logged.
 export function parseConfig(text) {
+  if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > MAX_CONFIG_BYTES) { console.log('config too large'); return null; }
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);   // UTF-8 byte order mark (some editors add it)
   let c;
   try { c = JSON.parse(text); } catch { return null; }
   if (c === null || typeof c !== 'object' || Array.isArray(c)) return null;
   if (c.rules !== undefined && !Array.isArray(c.rules)) return null;
+  if (c.rules !== undefined && c.rules.length > MAX_RULES) { console.log('config too large'); return null; }
   const rules = [];
   (c.rules || []).forEach((r, i) => {
     const pat = r && typeof r === 'object' ? parsePattern(r.path) : null;
@@ -76,11 +82,15 @@ export function parseConfig(text) {
 }
 
 // The window for a request URI: query string stripped, exact path beats any prefix, the longest prefix wins, the first of
-// equal patterns wins, case-sensitive (the URI is matched as CloudFront gives it, not decoded). null = no rule, no default.
+// equal patterns wins, case-sensitive (the URI is matched as CloudFront gives it, not decoded or normalised).
+// null = no window: no rule and no default, OR a URI variant that must never be cached: an empty URI, "//", "/./", "/../",
+// a trailing "/." or "/..", or any "%" (an encoded path could be the same page as a rule's path, and we do not decode).
+// Anything else that matches no rule (for example /Prices/a, or /prices without the slash) gets "default".
 export function selectWindow(config, uri) {
   let path = typeof uri === 'string' ? uri : '';
   const q = path.indexOf('?');
   if (q !== -1) path = path.slice(0, q);
+  if (path === '' || path[0] !== '/' || /\/\/|\/\.\/|\/\.\.\/|\/\.{1,2}$|%/.test(path)) return null;
   let best = null;
   for (const r of config.rules) {
     if (r.prefix ? !path.startsWith(r.key) : path !== r.key) continue;

@@ -11,6 +11,8 @@ while [ $# -gt 0 ]; do
   case "$1" in -D) hdr="$2"; shift ;; -o) out="$2"; shift ;; --max-time) shift ;; -*) ;; *) url="$1" ;; esac
   shift
 done
+# STUB_CURL_FAIL_PATH=<path>: no answer for that one path
+if [ -n "${STUB_CURL_FAIL_PATH:-}" ] && [ "${url#*"$STUB_CURL_FAIL_PATH"}" != "$url" ]; then echo "curl: (28) timeout" >&2; exit 28; fi
 if [ "${STUB_CURL_DOWN:-0}" = 1 ]; then echo "curl: (7) could not connect" >&2; exit 7; fi
 case "$url" in "https://$(fake_domain)"/*) ;; *) echo "curl: (6) could not resolve host" >&2; exit 6 ;; esac
 prefix="https://$(fake_domain)/"; path="/${url#"$prefix"}"
@@ -61,7 +63,8 @@ if [ "$status" -lt 400 ] || [ "$mode" = rewrite-errors ]; then
         def win: ((.rules // []) | map(select((.path | endswith("*") | not) and .path == $p)) | .[0])
           // ((.rules // []) | map(select(.path as $pat | ($pat | endswith("*")) and ($p | startswith($pat[0:(($pat | length) - 1)])))) | sort_by(-(.path | length)) | .[0])
           // .default;
-        win as $w
+        ($p | test("//|/\\./|/\\.\\./|/\\.{1,2}$|%")) as $variant
+        | (if $variant then null else win end) as $w
         | if $w == null then 0
           elif ($s >= ($w.startMin * 60) and $s < ($w.endMin * 60)) then $w.inTtl
           else (if $s < ($w.startMin * 60) then ($w.startMin * 60) - $s else 86400 - $s + ($w.startMin * 60) end) as $until

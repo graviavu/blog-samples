@@ -88,7 +88,7 @@ Plan for run $id (every resource below is tagged RunId=$id and is deleted at the
   4. Lambda@Edge function   bhc-$id-edge         Node.js 22, us-east-1, one published version, origin-response
   5. Cache policy           bhc-$id-cp           min 0, default 0, max 86400; no query strings, headers or cookies in the key
   6. CloudFront distribution (PriceClass_100)    origin = the function URL, edge function on origin-response, 500 not cached
-Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-D error status, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
+Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-F URI variants, T-D error status, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
 Teardown: disable the distribution, wait, delete it, then the cache policy, both functions, both roles, the log groups and the bucket.
 Cost: an estimate of a few cents at most (a few hundred requests; Lambda@Edge, S3 and CloudFront free-tier or cent-level charges).
 Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to disable it).
@@ -216,13 +216,15 @@ set_rules() {
 }
 # One config for T-A, T-B and T-D, so one path is inside its window and others are outside at the SAME moment:
 #   /prices/*  window now-5 .. now+30 min   (inside)       /rates/*, /err*  window now-60 .. now-30 min (outside)
+#   default: the MOST RESTRICTIVE window (all day, never cached), which is what unmatched variants such as /Prices/a get
 ABD_READY=0
 setup_abd() {
   local m cfg; m="$(minute_of_day)"
   if [ "$m" -lt 60 ] || [ "$m" -gt 1410 ]; then return 0; fi
   cfg="$(jq -nc --argjson p "$(win_json $((m - 5)) $((m + 30)))" --argjson r "$(win_json $((m - 60)) $((m - 30)))" \
-    '{rules:[({path:"/prices/*"}+$p), ({path:"/rates/*"}+$r), ({path:"/err*"}+$r)]}')"
-  say "path rules: /prices/* is inside its window now, /rates/* and /err* are outside theirs"
+    '{rules:[({path:"/prices/*"}+$p), ({path:"/rates/*"}+$r), ({path:"/err*"}+$r)],
+      default:{startMin:0,endMin:1440,inTtl:0,outTtl:0}}')"
+  say "path rules: /prices/* is inside its window now, /rates/* and /err* are outside theirs, default = never cache"
   set_rules "$cfg" "/prices/* minutes $((m - 5))..$((m + 30)), /rates/* and /err* minutes $((m - 60))..$((m - 30)) (UTC)"
   ABD_READY=1
 }
@@ -234,28 +236,29 @@ csv() { local IFS=,; echo "$*"; }
 # req PATH -> R_ST R_XC R_AGE R_CC R_NONCE R_CNT. Returns 1 when there was no HTTP answer.
 req() {
   local h="$WORK/resp.h" b="$WORK/resp.b"
-  R_ST="" R_XC="" R_AGE="" R_CC="" R_NONCE="" R_CNT=""
+  R_ST="" R_XC="" R_AGE="" R_CC="" R_NONCE="" R_CNT="" R_PATH=""
   : > "$h"; : > "$b"
-  curl -sS -o "$b" -D "$h" --max-time 30 "https://$CF_DOMAIN$1" 2>"$WORK/curl.err" || return 1
+  curl -sS --path-as-is -o "$b" -D "$h" --max-time 30 "https://$CF_DOMAIN$1" 2>"$WORK/curl.err" || return 1
   R_ST="$(tr -d '\r' < "$h" | awk 'NR==1{print $2}')"
   R_XC="$(tr -d '\r' < "$h" | awk -F': ' 'tolower($1)=="x-cache"{print $2; exit}' | awk '{print $1}')"
   R_AGE="$(tr -d '\r' < "$h" | awk -F': ' 'tolower($1)=="age"{print $2; exit}')"
   R_CC="$(tr -d '\r' < "$h" | awk 'tolower(substr($0,1,14))=="cache-control:"{sub(/^[^:]*: */,""); print; exit}')"
   R_NONCE="$(jq -r '.nonce // empty' "$b" 2>/dev/null)"
   R_CNT="$(jq -r '.counter // empty' "$b" 2>/dev/null)"
+  R_PATH="$(jq -r '.path // empty' "$b" 2>/dev/null)"
   [ -n "$R_ST" ]
 }
 
 # series PATH N GAP -> S_ST S_XC S_AGE S_CC S_NONCE S_CNT (arrays), S_BAD=1 when a request got no answer
 series() {
   local i
-  S_ST=() S_XC=() S_AGE=() S_CC=() S_NONCE=() S_CNT=() S_BAD=0
+  S_ST=() S_XC=() S_AGE=() S_CC=() S_NONCE=() S_CNT=() S_PATH=() S_BAD=0
   for ((i = 0; i < $2; i++)); do
     [ "$i" -gt 0 ] && nap "$3"
     if req "$1"; then
-      S_ST+=("$R_ST"); S_XC+=("${R_XC:-none}"); S_AGE+=("${R_AGE:--}"); S_CC+=("$R_CC"); S_NONCE+=("$R_NONCE"); S_CNT+=("${R_CNT:-?}")
+      S_ST+=("$R_ST"); S_XC+=("${R_XC:-none}"); S_AGE+=("${R_AGE:--}"); S_CC+=("$R_CC"); S_NONCE+=("$R_NONCE"); S_CNT+=("${R_CNT:-?}"); S_PATH+=("${R_PATH:-?}")
     else
-      S_BAD=1; S_ST+=("000"); S_XC+=("none"); S_AGE+=("-"); S_CC+=(""); S_NONCE+=(""); S_CNT+=("?")
+      S_BAD=1; S_ST+=("000"); S_XC+=("none"); S_AGE+=("-"); S_CC+=(""); S_NONCE+=(""); S_CNT+=("?"); S_PATH+=("?")
     fi
   done
 }
@@ -285,13 +288,14 @@ t_a() {
   if [ "$ABD_READY" != 1 ]; then add_result T-A INCONCLUSIVE "$TOO_CLOSE"; return; fi
   say "T-A: /prices/* has now inside its window, 5 requests, every one must reach the origin"
   series /prices/a 5 1
-  local other_cc="" other_xc=""
-  if req /rates/a; then other_cc="$R_CC"; other_xc="$R_XC"; fi   # another path, outside its window, at the same moment
+  local other_cc="" other_xc="" other_ok=0
+  if req /rates/a && [ "$R_ST" = 200 ]; then other_cc="$R_CC"; other_xc="$R_XC"; other_ok=1; fi   # another path, outside its window, at the same moment
   if [ "$S_BAD" = 1 ] || ! all_status 200; then add_result T-A INCONCLUSIVE "no HTTP 200 from every request: status=[$(csv "${S_ST[@]}")]"
   elif has_hit "${S_XC[@]}"; then add_result T-A FAIL "a request was served from cache: $(meas)"
   elif [ "$(distinct "${S_NONCE[@]}")" != 5 ]; then add_result T-A FAIL "origin nonce repeated, so the origin was not hit every time: $(meas)"
   elif ! all_eq "$EXPECT_IN" "${S_CC[@]}"; then add_result T-A FAIL "viewer Cache-Control is not what the function sets: $(meas)"
   elif ! steps_of_one "${S_CNT[@]}"; then add_result T-A INCONCLUSIVE "distinct nonces but the counter did not step by 1 (new origin instance or other traffic): $(meas)"
+  elif [ "$other_ok" != 1 ]; then add_result T-A INCONCLUSIVE "the side request to /rates/a got no HTTP 200, so the two-paths part could not be checked: $(meas)"
   elif [ "$other_cc" != "$EXPECT_OUT" ]; then add_result T-A FAIL "at the same moment /rates/a (outside its window) should get s-maxage=$OUT_TTL, got \"$other_cc\": $(meas)"
   else add_result T-A PASS "/prices/a: $(meas); at the same moment /rates/a (outside its window): cache-control=\"$other_cc\" xcache=$other_xc"; fi
 }
@@ -328,6 +332,26 @@ t_d() {
   else add_result T-D PASS "status=500 on all, not cached for outTtl; $(meas)"; fi
 }
 
+# T-F: URI variants of a rule path (//prices/a, /Prices/a, /%70rices/a) during the /prices/* window. They must not get a long TTL.
+# They are matched raw: "//" and "%" variants get s-maxage=0, the case variant falls to "default" (here: never cache). The
+# origin shows the path CloudFront forwarded; the function's own view (cf.request.uri) is not visible from outside.
+t_f() {
+  local v seen="" bad=0 fail=0 why=""
+  if [ "$ABD_READY" != 1 ]; then add_result T-F INCONCLUSIVE "$TOO_CLOSE"; return; fi
+  say "T-F: URI variants of /prices/a must not be cached for long"
+  for v in //prices/a /Prices/a /%70rices/a; do
+    series "$v" 2 1
+    if [ "$S_BAD" = 1 ] || ! all_status 200; then bad=1; seen="$seen [$v: status=$(csv "${S_ST[@]}")]"; continue; fi
+    seen="$seen [$v -> origin saw ${S_PATH[0]}; cache-control=\"${S_CC[0]}\" xcache=$(csv "${S_XC[@]}")]"
+    if has_hit "${S_XC[@]}"; then fail=1; why="$why $v was served from cache;"; fi
+    if printf '%s\n' "${S_CC[@]}" | grep -Eq 's-maxage=[1-9]'; then fail=1; why="$why $v got a positive s-maxage;"; fi
+    note "T-F INFO: request $v reached the origin as path ${S_PATH[0]} (what CloudFront forwarded; the function's own cf.request.uri is not visible from outside)."
+  done
+  if [ "$fail" = 1 ]; then add_result T-F FAIL "$why$seen"
+  elif [ "$bad" = 1 ]; then add_result T-F INCONCLUSIVE "no HTTP 200 for some variant:$seen"
+  else add_result T-F PASS "not cached for long:$seen"; fi
+}
+
 # e_phase PATH: 3 requests while the window cannot be used -> E_RES, E_MEAS
 e_phase() {
   series "$1" 3 1
@@ -360,7 +384,7 @@ t_c() {
   local m start end open t0 ttl0 pre_age pre_xc post_xc post_cc post_age first_nonce c2a c2b t1
   m="$(minute_of_day)"
   if [ "$m" -gt 1375 ]; then add_result T-C INCONCLUSIVE "$TOO_CLOSE"; return; fi
-  say "T-C: window opens in about 2-3 minutes; an object cached just before must expire by the opening"
+  say "T-C: window opens about 80-140 s after the first request; an object cached just before must expire by the opening"
   start=$((m + 3)); end=$((start + 60))
   set_rules "$(jq -nc --argjson w "$(win_json "$start" "$end")" '{rules:[({path:"/c/*"}+$w)]}')" "/c/* opens at minute $start, closes at $end (UTC)"
   open=$(( $(day_start_epoch) + start * 60 ))
@@ -382,6 +406,9 @@ t_c() {
   wait_until_epoch $((open - 10))
   req /c/old || { add_result T-C INCONCLUSIVE "no answer for /c before the opening"; return; }
   pre_xc="$R_XC"; pre_age="${R_AGE:--}"
+  case "$(lc "$pre_xc")" in hit|refreshhit) ;; *) add_result T-C INCONCLUSIVE "10 s before the opening /c/old was not a Hit (xcache=$pre_xc): it expired early (clock skew or a very short TTL), so the Age check is not measurable"; return ;; esac
+  case "$pre_age" in ''|*[!0-9]*) add_result T-C INCONCLUSIVE "no numeric Age 10 s before the opening (age=$pre_age)"; return ;; esac
+  if [ "$pre_age" -gt "$ttl0" ]; then add_result T-C FAIL "Age $pre_age s before the opening is above the TTL $ttl0 s: served past its TTL"; return; fi
   wait_until_epoch $((open + 5))
   req /c/old || { add_result T-C INCONCLUSIVE "no answer for /c after the opening"; return; }
   t1="$(now_epoch)"; post_xc="$R_XC"; post_cc="$R_CC"; post_age="${R_AGE:--}"
@@ -411,11 +438,11 @@ run_tests() {
     nap 10
   done
   if [ "$i" -gt "$WARMUP_TRIES" ]; then
-    for m in T-A T-B T-D T-E T-C; do add_result "$m" INCONCLUSIVE "CloudFront did not answer 200 after the warm-up (origin, function URL permission or edge function problem)"; done
+    for m in T-A T-B T-D T-F T-E T-C; do add_result "$m" INCONCLUSIVE "CloudFront did not answer 200 after the warm-up (origin, function URL permission or edge function problem)"; done
     return
   fi
   setup_abd
-  t_a; t_b; t_d; t_e; t_c
+  t_a; t_b; t_d; t_f; t_e; t_c
 }
 
 # ---------------------------------------------------------------------------------------------------- report

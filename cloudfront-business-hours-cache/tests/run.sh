@@ -21,7 +21,7 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
@@ -100,8 +100,8 @@ check "the plan says it costs cents and takes 15-25 minutes" has "$OUT" "costs c
 echo "full run, everything works"
 reset_env; SEED=1 go happy "$PHRASE\n"
 check "exit 0" is "$RC" 0
-for t in T-A T-B T-C T-D T-E; do check "$t PASS in the table" grep -Eq "^$t +PASS" "$OUT"; done
-check "summary line PASS=5" has "$OUT" "PASS=5 FAIL=0 INCONCLUSIVE=0"
+for t in T-A T-B T-C T-D T-E T-F; do check "$t PASS in the table" grep -Eq "^$t +PASS" "$OUT"; done
+check "summary line PASS=5" has "$OUT" "PASS=6 FAIL=0 INCONCLUSIVE=0"
 check "results file written" test -n "$(first_res)"
 check "results file has the table and the T-C note" bash -c "grep -q '^| T-C | PASS' '$(first_res)' && grep -q 'was gone 5s after the opening' '$(first_res)'"
 check "results file says teardown complete" has "$(first_res)" "Complete: every resource"
@@ -143,7 +143,7 @@ check "T-D FAIL when errors get the long TTL" grep -Eq "^T-D +FAIL" "$OUT"
 reset_env; export STUB_CDN=stale-config; go stale "$PHRASE\n"
 check "T-E FAIL when a stale config is used after an S3 failure" grep -Eq "^T-E +FAIL" "$OUT"
 reset_env; export STUB_CURL_DOWN=1; go down "$PHRASE\n"
-check "no answer: all tests INCONCLUSIVE, rc 3" bash -c "[ '$(grep -cE '^T-. +INCONCLUSIVE' "$OUT")' = 5 ]"
+check "no answer: all tests INCONCLUSIVE, rc 3" bash -c "[ '$(grep -cE '^T-. +INCONCLUSIVE' "$OUT")' = 6 ]"
 check "no answer: rc 3" is "$RC" 3
 check "no answer: still torn down" has "$OUT" "teardown: complete"
 
@@ -324,6 +324,20 @@ check "screen summary names the log groups left, not just 'complete'" bash -c "g
 check "results file says the same" has "$(first_res)" "log groups left"
 reset_env; export STUB_FAIL=describe-regions; go noregions "$PHRASE\n"
 check "describe-regions failure is shown as not checked" bash -c "grep -q 'not-checked' '$OUT' && grep -q 'not-checked' '$(first_res)'"
+
+echo "review round: URI variants (T-F), side request, T-C age, config limits"
+reset_env; go tf "$PHRASE\n"
+check "T-F PASS in the table" grep -Eq "^T-F +PASS" "$OUT"
+check "T-F requests the three variants raw (curl --path-as-is)" bash -c "grep -q -- '--path-as-is' '$STUB_DIR/calls.log' && grep -q '//prices/a' '$STUB_DIR/calls.log' && grep -q '/Prices/a' '$STUB_DIR/calls.log' && grep -q '%70rices/a' '$STUB_DIR/calls.log'"
+check "T-F records the observed headers and what the origin saw" bash -c "grep -E '^T-F' '$OUT' | grep -q 'cache-control=' && grep -E '^T-F' '$OUT' | grep -q 'origin saw'"
+check "results file has the T-F INFO line" has "$(first_res)" "T-F INFO: request //prices/a reached the origin as path"
+check "the test config has a restrictive default" bash -c "grep -q '\"default\":{\"startMin\":0,\"endMin\":1440,\"inTtl\":0,\"outTtl\":0}' '$STUB_DIR/puts.log'"
+reset_env; export STUB_CDN=cacheall; go tf_fail "$PHRASE\n"
+check "T-F FAIL when variants are cached for long" grep -Eq "^T-F +FAIL" "$OUT"
+reset_env; export STUB_CURL_FAIL_PATH=/rates/a; go sidefail "$PHRASE\n"
+check "a failing /rates/a side request makes T-A INCONCLUSIVE, not FAIL" grep -Eq "^T-A +INCONCLUSIVE" "$OUT"
+check "...and nothing else is affected" bash -c "grep -Eq '^T-B +PASS' '$OUT' && grep -Eq '^T-F +PASS' '$OUT'"
+check "T-C: the Age before the opening is part of the measurement" bash -c "grep -E '^T-C +PASS' '$OUT' | grep -q 'age=[0-9]*s'"
 
 echo "review round: .gitignore"
 check "results and state files are git-ignored" bash -c "grep -q 'results-\*.md' '$root/.gitignore' && grep -q 'state-\*.env' '$root/.gitignore'"

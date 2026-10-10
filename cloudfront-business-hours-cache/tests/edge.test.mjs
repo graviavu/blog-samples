@@ -199,6 +199,27 @@ test('the query string is stripped before matching', () => {
   assert.deepEqual(pick(cfg, '/p/q?x=/a/b'), W1);
 });
 
+test('URI variants of a rule path are never cached, not even through the default', async () => {
+  const cfg = { rules: [rule('/prices/*', W1)], default: W2 };
+  for (const u of ['//prices/a', '/prices//a', '/./prices/a', '/x/../prices/a', '/prices/.', '/prices/..', '/prices/a/.', '/%70rices/a', '/prices%2fa',
+    '/prices/%61', '', 'prices/a', '/x/./y', '/x/../y', '/x//y', '/100%']) {
+    assert.equal(pick(cfg, u), null, JSON.stringify(u));
+    assert.equal(pick(cfg, `${u}?q=1`), null, `${u}?q=1`);
+  }
+  const { handler } = build({ text: JSON.stringify(cfg), time: at(0, 30) });
+  assert.equal(cc(await handler(ev('200', {}, '//prices/a'))), FALLBACK_CACHE_CONTROL);
+  assert.equal(cc(await handler(ev('200', {}, '/%70rices/a'))), FALLBACK_CACHE_CONTROL);
+});
+
+test('other unmatched variants (case, no slash) get the default, which is why the default should be the most restrictive window', () => {
+  const cfg = { rules: [rule('/prices/*', W1)], default: W2 };
+  assert.deepEqual(pick(cfg, '/Prices/a'), W2);
+  assert.deepEqual(pick(cfg, '/prices'), W2);
+  assert.deepEqual(pick(cfg, '/prices.html'), W2);
+  assert.equal(pick({ rules: [rule('/prices/*', W1)] }, '/Prices/a'), null);
+  assert.deepEqual(pick(cfg, '/prices/a.b..c/d'), W1);   // dots inside a name are not dot segments
+});
+
 test('no match: the default if there is one, otherwise null', () => {
   assert.deepEqual(pick({ rules: [rule('/a/*', W1)], default: W2 }, '/other'), W2);
   assert.equal(pick({ rules: [rule('/a/*', W1)] }, '/other'), null);
@@ -254,6 +275,37 @@ test('a malformed default is skipped but the rules still work', async () => {
   const { handler } = build({ text, time: at(0, 30) });
   assert.equal(cc(await handler(ev('200', {}, '/a/x'))), OUT);
   assert.equal(cc(await handler(ev('200', {}, '/zzz'))), FALLBACK_CACHE_CONTROL);
+});
+
+test('a config over 256 KB or with more than 1000 rules is refused; only "config too large" is logged', async () => {
+  const logs = [];
+  const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const many = (n) => JSON.stringify({ rules: Array.from({ length: n }, (_, i) => rule(`/p${i}/*`)) });
+    assert.notEqual(parseConfig(many(1000)), null);
+    assert.equal(parseConfig(many(1001)), null);
+    const big = JSON.stringify({ default: W1, pad: 'x'.repeat(256 * 1024) });
+    assert.equal(parseConfig(big), null);
+    const { handler } = build({ text: big, time: at(0, 30) });
+    assert.equal(cc(await handler(ev())), FALLBACK_CACHE_CONTROL);
+  } finally { console.log = orig; }
+  assert.ok(logs.some((l) => l === 'config too large'));
+  assert.ok(!logs.some((l) => l.includes('/p1/') || l.includes('xxxx')), 'content is never logged');
+});
+
+test('a UTF-8 byte order mark in front of the JSON is ignored', () => {
+  const c = parseConfig('\uFEFF' + JSON.stringify({ rules: [rule('/a/*')] }));
+  assert.equal(c.rules.length, 1);
+});
+
+test('TTLs above 86400 (the cache policy MaxTTL) make the rule malformed; 86400 is fine', () => {
+  const logs = [];
+  const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  let c;
+  try { c = parseConfig(JSON.stringify({ rules: [rule('/a/*', { ...W1, outTtl: 86400 }), rule('/b/*', { ...W1, outTtl: 86401 }), rule('/c/*', { ...W1, inTtl: 86401 })] })); }
+  finally { console.log = orig; }
+  assert.deepEqual(c.rules.map((r) => r.path), ['/a/*']);
+  assert.ok(logs.some((l) => l.includes('rule 1 ')) && logs.some((l) => l.includes('rule 2 ')));
 });
 
 test('the whole config is cached once for different paths', async () => {
