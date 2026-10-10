@@ -21,7 +21,7 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_REPLICA STUB_REPLICA_FN STUB_STATUS_SEQ STUB_INIT_STATUS EDGE_RUNTIME ORIGIN_RUNTIME PERMISSIONS_BOUNDARY_ARN SETTLE_POLLS STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_ERR_PRESTORE STUB_REPLICA STUB_REPLICA_FN STUB_STATUS_SEQ STUB_INIT_STATUS EDGE_RUNTIME ORIGIN_RUNTIME PERMISSIONS_BOUNDARY_ARN SETTLE_POLLS STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
@@ -105,6 +105,7 @@ echo "full run, everything works"
 reset_env; SEED=1 go happy "$PHRASE\n"
 check "exit 0" is "$RC" 0
 for t in T-A T-B T-C T-D T-E T-F; do check "$t PASS in the table" grep -Eq "^$t +PASS" "$OUT"; done
+check "T-D: 500 each time, a fresh origin answer 16 s after the first, the cached copy allowed (default 10 s)" bash -c "grep -E '^T-D +PASS' '$OUT' | grep -q 'new nonce' && grep -E '^T-D +PASS' '$OUT' | grep -q 'default 5xx caching is 10 s'"
 check "summary line PASS=6" has "$OUT" "PASS=6 FAIL=0 INCONCLUSIVE=0"
 check "results file written" test -n "$(first_res)"
 check "results file has the table and the T-C note" bash -c "grep -q '^| T-C | PASS' '$(first_res)' && grep -q 'was gone 5s after the opening' '$(first_res)'"
@@ -151,7 +152,7 @@ check "the edge function is Python: handler index.lambda_handler, runtime parame
 check "edge role trusts edgelambda, origin role does not" bash -c "[ \$(grep -c edgelambda.amazonaws.com '$TPL') = 1 ]"
 check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL' && grep -q 'log-group:/aws/lambda/\*bhc-\${RunId}-\*' '$TPL'"
 check "cache policy: min 0, default 0, max 86400, nothing in the key" bash -c "grep -q 'MinTTL: 0' '$TPL' && grep -q 'DefaultTTL: 0' '$TPL' && grep -q 'MaxTTL: 86400' '$TPL' && grep -q 'HeaderBehavior: none' '$TPL' && grep -q 'QueryStringBehavior: none' '$TPL'"
-check "distribution: edge function on origin-response, 500 not cached" bash -c "grep -q 'EventType: origin-response' '$TPL' && grep -q 'ErrorCachingMinTTL: 0' '$TPL'"
+check "distribution: edge function on origin-response; no custom error responses (CloudFront's 10 s default for a 5xx is what T-D relies on)" bash -c "grep -q 'EventType: origin-response' '$TPL' && ! grep -v '^ *#' '$TPL' | grep -q 'CustomErrorResponses' && ! grep -q IncludeBody '$TPL'"
 if command -v cfn-lint >/dev/null 2>&1; then
   check "cfn-lint is clean on cfn/stack.yaml" cfn-lint "$TPL"
 else
@@ -168,6 +169,10 @@ check "without the cap an object cached before the opening is served after it: T
 check "...and the message says the TTL is not capped" has "$OUT" "not capped to the time until the opening"
 reset_env; export STUB_CDN=rewrite-errors; go rewrite "$PHRASE\n"
 check "T-D FAIL when errors get the long TTL" grep -Eq "^T-D +FAIL" "$OUT"
+reset_env; export STUB_CDN=errlong; go errlong "$PHRASE\n"
+check "T-D FAIL when an error is held much longer than CloudFront's 10 s default" bash -c "grep -Eq '^T-D +FAIL' '$OUT' && grep -q 'still served from cache 16 s after' '$OUT'"
+reset_env; export STUB_ERR_PRESTORE=1; go errpre "$PHRASE\n"
+check "T-D INCONCLUSIVE when the first answer already has an Age (timing cannot be established)" grep -Eq "^T-D +INCONCLUSIVE" "$OUT"
 reset_env; export STUB_CDN=stale-config; go stale "$PHRASE\n"
 check "T-E FAIL when a stale config is used after an S3 failure" grep -Eq "^T-E +FAIL" "$OUT"
 reset_env; export STUB_CURL_DOWN=1; go down "$PHRASE\n"

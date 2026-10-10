@@ -37,9 +37,16 @@ if [ -e "$key" ]; then   # cached?
   stored="$(sed -n 1p "$key")"; ttl="$(sed -n 2p "$key")"; cc="$(sed -n 3p "$key")"
   if [ "$now" -lt $((stored + ttl)) ]; then
     if [ "${STUB_STRAY_MISS:-}" = "$path:$nreq" ]; then emit 200 Miss "" "$cc" "$(sed -n 4p "$key")"; exit 0; fi
+    st="$(sed -n 5p "$key")"
+    if [ "${st:-200}" -ge 400 ]; then emit "$st" Error $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0; fi   # a cached error says "Error from cloudfront"
     emit 200 Hit $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0
   fi
   rm -f "$key"
+fi
+
+# STUB_ERR_PRESTORE=1: the first /err answer is a copy cached by an earlier request (it has an Age)
+if [ "${STUB_ERR_PRESTORE:-0}" = 1 ] && [ "$path" = /err ] && [ "$(get prestored 0)" = 0 ]; then
+  put prestored 1; emit 500 Error 3 "" '{"nonce":"old","path":"/err"}'; exit 0
 fi
 
 # origin: counts its calls, unique nonce per call, 500 on /err*
@@ -80,6 +87,14 @@ fi
 # CloudFront caches only what the policy allows: status < 400 and s-maxage > 0
 ttl="${cc##*s-maxage=}"
 if [ -n "$cc" ] && [ "$status" -lt 400 ] && [ "${ttl:-0}" -gt 0 ] 2>/dev/null; then
-  printf '%s\n%s\n%s\n%s\n' "$now" "$ttl" "$cc" "$body" > "$key"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$now" "$ttl" "$cc" "$body" "$status" > "$key"
+fi
+if [ "$status" -ge 400 ]; then
+  # CloudFront caches a 5xx for the larger of its default 10 s and any s-maxage the origin response carries.
+  # STUB_CDN=errlong: it holds the error for 14400 s (what T-D must catch).
+  etl=10; case "$ttl" in ''|*[!0-9]*) ;; *) [ "$ttl" -gt "$etl" ] && etl="$ttl" ;; esac
+  [ "$mode" = errlong ] && etl=14400
+  printf '%s\n%s\n%s\n%s\n%s\n' "$now" "$etl" "$cc" "$body" "$status" > "$key"
+  emit "$status" Error "" "$cc" "$body"; exit 0
 fi
 emit "$status" Miss "" "$cc" "$body"

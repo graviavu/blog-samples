@@ -298,12 +298,8 @@ Resources:
           LambdaFunctionAssociations:
             - EventType: origin-response
               LambdaFunctionARN: !Ref EdgeVersion    # Ref of a Version is its ARN including the version number
-        # To my reading of the CloudFront docs (not re-checked), CloudFront caches an origin error for a short default time (10 s).
-        # 0 makes every request of the error test (T-D) reach the origin. Unverified; if it is unwanted, delete this block and
-        # make T-D look at x-cache/age instead.
-        CustomErrorResponses:
-          - ErrorCode: 500
-            ErrorCachingMinTTL: 0
+        # No CustomErrorResponses: CloudFront caches a 5xx from the origin for its default of 10 seconds (or the origin's own
+        # max-age/s-maxage if that is longer; the edge function never rewrites statuses >= 400). T-D relies on exactly that.
 
 Outputs:
   DistributionId:

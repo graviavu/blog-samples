@@ -104,7 +104,7 @@ Plan for run $id: ONE CloudFormation stack bhc-$id (cfn/stack.yaml), tagged RunI
     Lambda (origin)         bhc-$id-origin  Node.js 22, inline code, PUBLIC function URL (test only)
     Lambda@Edge function    bhc-$id-edge    Node.js 22, us-east-1, code from the art bucket, plus one published version
     Cache policy            bhc-$id-cp      min 0, default 0, max 86400; no query strings, headers or cookies in the key
-    CloudFront distribution (PriceClass_100) origin = the function URL, edge function on origin-response, 500 not cached
+    CloudFront distribution (PriceClass_100) origin = the function URL, edge function on origin-response (CloudFront caches a 500 for its default 10 s)
   Then: a best-effort reserved concurrency of 5 on the origin, and the window JSON uploaded by this script.
 Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-F URI variants, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
 Teardown: empty the config bucket, delete the stack (CloudFormation disables and deletes the distribution), delete the art bucket, the log groups.
@@ -298,12 +298,25 @@ t_b() {
 t_d() {
   say "T-D: origin answers 500 on /err (a rule for /err* is outside its window); the long TTL must not be applied or cached"
   if [ "$ABD_READY" != 1 ]; then add_result T-D INCONCLUSIVE "$TOO_CLOSE"; return; fi
-  series /err 3 1
-  if [ "$S_BAD" = 1 ] || ! all_status 500; then add_result T-D INCONCLUSIVE "expected HTTP 500 from every request: status=[$(csv "${S_ST[@]}")]"
-  elif has_hit "${S_XC[@]}"; then add_result T-D FAIL "the 500 was served from cache: $(meas)"
-  elif printf '%s\n' "${S_CC[@]}" | grep -q 's-maxage=14400'; then add_result T-D FAIL "the function rewrote an error response: $(meas)"
-  elif [ "$(distinct "${S_NONCE[@]}")" != 3 ]; then add_result T-D FAIL "origin nonce repeated for the 500: $(meas)"
-  else add_result T-D PASS "status=500 on all, not cached for outTtl; $(meas)"; fi
+  # CloudFront caches a 5xx for 10 s by default, so: two requests 1 s apart (the second may be the cached copy), then one 16 s after the
+  # first (it must be a fresh answer from the origin), then one more. No Age may be above ~15 s.
+  local first_nonce n3 a3 a4="-" ages
+  series /err 2 1
+  if [ "$S_BAD" = 1 ] || ! all_status 500; then add_result T-D INCONCLUSIVE "expected HTTP 500 from every request: status=[$(csv "${S_ST[@]}")]"; return; fi
+  first_nonce="${S_NONCE[0]}"
+  if [ "${S_AGE[0]}" != "-" ]; then add_result T-D INCONCLUSIVE "the first answer already carries Age ${S_AGE[0]}: the timing cannot be established (an earlier request cached it)"; return; fi
+  nap 15
+  if ! req /err || [ "$R_ST" != 500 ]; then add_result T-D INCONCLUSIVE "no HTTP 500 for the request 16 s later (status=${R_ST:-none})"; return; fi
+  n3="$R_NONCE"; a3="${R_AGE:--}"
+  ages="age=[$(csv "${S_AGE[@]}"),$a3"
+  if req /err && [ "$R_ST" = 500 ]; then a4="${R_AGE:--}"; ages="$ages,$a4"; fi
+  ages="$ages]"
+  if printf '%s\n' "${S_CC[@]}" "$R_CC" | grep -q 's-maxage=14400'; then add_result T-D FAIL "the function rewrote an error response: $(meas)"
+  elif [ "$n3" = "$first_nonce" ] || { [ "$a3" != "-" ] && [ "$a3" -ge 10 ] 2>/dev/null; }; then
+    add_result T-D FAIL "the 500 was still served from cache 16 s after the first answer (same nonce or Age $a3): cached longer than CloudFront's 10 s default; $ages"
+  elif printf '%s\n' "${S_AGE[@]}" "$a3" "$a4" | awk '$1 ~ /^[0-9]+$/ && $1 > 15 {f=1} END {exit !f}'; then
+    add_result T-D FAIL "an Age above 15 s on a 500: $ages"
+  else add_result T-D PASS "status 500 each time, no s-maxage=14400, a fresh origin answer 16 s after the first (new nonce); CloudFront's default 5xx caching is 10 s; $ages"; fi
 }
 
 # T-F: URI variants of a rule path (//prices/a, /Prices/a, /%70rices/a) during the /prices/* window. They must not get a long TTL.
