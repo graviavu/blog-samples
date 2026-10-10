@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake zip: "zip -q -j OUT FILE" keeps a copy of FILE in $STUB_DIR/zipped/ so the tests can look at the packaged code.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+out="$3"; src="$4"
+mkdir -p "$S/zipped"; cp "$src" "$S/zipped/$(basename "$out" .zip)-$(basename "$src")"
+echo zip > "$out"

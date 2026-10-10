@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls run-test.sh makes; anything else exits 99.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
+[ "$1" = "--region" ] && shift 2
+svc="$1"; cmd="$2"; shift 2
+echo "$svc $cmd $*" >> "$S/calls.log"
+mkdir -p "$S/res"
+q="$(arg --query "$@")"
+acct12="$(acct)"
+
+# --- failure and signal injection ---------------------------------------------------------------------------------------
+# STUB_FAIL=<cmd>[:<n>]  the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
+# STUB_SIG=INT|TERM STUB_SIG_AT=<cmd>  signal the script (once) during that command.
+if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
+  n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
+  want="${STUB_FAIL#*:}"; [ "$want" = "$STUB_FAIL" ] && want=1
+  if [ "$n" = "$want" ]; then
+    echo "An error occurred (AccessDenied) when calling $cmd: arn:aws:iam::$acct12:role/x not allowed, account $acct12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(fake_domain), $(fake_origin), x-amz-security-token: $(printf '%s' abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ)" >&2
+    exit 254
+  fi
+fi
+if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT:-}" ] && [ ! -e "$S/sig_done" ]; then
+  : > "$S/sig_done"; kill -"$STUB_SIG" "${RT_MAIN_PID:?}"; sleep 0.2
+fi
+
+fileof() { local f; f="$(arg "$1" "${@:2}")"; echo "${f#file://}"; }
+tag_from() { # extracts the RunId value from: Key=RunId,Value=X   or   RunId=X   or   {Key=RunId,Value=X}
+  local t; t="$(printf '%s' "$*" | sed -n 's/.*RunId,Value=\([A-Za-z0-9-]*\).*/\1/p' | head -n 1)"
+  [ -n "$t" ] || t="$(printf '%s' "$*" | sed -n 's/.*RunId=\([A-Za-z0-9-]*\).*/\1/p' | head -n 1)"
+  printf '%s' "$t"
+}
+notfound() { echo "An error occurred ($1) when calling the $cmd operation: The specified resource does not exist (arn:aws:x::$acct12:y)" >&2; exit 254; }
+reg() { echo "$1" > "$S/res/$2__$3"; }          # tag kind name
+tagof() { # kind name
+  [ -e "$S/res/$1__$2" ] || return 1
+  if [ "${STUB_FOREIGN_TAG:-}" = "$1" ]; then echo OTHERRUN; else cat "$S/res/$1__$2"; fi
+}
+del() { rm -f "$S/res/$1__$2"; echo "DELETE $1 $2" >> "$S/deleted.log"; }
+okjson() { echo '{}'; }
+
+case "$svc $cmd" in
+  "sts get-caller-identity") echo "$acct12" ;;
+  # ---- S3
+  "s3api create-bucket") reg "" s3 "$(arg --bucket "$@")"; okjson ;;
+  "s3api put-public-access-block") okjson ;;
+  "s3api put-bucket-tagging") b="$(arg --bucket "$@")"; reg "$(tag_from "$@")" s3 "$b"; okjson ;;
+  "s3api get-bucket-tagging") t="$(tagof s3 "$(arg --bucket "$@")")" || notfound NoSuchBucket; echo "${t:-None}" ;;
+  "s3api put-object") cp "$(arg --body "$@")" "$S/s3obj"; cat "$S/s3obj" >> "$S/puts.log"; okjson ;;
+  "s3api delete-object") rm -f "$S/s3obj"; echo "DELETE s3object $(arg --key "$@")" >> "$S/deleted.log"; okjson ;;
+  "s3api delete-bucket") b="$(arg --bucket "$@")"; tagof s3 "$b" >/dev/null || notfound NoSuchBucket; del s3 "$b"; okjson ;;
+  # ---- IAM
+  "iam create-role") n="$(arg --role-name "$@")"; reg "$(tag_from "$@")" iam "$n"; echo "arn:aws:iam::$acct12:role/$n" ;;
+  "iam put-role-policy") okjson ;;
+  "iam list-role-tags") t="$(tagof iam "$(arg --role-name "$@")")" || notfound NoSuchEntity; echo "${t:-None}" ;;
+  "iam delete-role-policy") okjson ;;
+  "iam delete-role") n="$(arg --role-name "$@")"; tagof iam "$n" >/dev/null || notfound NoSuchEntity; del iam "$n"; okjson ;;
+  # ---- Lambda
+  "lambda create-function")
+    n="$(arg --function-name "$@")"; reg "$(tag_from "$@")" lambda "$n"
+    echo "arn:aws:lambda:us-east-1:$acct12:function:$n" ;;
+  "lambda wait") ;;
+  "lambda create-function-url-config") echo "https://$(fake_origin)/" ;;
+  "lambda add-permission") okjson ;;
+  "lambda publish-version") echo "arn:aws:lambda:us-east-1:$acct12:function:$(arg --function-name "$@"):1" ;;
+  "lambda get-function") t="$(tagof lambda "$(arg --function-name "$@")")" || notfound ResourceNotFoundException; echo "${t:-None}" ;;
+  "lambda delete-function")
+    n="$(arg --function-name "$@")"; tagof lambda "$n" >/dev/null || notfound ResourceNotFoundException
+    case "$n" in *-edge)
+      if [ "${STUB_REPLICA:-0}" = 1 ] || { [ -e "$S/cf_enabled" ] && [ ! -e "$S/dist_deleted" ]; }; then
+        echo "An error occurred (InvalidParameterValueException) when calling the DeleteFunction operation: Lambda was unable to delete arn:aws:lambda:us-east-1:$acct12:function:$n:1 because it is a replicated function. Please see our documentation for Deleting Lambda@Edge Functions and Replicas." >&2; exit 254
+      fi ;; esac
+    del lambda "$n"; okjson ;;
+  # ---- CloudFront
+  "cloudfront create-cache-policy")
+    f="$(fileof --cache-policy-config "$@")"; reg "$(jq -r '.Name' "$f")" cp CPFAKE1
+    echo CPFAKE1 ;;
+  "cloudfront get-cache-policy")
+    [ -e "$S/res/cp__$(arg --id "$@")" ] || notfound NoSuchCachePolicy
+    case "$q" in ETag) echo ETAGCP ;; *) cat "$S/res/cp__$(arg --id "$@")" ;; esac ;;
+  "cloudfront delete-cache-policy")
+    tagof cp "$(arg --id "$@")" >/dev/null || notfound NoSuchCachePolicy
+    if [ -e "$S/cf_enabled" ] && [ ! -e "$S/dist_deleted" ]; then echo "An error occurred (CachePolicyInUse)" >&2; exit 254; fi
+    del cp "$(arg --id "$@")"; okjson ;;
+  "cloudfront create-distribution-with-tags")
+    f="$(fileof --distribution-config-with-tags "$@")"
+    reg "$(jq -r '.Tags.Items[] | select(.Key=="RunId") | .Value' "$f")" cf "$(fake_dist_id)"; put cf_enabled true
+    jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" '{Distribution:{Id:$id,DomainName:$d}}' ;;
+  "cloudfront list-distributions") if [ -e "$S/res/cf__$(fake_dist_id)" ]; then fake_dist_id; echo; else echo None; fi ;;
+  "cloudfront list-cache-policies") if [ -e "$S/res/cp__CPFAKE1" ]; then echo CPFAKE1; else echo None; fi ;;
+  "cloudfront get-distribution")
+    [ -e "$S/res/cf__$(arg --id "$@")" ] || notfound NoSuchDistribution
+    echo "arn:aws:cloudfront::$acct12:distribution/$(arg --id "$@")" ;;
+  "cloudfront list-tags-for-resource")
+    t="$(tagof cf "$(arg --resource "$@" | sed 's#.*/##')")" || notfound NoSuchDistribution; echo "${t:-None}" ;;
+  "cloudfront get-distribution-config")
+    [ -e "$S/res/cf__$(arg --id "$@")" ] || notfound NoSuchDistribution
+    if [ "$q" = ETag ]; then echo ETAGCF; else jq -n --argjson e "$(get cf_enabled true)" '{ETag:"ETAGCF",DistributionConfig:{Enabled:$e}}'; fi ;;
+  "cloudfront update-distribution") f="$(fileof --distribution-config "$@")"; put cf_enabled "$(jq -r '.Enabled' "$f")"; okjson ;;
+  "cloudfront wait") ;;
+  "cloudfront delete-distribution")
+    [ "$(get cf_enabled true)" = false ] || { echo "An error occurred (DistributionNotDisabled)" >&2; exit 254; }
+    del cf "$(arg --id "$@")"; : > "$S/dist_deleted"; okjson ;;
+  *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
+esac
