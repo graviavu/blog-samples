@@ -54,10 +54,14 @@ jobs:
         working-directory: cloudfront-request-routing
         run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint template.yaml template-lambda-edge.yaml"
 
+      - name: cfn-lint (business-hours-cache template)
+        working-directory: cloudfront-business-hours-cache
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/stack.yaml"
+
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws
+          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/*
 
       - name: verify.sh against the local mock (tests the script, not CloudFront)
         working-directory: cloudfront-request-routing
@@ -74,3 +78,11 @@ jobs:
       - name: teardown.sh guards against a fake aws CLI
         working-directory: cloudfront-request-routing
         run: test/teardown-test.sh
+
+      - name: business-hours-cache edge function unit tests (python unittest, no dependencies)
+        working-directory: cloudfront-business-hours-cache
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: business-hours-cache run-test.sh against fake aws, curl, date, sleep and zip
+        working-directory: cloudfront-business-hours-cache
+        run: tests/run.sh
