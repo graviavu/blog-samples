@@ -1,0 +1,5 @@
+From: promo@gadgetsonline.example
+Subject: Your cart misses you
+Date: 2026-10-09
+
+You left 1 item in your cart. Complete your order and get free shipping.

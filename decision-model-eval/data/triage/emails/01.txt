@@ -1,0 +1,5 @@
+From: billing@acme-hosting.example
+Subject: URGENT: payment failed, service suspends in 24h
+Date: 2026-10-09
+
+Hi Sam, the card on file was declined for the production hosting plan. Service will be suspended in 24 hours unless the payment method is updated. Please update it in the billing page today.

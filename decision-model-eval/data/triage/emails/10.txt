@@ -1,0 +1,5 @@
+From: hr@company.example
+Subject: Reminder: update your benefits selection this quarter
+Date: 2026-10-09
+
+Open enrollment closes at the end of the month. Please review your selections when convenient.

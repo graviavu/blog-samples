@@ -1,0 +1,5 @@
+From: newsletter@aiweekly.example
+Subject: AI Weekly #212: this week in agents
+Date: 2026-10-09
+
+Top stories: new small decision models, an agent framework release, and a long read on evals. Read online.

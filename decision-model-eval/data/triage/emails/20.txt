@@ -1,0 +1,5 @@
+From: team@project.example
+Subject: Retro notes from Tuesday
+Date: 2026-10-09
+
+Sharing notes from the retro. Action items are listed at the bottom; please skim when you can.

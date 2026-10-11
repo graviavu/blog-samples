@@ -1,0 +1,5 @@
+From: security@cloudco.example
+Subject: Security alert: new sign-in from unknown device
+Date: 2026-10-09
+
+We detected a sign-in to your account from a new device in another country at 03:14. If this was not you, reset your password immediately and revoke sessions.

@@ -1,0 +1,5 @@
+From: cfo@client.example
+Subject: Contract must be signed by 5pm today
+Date: 2026-10-09
+
+Sam, the vendor will withdraw the offer if the signed contract is not back by 5pm today. Please sign the attached PDF and reply.
