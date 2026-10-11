@@ -112,7 +112,8 @@ case "$svc $cmd" in
           i=$(get seq_n 0); put seq_n $((i + 1)); read -r -a seq_words <<< "$STUB_STATUS_SEQ"; w=${#seq_words[@]}; [ "$i" -lt "$w" ] || i=$((w - 1)); echo "${seq_words[$i]}"
         else get stack_status; echo; fi ;;
       *Tags*) t="$(tagof cfn "$n")"; echo "${t:-None}" ;;
-      *Outputs*) if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '[{"OutputKey":"DistributionId","OutputValue":null}]'; else jq -n --arg id "$(fake_dist_id)" --arg d "$(fake_domain)" --arg o "$(fake_origin)" '[{OutputKey:"DistributionId",OutputValue:$id},{OutputKey:"DistributionDomain",OutputValue:$d},{OutputKey:"OriginHost",OutputValue:$o}]'; fi ;;
+      *Outputs*) if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '[{"OutputKey":"DistributionId","OutputValue":null}]'; else dom="$(fake_domain)"; [ "${STUB_BAD_DOMAIN:-0}" = 1 ] && dom="evil.example.com"
+          jq -n --arg id "$(fake_dist_id)" --arg d "$dom" --arg o "$(fake_origin)" '[{OutputKey:"DistributionId",OutputValue:$id},{OutputKey:"DistributionDomain",OutputValue:$d},{OutputKey:"OriginHost",OutputValue:$o}]'; fi ;;
     esac ;;
   "cloudformation describe-stack-resources")
     if [ "$(get stack_status)" = DELETE_FAILED ]; then get fail_cause; echo; else echo; fi ;;

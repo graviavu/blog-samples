@@ -21,7 +21,7 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_ERR_PRESTORE STUB_REPLICA STUB_REPLICA_FN STUB_STATUS_SEQ STUB_INIT_STATUS EDGE_RUNTIME ORIGIN_RUNTIME PERMISSIONS_BOUNDARY_ARN SETTLE_POLLS STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
+  unset STUB_CURL_FAIL_PATH STUB_TAG_HIDE STUB_FAIL STUB_FAIL_CODE STUB_FAIL_TEXT STUB_STRAY_MISS STUB_DIST_NULL EXPECT_ACCOUNT_LAST4 STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_BAD_DOMAIN STUB_ERR_PRESTORE STUB_REPLICA STUB_REPLICA_FN STUB_STATUS_SEQ STUB_INIT_STATUS EDGE_RUNTIME ORIGIN_RUNTIME PERMISSIONS_BOUNDARY_ARN SETTLE_POLLS STUB_STACK_FAIL STUB_CDN STUB_CURL_DOWN STUB_START_EPOCH
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" SETTLE_SECS=40 EDGE_DELETE_PAUSE=1 WARMUP_TRIES=2
 }
@@ -82,11 +82,22 @@ check "dry run hides the account id" has "$OUT" "account \*\*\*\*"
 echo "dry run, near UTC midnight"
 reset_env; export STUB_START_EPOCH=1791592200   # 00:30 UTC
 go dry_mid "" --dry-run
-check "dry run warns about the time of day" has "$OUT" "01:30 and 22:00 UTC"
+check "dry run warns about the time of day" has "$OUT" "after 01:30 and before 22:00 UTC"
 check "dry run still only reads" only_sts
 go mid "$PHRASE\n"
 check "a real run near midnight refuses before creating anything" is "$RC" 2
 check "only read-only calls were made" only_sts
+
+echo "the time-of-day window is refused AT 01:30 and 22:00, allowed one minute inside"
+for spec in "5400:refused" "5460:ok" "79140:ok" "79200:refused"; do
+  off="${spec%%:*}"; want="${spec##*:}"
+  reset_env; export STUB_START_EPOCH=$((1791590400 + off)); go "tod_$off" "" --dry-run
+  if [ "$want" = refused ]; then check "$off s after 00:00 UTC: a real run would refuse (the dry run says so)" has "$OUT" "after 01:30 and before 22:00 UTC"
+  else check "$off s after 00:00 UTC: allowed (no warning)" hasnot "$OUT" "after 01:30 and before 22:00 UTC"; fi
+done
+reset_env; export STUB_START_EPOCH=$((1791590400 + 79200)); go tod_real "$PHRASE\n"
+check "at exactly 22:00 a real run refuses with rc 2 and creates nothing" bash -c "[ '$RC' = 2 ] && grep -q 'at or outside' '$OUT'"
+check "...only read-only calls" only_sts
 
 echo "typed confirmation"
 reset_env; go confirm_wrong "yes\n"
@@ -149,8 +160,12 @@ check "the origin sends no Cache-Control" hasnot "$root/origin/index.js" -i "cac
 check "the template creates the resources the README lists" bash -c "for t in AWS::S3::Bucket AWS::IAM::Role AWS::Lambda::Function AWS::Lambda::Url AWS::Lambda::Version AWS::Lambda::Permission AWS::CloudFront::CachePolicy AWS::CloudFront::Distribution; do grep -q \"Type: \$t\" '$TPL' || exit 1; done"
 check "config bucket: public access block, encryption, and no bucket policy but the TLS-only deny" bash -c "grep -q BlockPublicAcls '$TPL' && grep -q SSEAlgorithm '$TPL' && [ \$(grep -c 'Type: AWS::S3::BucketPolicy' '$TPL') = 1 ] && grep -q 'aws:SecureTransport' '$TPL'"
 check "the edge function is Python: handler index.lambda_handler, runtime parameter default python3.12" bash -c "grep -q 'Handler: index.lambda_handler' '$TPL' && grep -q 'Default: python3.12' '$TPL'"
+check "the edge role S3 grants have no s3:ResourceAccount condition (not verified for GetObject/ListBucket); one object, one bucket" bash -c "! grep -q 'ResourceAccount' '$TPL' && grep -c 's3:GetObject' '$TPL' | grep -q '^1$'"
+check "edge function timeout is 10 s; the origin keeps 5" bash -c "grep -A1 'Role: !GetAtt EdgeRole.Arn' '$TPL' | grep -q 'Timeout: 10' && grep -A1 'Role: !GetAtt OriginRole.Arn' '$TPL' | grep -q 'Timeout: 5'"
+check "PermissionsBoundary has an AllowedPattern for an IAM policy ARN (or empty)" bash -c "grep -A3 '^  PermissionsBoundary:' '$TPL' | grep -q \"AllowedPattern: '\\^\\$|\\^arn:aws\""
+check "edge role log permissions name the exact edge log group" bash -c "grep -q 'log-group:/aws/lambda/us-east-1.bhc-\${RunId}-edge' '$TPL' && ! grep -q 'lambda/\*bhc' '$TPL'"
 check "edge role trusts edgelambda, origin role does not" bash -c "[ \$(grep -c edgelambda.amazonaws.com '$TPL') = 1 ]"
-check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL' && grep -q 'log-group:/aws/lambda/\*bhc-\${RunId}-\*' '$TPL'"
+check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL'"
 check "cache policy: min 0, default 0, max 86400, nothing in the key" bash -c "grep -q 'MinTTL: 0' '$TPL' && grep -q 'DefaultTTL: 0' '$TPL' && grep -q 'MaxTTL: 86400' '$TPL' && grep -q 'HeaderBehavior: none' '$TPL' && grep -q 'QueryStringBehavior: none' '$TPL'"
 check "distribution: edge function on origin-response; no custom error responses (CloudFront's 10 s default for a 5xx is what T-D relies on)" bash -c "grep -q 'EventType: origin-response' '$TPL' && ! grep -v '^ *#' '$TPL' | grep -q 'CustomErrorResponses' && ! grep -q IncludeBody '$TPL'"
 if command -v cfn-lint >/dev/null 2>&1; then
@@ -387,6 +402,10 @@ reset_env; export STUB_CURL_FAIL_PATH=/rates/a; go sidefail "$PHRASE\n"
 check "a failing /rates/a side request makes T-A INCONCLUSIVE, not FAIL" grep -Eq "^T-A +INCONCLUSIVE" "$OUT"
 check "...and nothing else is affected" bash -c "grep -Eq '^T-B +PASS' '$OUT' && grep -Eq '^T-F +PASS' '$OUT'"
 check "T-C: the Age before the opening is part of the measurement" bash -c "grep -E '^T-C +PASS' '$OUT' | grep -q 'age=[0-9]*s'"
+reset_env; export STUB_BAD_DOMAIN=1; go baddomain "$PHRASE\n"
+check "a distribution domain that is not <id>.cloudfront.net is never requested" bash -c "grep -q 'does not look like' '$OUT' && ! grep -q '^curl ' '$STUB_DIR/calls.log' && grep -q 'teardown: complete' '$OUT'"
+reset_env; go plan_py "" --dry-run
+check "the plan names Python for the edge function and the TLS-only policy; no stale text" bash -c "grep -q 'python3.12' '$OUT' && grep -q 'TLS-only deny policy' '$OUT' && ! grep -q 'Node.js 22, us-east-1' '$OUT' && ! grep -q 'no bucket policy' '$OUT'"
 
 echo ".gitignore"
 check "results and state files are git-ignored" bash -c "grep -q 'results-\*.md' '$root/.gitignore' && grep -q 'state-\*.env' '$root/.gitignore'"

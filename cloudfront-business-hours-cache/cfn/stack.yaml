@@ -53,6 +53,7 @@ Parameters:
   PermissionsBoundary:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[\w+=,./@-]+$'
     Description: >-
       Optional ARN of an IAM permissions boundary policy for the two roles this stack creates (see README, "Running it as a
       person with limited rights"). Empty = none.
@@ -70,7 +71,7 @@ Conditions:
 
 Resources:
 
-  # ---- Config bucket: holds the window JSON. Private, encrypted, no bucket policy.
+  # ---- Config bucket: holds the window JSON. Private, encrypted, and one bucket policy statement: deny non-TLS requests.
   ConfigBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -128,19 +129,15 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/${ConfigKey}'
-                Condition:
-                  StringEquals: {'s3:ResourceAccount': !Ref 'AWS::AccountId'}
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
-                Condition:
-                  StringEquals: {'s3:ResourceAccount': !Ref 'AWS::AccountId'}
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource:
                   # the edge function logs as /aws/lambda/us-east-1.<function> in the region of the edge location
-                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*bhc-${RunId}-*'
-                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*bhc-${RunId}-*:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/us-east-1.bhc-${RunId}-edge'
+                  - !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/us-east-1.bhc-${RunId}-edge:*'
       Tags:
         - {Key: RunId, Value: !Ref RunId}
         - {Key: Purpose, Value: bhc-test}
@@ -237,7 +234,7 @@ Resources:
       Runtime: !Ref EdgeRuntime
       Handler: index.lambda_handler
       Role: !GetAtt EdgeRole.Arn
-      Timeout: 5
+      Timeout: 10      # a cold boto3 import plus the S3 call (1.5 s connect and read timeouts); the limit for origin events is 30 s
       MemorySize: 128
       Code:
         S3Bucket: !Ref CodeBucket

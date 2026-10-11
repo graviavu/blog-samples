@@ -175,7 +175,7 @@ owned() {
 }
 
 # ---------------------------------------------------------------------------------------------------- teardown
-# The stack owns everything except the artifact bucket (and, in the Lambda@Edge replica case, the edge function and role that
+# The stack owns everything except the artifact bucket (and, in the Lambda@Edge replica case, the edge function and version that
 # were retained). Order: stack, edge leftovers, artifact bucket, log groups.
 # settle_stack: poll DescribeStacks until the status is no longer *_IN_PROGRESS (it is unverified whether DeleteStack is accepted
 # during CREATE_IN_PROGRESS / ROLLBACK_IN_PROGRESS, so it is never tried). Sets ST. 0 settled, 1 timed out, 2 cannot read.

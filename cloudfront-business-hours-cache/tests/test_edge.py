@@ -167,6 +167,11 @@ class Responses(unittest.TestCase):
             r = Harness(t=at(0, 30)).run(headers={'cache-control': [{'key': 'Cache-Control', 'value': v}]})
             self.assertEqual(cc(r), v, v)
 
+    def test_a_cache_control_header_that_is_not_a_list_is_left_alone(self):
+        for bad in ['public', {'key': 'Cache-Control', 'value': 'public'}, 5]:
+            r = Harness(t=at(0, 30)).run(headers={'cache-control': bad})
+            self.assertEqual(r['headers']['cache-control'], bad, repr(bad))
+
     def test_origin_set_cookie_left_untouched(self):
         r = Harness(t=at(0, 30)).run(headers={'set-cookie': [{'key': 'Set-Cookie', 'value': 'a=b'}]})
         self.assertIsNone(cc(r))
@@ -339,7 +344,7 @@ class S3Client(unittest.TestCase):
         self.assertIn('connect_timeout=S3_TIMEOUT_SECONDS', src)
         self.assertIn('read_timeout=S3_TIMEOUT_SECONDS', src)
         self.assertIn("retries={'max_attempts': 0}", src)
-        self.assertEqual(edge.S3_TIMEOUT_SECONDS, 2.5)
+        self.assertEqual(edge.S3_TIMEOUT_SECONDS, 1.5)
 
 
 class PathRules(unittest.TestCase):
@@ -384,7 +389,7 @@ class PathRules(unittest.TestCase):
     def test_uri_variants_are_never_cached_not_even_through_the_default(self):
         cfg = {'rules': [rule('/prices/*', W1)], 'default': W2}
         for u in ['//prices/a', '/prices//a', '/./prices/a', '/x/../prices/a', '/prices/.', '/prices/..', '/prices/a/.', '/%70rices/a',
-                  '/prices%2fa', '/prices/%61', '', 'prices/a', '/x/./y', '/x/../y', '/x//y', '/100%']:
+                  '/prices%2fa', '/prices/%61', '/prices/..\\a', '/prices\\..\\x', '/prices/a\\', '', 'prices/a', '/x/./y', '/x/../y', '/x//y', '/100%']:
             self.assertIsNone(pick(cfg, u), repr(u))
             self.assertIsNone(pick(cfg, u + '?q=1'), repr(u + '?q=1'))
         h = Harness(text=json.dumps(cfg), t=at(0, 30))

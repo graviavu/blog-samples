@@ -7,7 +7,7 @@ Reads one S3 object with path rules (kept 30 s in memory, parsed once):
 The rule for the request URI (event["Records"][0]["cf"]["request"]["uri"], query string stripped) is chosen by exact path or
 trailing-* prefix; an exact path beats any prefix, the LONGEST matching prefix wins, the first of identical patterns wins,
 case-sensitive. No rule and no default: s-maxage=0. A malformed rule is skipped (only its index is logged, never its content).
-A URI that is empty, or contains "//", "/./", "/../", a trailing "/." or "/..", or any "%" gets no window at all: s-maxage=0.
+A URI that is empty, or contains "//", "/./", "/../", a trailing "/." or "/..", any "%" or any backslash gets no window at all: s-maxage=0.
 
 Then it computes the time since 00:00 UTC (to the second, with the fraction) and sets
   Cache-Control: public, max-age=0, s-maxage=<ttl>
@@ -41,12 +41,12 @@ FAIL_CACHE_SECONDS = 5.0      # a failure is remembered briefly, so an S3 outage
 MAX_TTL_SECONDS = 86400
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_RULES = 1000
-S3_TIMEOUT_SECONDS = 2.5
+S3_TIMEOUT_SECONDS = 1.5   # connect and read; the function timeout is 10 s (a cold boto3 import is slow)
 REWRITE_STATUS = frozenset((200, 203, 204, 206))
 FALLBACK_CACHE_CONTROL = 'public, max-age=0, s-maxage=0'
 
 _BAD_PATH_CHARS = re.compile(r'[\s\x00-\x1f\x7f?#]')
-_URI_VARIANT = re.compile(r'//|/\./|/\.\./|/\.{1,2}$|%')
+_URI_VARIANT = re.compile(r'//|/\./|/\.\./|/\.{1,2}$|%|\\')   # also any backslash: \..\ is a dot segment to some servers
 _FORBIDS_SHARED = re.compile(r'(^|[\s,])(private|no-store|no-cache)(?=$|[\s,=])', re.IGNORECASE)
 
 
@@ -199,7 +199,9 @@ def origin_forbids_shared(headers):
     if isinstance(cookies, list) and len(cookies) > 0:
         return True
     values = h.get('cache-control')
-    values = values if isinstance(values, list) else []
+    if values is not None and not isinstance(values, list):
+        return True        # a header we do not understand: leave the response alone
+    values = values or []
     joined = ','.join(str(v.get('value') or '') for v in values if isinstance(v, dict))
     return bool(_FORBIDS_SHARED.search(joined))
 

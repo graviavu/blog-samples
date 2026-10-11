@@ -81,7 +81,7 @@ preflight() {
     [ "$EXPECT_ACCOUNT_LAST4" = "$ACCT_LAST4" ] || die "the account does not end in EXPECT_ACCOUNT_LAST4: wrong profile? Nothing was done."
   fi
   local m; m="$(minute_of_day)"
-  if [ "$m" -lt 90 ] || [ "$m" -gt 1320 ]; then
+  if [ "$m" -le 90 ] || [ "$m" -ge 1320 ]; then   # 01:30 and 22:00 themselves are refused
     MIDNIGHT_BAD=1
   else
     MIDNIGHT_BAD=0
@@ -98,17 +98,17 @@ Plan for run $id: ONE CloudFormation stack bhc-$id (cfn/stack.yaml), tagged RunI
   Created by this script before the stack (the stack needs the code to exist):
     S3 bucket bhc-$id-art   holds the edge function zip (bucket and key baked in), private
   Created by the stack:
-    S3 bucket bhc-$id-cfg   holds $CONFIG_KEY (the windows), private, encrypted, no bucket policy
+    S3 bucket bhc-$id-cfg   holds $CONFIG_KEY (the windows), private, encrypted, TLS-only deny policy
     IAM roles               bhc-$id-erole (edge: read that one object + list the bucket, write logs; trusts lambda and edgelambda)
                             bhc-$id-orole (origin: write logs only)
-    Lambda (origin)         bhc-$id-origin  Node.js 22, inline code, PUBLIC function URL (test only)
-    Lambda@Edge function    bhc-$id-edge    Node.js 22, us-east-1, code from the art bucket, plus one published version
+    Lambda (origin)         bhc-$id-origin  $ORIGIN_RT, inline code, PUBLIC function URL (test only)
+    Lambda@Edge function    bhc-$id-edge    $EDGE_RT, us-east-1, code from the art bucket, plus one published version
     Cache policy            bhc-$id-cp      min 0, default 0, max 86400; no query strings, headers or cookies in the key
     CloudFront distribution (PriceClass_100) origin = the function URL, edge function on origin-response (CloudFront caches a 500 for its default 10 s)
   Then: a best-effort reserved concurrency of 5 on the origin, and the window JSON uploaded by this script.
 Tests:  T-A/T-B/T-D two paths with different windows at the same moment (in window / out of window / error status), T-F URI variants, T-E S3 failure fallback, T-C an object cached just before the window opens expires at the opening.
 Teardown: empty the config bucket, delete the stack (CloudFormation disables and deletes the distribution), delete the art bucket, the log groups.
-          If AWS still holds the Lambda@Edge replicas, the edge function and its role are retained and --cleanup removes them later.
+          If AWS still holds the Lambda@Edge replicas, the edge function and version are retained (the stack deletes the role) and --cleanup removes the function later.
 Cost: an estimate of a few cents at most (a few hundred requests; Lambda@Edge, S3 and CloudFront free-tier or cent-level charges).
 Time: about 15-25 minutes, mostly waiting for CloudFront to deploy (and again to delete it).
 The origin function URL is PUBLIC (auth NONE) while the stack exists; it returns only a timestamp and a counter.
@@ -166,6 +166,7 @@ create_all() {
   # shellcheck disable=SC2034  # used by redact()
   ORIGIN_HOST="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="OriginHost") | .OutputValue')"
   [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] && [ -n "$CF_DOMAIN" ] && [ "$CF_DOMAIN" != null ] || fail "the stack outputs have no distribution"
+  printf '%s' "$CF_DOMAIN" | grep -Eq '^[a-z0-9]+\.cloudfront\.net$' || fail "the distribution domain does not look like <id>.cloudfront.net; not sending requests to it"
 
   say "[5/5] initial window config and best-effort reserved concurrency for the public origin"
   put_json "{\"default\":$(win_json 0 1)}" || fail "initial config upload"
@@ -417,7 +418,7 @@ t_c() {
 }
 
 # edge_failsafe_everywhere: a path with a rule outside its window must get the long TTL. If it gets s-maxage=0 instead, the function is
-# on its fail-safe (for example the AWS SDK v3 is not available in the Lambda@Edge runtime), and no test can say anything.
+# on its fail-safe (for example boto3 is not available in the Lambda@Edge runtime), and no test can say anything.
 edge_failsafe_everywhere() {
   req /rates/probe || return 1
   [ "$R_ST" = 200 ] && [ "$R_CC" = "$EXPECT_IN" ]
@@ -496,20 +497,21 @@ main_run() {
   RUNID="${RT_RUNID:-$(date -u +%y%m%d%H%M)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')}"
   printf '%s' "$RUNID" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "run id '$RUNID' is not of the form 2610101200-ab12"
   set_names
+  EDGE_RT="${EDGE_RUNTIME:-python3.12 (template default)}"; ORIGIN_RT="${ORIGIN_RUNTIME:-nodejs22.x (template default)}"
   print_plan "$RUNID"
   aws_ro cloudformation validate-template --template-body "file://$TEMPLATE" >/dev/null || die "cfn/stack.yaml did not validate"
   say "template check: cloudformation validate-template accepted cfn/stack.yaml"
   if [ "$MIDNIGHT_BAD" = 1 ]; then
     say ""
     say "NOTE: it is now $(stamp). The tests need windows of up to 60 minutes on both sides of 'now' inside one UTC day."
-    say "      Start this between 01:30 and 22:00 UTC. A real run refuses to start outside that."
+    say "      Start this after 01:30 and before 22:00 UTC. A real run refuses to start at or outside those times."
   fi
   if [ "$DRY_RUN" = 1 ]; then
     say ""
     say "dry run: nothing was created or deleted (only the read-only calls sts get-caller-identity and cloudformation validate-template were made)."
     return 0
   fi
-  [ "$MIDNIGHT_BAD" = 0 ] || die "outside 01:30-22:00 UTC, see the note above"
+  [ "$MIDNIGHT_BAD" = 0 ] || die "at or outside 01:30 / 22:00 UTC, see the note above"
   say ""
   say "This creates real AWS resources in your account. It costs cents and takes about 15-25 minutes."
   say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
@@ -533,7 +535,7 @@ main_cleanup() {
   if [ -f "$STATE_FILE" ] && grep -q '^RUNID=' "$STATE_FILE"; then state_load "$STATE_FILE"; RUNID="$CLEANUP_ID"; fi
   set_names
   TRY_STACK=1
-  say "cleanup of run $RUNID: will delete only stack $STACK (tagged RunId=$RUNID), what it left behind (edge function and role), bucket $ART_BUCKET and the log groups of this run"
+  say "cleanup of run $RUNID: will delete only stack $STACK (tagged RunId=$RUNID), what it left behind (the edge function, if AWS still holds its replicas), bucket $ART_BUCKET and the log groups of this run"
   if [ "$DRY_RUN" = 1 ]; then say "dry run: nothing was deleted."; return 0; fi
   say "Target:  profile ${AWS_PROFILE:-<none, default credentials>}   region $REGION   account ending in $ACCT_LAST4"
   confirm "$CLEANUP_PHRASE"
