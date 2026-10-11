@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Fake curl: a small model of CloudFront + the edge function + the origin. Needs jq.
+#   STUB_CDN=ok (default) | cacheall (ignores the function, caches everything 14400 s) | rewrite-errors (long TTL on 500)
+#            | nocap (outTtl without the cap to the next opening) | stale-config (keeps using the last good config when S3 fails)
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+echo "curl $*" >> "$S/calls.log"
+hdr="" out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -D) hdr="$2"; shift ;; -o) out="$2"; shift ;; --max-time) shift ;; -*) ;; *) url="$1" ;; esac
+  shift
+done
+# STUB_CURL_FAIL_PATH=<path>: no answer for that one path
+if [ -n "${STUB_CURL_FAIL_PATH:-}" ] && [ "${url#*"$STUB_CURL_FAIL_PATH"}" != "$url" ]; then echo "curl: (28) timeout" >&2; exit 28; fi
+if [ "${STUB_CURL_DOWN:-0}" = 1 ]; then echo "curl: (7) could not connect" >&2; exit 7; fi
+case "$url" in "https://$(fake_domain)"/*) ;; *) echo "curl: (6) could not resolve host" >&2; exit 6 ;; esac
+prefix="https://$(fake_domain)/"; path="/${url#"$prefix"}"
+mkdir -p "$S/cdn"
+key="$S/cdn/$(printf '%s' "$path" | tr '/' '_')"
+now="$(now_epoch)"
+mode="${STUB_CDN:-ok}"
+
+emit() { # status xcache age cc body
+  {
+    echo "HTTP/2 $1"; echo "content-type: application/json"; echo "x-cache: $2 from cloudfront"
+    [ -n "$3" ] && echo "age: $3"
+    [ -n "$4" ] && echo "cache-control: $4"
+    echo "x-amz-cf-id: AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefgh=="; echo
+  } > "${hdr:-/dev/null}"
+  printf '%s' "$5" > "${out:-/dev/null}"
+}
+
+# STUB_STRAY_MISS=<path>:<n>: the n-th request for that path is answered from the cache but labelled Miss (a POP with several cache servers)
+nreq=$(( $(get "nreq_$(printf '%s' "$path" | tr '/' '_')" 0) + 1 )); put "nreq_$(printf '%s' "$path" | tr '/' '_')" "$nreq"
+if [ -e "$key" ]; then   # cached?
+  stored="$(sed -n 1p "$key")"; ttl="$(sed -n 2p "$key")"; cc="$(sed -n 3p "$key")"
+  if [ "$now" -lt $((stored + ttl)) ]; then
+    if [ "${STUB_STRAY_MISS:-}" = "$path:$nreq" ]; then emit 200 Miss "" "$cc" "$(sed -n 4p "$key")"; exit 0; fi
+    st="$(sed -n 5p "$key")"
+    if [ "${st:-200}" -ge 400 ]; then emit "$st" Error $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0; fi   # a cached error says "Error from cloudfront"
+    emit 200 Hit $((now - stored)) "$cc" "$(sed -n 4p "$key")"; exit 0
+  fi
+  rm -f "$key"
+fi
+
+# STUB_ERR_PRESTORE=1: the first /err answer is a copy cached by an earlier request (it has an Age)
+if [ "${STUB_ERR_PRESTORE:-0}" = 1 ] && [ "$path" = /err ] && [ "$(get prestored 0)" = 0 ]; then
+  put prestored 1; emit 500 Error 3 "" '{"nonce":"old","path":"/err"}'; exit 0
+fi
+
+# origin: counts its calls, unique nonce per call, 500 on /err*
+c=$(( $(get origin_counter 0) + 1 )); put origin_counter "$c"
+nonce="inst1-$c-$((RANDOM % 10000))"
+status=200; case "$path" in /err*) status=500 ;; esac
+body="$(jq -nc --arg n "$nonce" --argjson c "$c" --argjson t "$now" --arg p "$path" '{now:$t,counter:$c,nonce:$n,path:$p}')"
+
+# edge function (origin-response)
+cc=""
+if [ "$status" -lt 400 ] || [ "$mode" = rewrite-errors ]; then
+  if [ "$mode" = nosdk ]; then
+    cc="public, max-age=0, s-maxage=0"      # the edge function is on its fail-safe for every response
+  elif [ "$mode" = cacheall ]; then
+    cc="public, max-age=0, s-maxage=14400"
+  else
+    cfg=""; [ -e "$S/s3obj" ] && cfg="$(cat "$S/s3obj")"
+    if [ -n "$cfg" ]; then put lastcfg "$cfg"; elif [ "$mode" = stale-config ]; then cfg="$(get lastcfg)"; fi
+    if [ -n "$cfg" ] && echo "$cfg" | jq -e '(.rules // .default) != null' >/dev/null 2>&1; then
+      secs=$(( now % 86400 ))
+      # same rules as the edge function: exact beats prefix, longest prefix wins, then "default", else 0
+      ttl="$(echo "$cfg" | jq -r --argjson s "$secs" --arg p "$path" --arg nocap "$([ "$mode" = nocap ] && echo 1 || echo 0)" '
+        def win: ((.rules // []) | map(select((.path | endswith("*") | not) and .path == $p)) | .[0])
+          // ((.rules // []) | map(select(.path as $pat | ($pat | endswith("*")) and ($p | startswith($pat[0:(($pat | length) - 1)])))) | sort_by(-(.path | length)) | .[0])
+          // .default;
+        ($p | test("//|/\\./|/\\.\\./|/\\.{1,2}$|%")) as $variant
+        | (if $variant then null else win end) as $w
+        | if $w == null then 0
+          elif ($s >= ($w.startMin * 60) and $s < ($w.endMin * 60)) then $w.inTtl
+          else (if $s < ($w.startMin * 60) then ($w.startMin * 60) - $s else 86400 - $s + ($w.startMin * 60) end) as $until
+            | (if $nocap == "1" then $w.outTtl else ([$w.outTtl, $until] | min) end) end')"
+    else
+      ttl=0
+    fi
+    cc="public, max-age=0, s-maxage=$ttl"
+  fi
+fi
+# CloudFront caches only what the policy allows: status < 400 and s-maxage > 0
+ttl="${cc##*s-maxage=}"
+if [ -n "$cc" ] && [ "$status" -lt 400 ] && [ "${ttl:-0}" -gt 0 ] 2>/dev/null; then
+  printf '%s\n%s\n%s\n%s\n%s\n' "$now" "$ttl" "$cc" "$body" "$status" > "$key"
+fi
+if [ "$status" -ge 400 ]; then
+  # CloudFront caches a 5xx for the larger of its default 10 s and any s-maxage the origin response carries.
+  # STUB_CDN=errlong: it holds the error for 14400 s (what T-D must catch).
+  etl=10; case "$ttl" in ''|*[!0-9]*) ;; *) [ "$ttl" -gt "$etl" ] && etl="$ttl" ;; esac
+  [ "$mode" = errlong ] && etl=14400
+  printf '%s\n%s\n%s\n%s\n%s\n' "$now" "$etl" "$cc" "$body" "$status" > "$key"
+  emit "$status" Error "" "$cc" "$body"; exit 0
+fi
+emit "$status" Miss "" "$cc" "$body"

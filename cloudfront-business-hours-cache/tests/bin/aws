@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls run-test.sh makes; anything else exits 99.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
+REG=us-east-1; if [ "$1" = "--region" ]; then REG="$2"; shift 2; fi
+svc="$1"; cmd="$2"; shift 2
+echo "$svc $cmd $*" >> "$S/calls.log"
+mkdir -p "$S/res"
+q="$(arg --query "$@")"
+acct12="$(acct)"
+
+# --- failure and signal injection ---------------------------------------------------------------------------------------
+# STUB_FAIL=<cmd>[:<n>]  the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
+# STUB_SIG=INT|TERM STUB_SIG_AT=<cmd>  signal the script (once) during that command.
+if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
+  n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
+  want="${STUB_FAIL#*:}"; [ "$want" = "$STUB_FAIL" ] && want=1
+  if [ "$n" = "$want" ]; then
+    # STUB_FAIL_CODE / STUB_FAIL_TEXT: another error code and wording (default AccessDenied)
+    echo "An error occurred (${STUB_FAIL_CODE:-AccessDenied}) when calling $cmd: ${STUB_FAIL_TEXT:-denied} arn:aws:iam::$acct12:role/x not allowed, account $acct12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(fake_domain), $(fake_origin), x-amz-security-token: $(printf '%s' abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ)" >&2
+    exit 254
+  fi
+fi
+if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT:-}" ] && [ ! -e "$S/sig_done" ]; then
+  : > "$S/sig_done"; kill -"$STUB_SIG" "${RT_MAIN_PID:?}"; sleep 0.2
+fi
+
+fileof() { local f; f="$(arg "$1" "${@:2}")"; echo "${f#file://}"; }
+tag_from() { # extracts the RunId value from: Key=RunId,Value=X   or   RunId=X   or   {Key=RunId,Value=X}
+  local t; t="$(printf '%s' "$*" | sed -n 's/.*RunId,Value=\([A-Za-z0-9-]*\).*/\1/p' | head -n 1)"
+  [ -n "$t" ] || t="$(printf '%s' "$*" | sed -n 's/.*RunId=\([A-Za-z0-9-]*\).*/\1/p' | head -n 1)"
+  printf '%s' "$t"
+}
+notfound() { echo "An error occurred ($1) when calling the $cmd operation: The specified resource does not exist (arn:aws:x::$acct12:y)" >&2; exit 254; }
+reg() { echo "$1" > "$S/res/$2__$3"; }          # tag kind name
+tagof() { # kind name
+  [ -e "$S/res/$1__$2" ] || return 1
+  if [ "${STUB_FOREIGN_TAG:-}" = "$1" ]; then echo OTHERRUN; else cat "$S/res/$1__$2"; fi
+}
+del() { rm -f "$S/res/$1__$2"; echo "DELETE $1 $2" >> "$S/deleted.log"; }
+okjson() { echo '{}'; }
+
+case "$svc $cmd" in
+  "sts get-caller-identity") echo "$acct12" ;;
+  # ---- S3
+  "s3api create-bucket") reg "" s3 "$(arg --bucket "$@")"; okjson ;;
+  "s3api put-public-access-block") okjson ;;
+  "s3api put-bucket-encryption") jq -e . >/dev/null 2>&1 <<< "$(arg --server-side-encryption-configuration "$@")" || { echo "stub: bad encryption config" >&2; exit 254; }; okjson ;;
+  "s3api put-bucket-policy")
+    jq -e '.Statement[0].Condition.Bool["aws:SecureTransport"] == "false"' "$(fileof --policy "$@")" >/dev/null 2>&1 || { echo "stub: bad bucket policy" >&2; exit 254; }
+    cp "$(fileof --policy "$@")" "$S/policy-$(arg --bucket "$@").json"; okjson ;;
+  "s3api put-bucket-tagging") b="$(arg --bucket "$@")"; reg "$(tag_from "$@")" s3 "$b"; okjson ;;
+  "s3api head-bucket")
+    if [ -e "$S/res/s3__$(arg --bucket "$@")" ]; then okjson; else echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254; fi ;;
+  "s3api get-bucket-tagging")
+    t="$(tagof s3 "$(arg --bucket "$@")")" || notfound NoSuchBucket
+    [ -n "$t" ] || { echo "An error occurred (NoSuchTagSet) when calling the GetBucketTagging operation: The TagSet does not exist" >&2; exit 254; }
+    echo "$t" ;;
+  "s3api put-object")
+    case "$(arg --bucket "$@")" in
+      *-art) cp "$(arg --body "$@")" "$S/art-object" ;;                                  # the edge zip
+      *) cp "$(arg --body "$@")" "$S/s3obj"; cat "$S/s3obj" >> "$S/puts.log" ;;           # the window config
+    esac; okjson ;;
+  "s3api delete-object") rm -f "$S/s3obj"; echo "DELETE s3object $(arg --key "$@")" >> "$S/deleted.log"; okjson ;;
+  "s3api delete-bucket") b="$(arg --bucket "$@")"; tagof s3 "$b" >/dev/null || notfound NoSuchBucket; del s3 "$b"; okjson ;;
+  # ---- IAM (only the retained edge role is ever touched directly)
+  "iam list-role-tags") t="$(tagof iam "$(arg --role-name "$@")")" || notfound NoSuchEntity; echo "${t:-None}" ;;
+  "iam delete-role-policy") okjson ;;
+  "iam delete-role") n="$(arg --role-name "$@")"; tagof iam "$n" >/dev/null || notfound NoSuchEntity; del iam "$n"; okjson ;;
+  # ---- Lambda (the stack creates the functions; the script only reads tags, deletes the retained edge function, caps concurrency)
+  "lambda put-function-concurrency") okjson ;;
+  "lambda get-function") t="$(tagof lambda "$(arg --function-name "$@")")" || notfound ResourceNotFoundException; echo "${t:-None}" ;;
+  "lambda delete-function")
+    n="$(arg --function-name "$@")"; tagof lambda "$n" >/dev/null || notfound ResourceNotFoundException
+    if [ "${STUB_REPLICA_FN:-0}" = 1 ]; then
+      echo "An error occurred (InvalidParameterValueException) when calling the DeleteFunction operation: Lambda was unable to delete arn:aws:lambda:us-east-1:$acct12:function:$n:1 because it is a replicated function. Please see our documentation for Deleting Lambda@Edge Functions and Replicas." >&2; exit 254
+    fi
+    del lambda "$n"; okjson ;;
+  "ec2 describe-regions") echo "us-east-1	eu-west-1" ;;
+  "logs describe-log-groups")
+    for f in "$S/logs/$REG"/*; do [ -e "$f" ] || continue; g="$(basename "$f" | tr '%' '/')"; case "$g" in "$(arg --log-group-name-prefix "$@")"*) printf '%s\t' "$g" ;; esac; done; echo ;;
+  "logs delete-log-group") g="$(arg --log-group-name "$@")"; rm -f "$S/logs/$REG/$(printf '%s' "$g" | tr '/' '%')"; echo "DELETE loggroup $REG $g" >> "$S/deleted.log"; okjson ;;
+  # ---- CloudFormation: a stack is a set of virtual resources (files under res/) with the stack's tag
+  "cloudformation validate-template")
+    f="$(fileof --template-body "$@")"; grep -q '^AWSTemplateFormatVersion' "$f" || { echo "An error occurred (ValidationError) when calling the ValidateTemplate operation: Template format error" >&2; exit 254; }
+    okjson ;;
+  "cloudformation create-stack")
+    n="$(arg --stack-name "$@")"; tag="$(tag_from "$@")"
+    jq -e . "$(fileof --parameters "$@")" >/dev/null 2>&1 || { echo "stub: invalid parameters JSON" >&2; exit 254; }
+    cp "$(fileof --parameters "$@")" "$S/stack-params.json"
+    case " $* " in *" CAPABILITY_NAMED_IAM "*) ;; *) echo "An error occurred (InsufficientCapabilitiesException) when calling the CreateStack operation" >&2; exit 254 ;; esac
+    reg "$tag" cfn "$n"; put stack_status "${STUB_INIT_STATUS:-CREATE_COMPLETE}"
+    rid="$(jq -r '.[] | select(.ParameterKey=="RunId") | .ParameterValue' "$S/stack-params.json")"
+    cfg="$(jq -r '.[] | select(.ParameterKey=="ConfigBucketName") | .ParameterValue' "$S/stack-params.json")"
+    for kv in "s3 $cfg" "iam bhc-$rid-erole" "iam bhc-$rid-orole" "lambda bhc-$rid-origin" "lambda bhc-$rid-edge" "cf $(fake_dist_id)"; do reg "$tag" "${kv%% *}" "${kv#* }"; done
+    put cf_enabled true
+    echo "arn:aws:cloudformation:us-east-1:$acct12:stack/$n/x" ;;
+  "cloudformation wait")
+    case "$1" in
+      stack-create-complete) if [ "${STUB_STACK_FAIL:-0}" = 1 ]; then echo "Waiter StackCreateComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi ;;
+      stack-delete-complete) if [ "$(get stack_status)" = DELETE_FAILED ]; then echo "Waiter StackDeleteComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi ;;
+    esac; exit 0 ;;
+  "cloudformation describe-stacks")
+    n="$(arg --stack-name "$@")"
+    [ -e "$S/res/cfn__$n" ] || { echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id $n does not exist" >&2; exit 254; }
+    case "$q" in
+      *StackStatus*)
+        # STUB_STATUS_SEQ="CREATE_IN_PROGRESS ROLLBACK_IN_PROGRESS ROLLBACK_COMPLETE": the status queries return these in turn, then the last one for ever
+        if [ -n "${STUB_STATUS_SEQ:-}" ]; then
+          i=$(get seq_n 0); put seq_n $((i + 1)); read -r -a seq_words <<< "$STUB_STATUS_SEQ"; w=${#seq_words[@]}; [ "$i" -lt "$w" ] || i=$((w - 1)); echo "${seq_words[$i]}"
+        else get stack_status; echo; fi ;;
+      *Tags*) t="$(tagof cfn "$n")"; echo "${t:-None}" ;;
+      *Outputs*) if [ "${STUB_DIST_NULL:-0}" = 1 ]; then echo '[{"OutputKey":"DistributionId","OutputValue":null}]'; else dom="$(fake_domain)"; [ "${STUB_BAD_DOMAIN:-0}" = 1 ] && dom="evil.example.com"
+          jq -n --arg id "$(fake_dist_id)" --arg d "$dom" --arg o "$(fake_origin)" '[{OutputKey:"DistributionId",OutputValue:$id},{OutputKey:"DistributionDomain",OutputValue:$d},{OutputKey:"OriginHost",OutputValue:$o}]'; fi ;;
+    esac ;;
+  "cloudformation describe-stack-resources")
+    if [ "$(get stack_status)" = DELETE_FAILED ]; then get fail_cause; echo; else echo; fi ;;
+  "cloudformation delete-stack")
+    n="$(arg --stack-name "$@")"; tagof cfn "$n" >/dev/null || { echo "An error occurred (ValidationError): Stack with id $n does not exist" >&2; exit 254; }
+    # retained logical ids: the words after --retain-resources
+    retained=" "; seen=0
+    for w in "$@"; do
+      case "$w" in --retain-resources) seen=1; continue ;; --*) seen=0 ;; esac
+      [ "$seen" = 1 ] && retained="$retained$w "
+    done
+    echo "retained=$retained" >> "$S/delete-calls.log"
+    # Lambda@Edge replicas: the version fails first; once it is retained the function fails; once both are retained the stack is deleted
+    if [ "${STUB_REPLICA:-0}" = 1 ]; then
+      case "$retained" in *" EdgeVersion "*) ;; *) put stack_status DELETE_FAILED; put fail_cause EdgeVersion; exit 0 ;; esac
+      case "$retained" in *" EdgeFunction "*) ;; *) put stack_status DELETE_FAILED; put fail_cause EdgeFunction; exit 0 ;; esac
+    fi
+    # the config bucket must be empty
+    if [ -e "$S/s3obj" ]; then put stack_status DELETE_FAILED; put fail_cause ConfigBucket; echo "stub: bucket not empty" >&2; exit 0; fi
+    mytag="$(cat "$S/res/cfn__$n")"
+    for r in "$S"/res/*__*; do
+      [ -e "$r" ] || continue; b="$(basename "$r")"; k="${b%%__*}"; nm="${b#*__}"
+      case "$k" in cfn) continue ;; esac
+      case "$nm" in bhc-*-art) continue ;; esac            # not part of the stack
+      [ "$(cat "$r")" = "$mytag" ] || continue               # only what carries the stack's tag
+      case "$nm" in *-edge) case "$retained" in *" EdgeFunction "*) continue ;; esac ;; esac
+      del "$k" "$nm"
+    done
+    : > "$S/dist_deleted"; del cfn "$n"; put stack_status DELETE_COMPLETE ;;
+  *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
+esac
