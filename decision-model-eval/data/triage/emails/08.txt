@@ -1,0 +1,5 @@
+From: noreply@social.example
+Subject: You have 3 new notifications
+Date: 2026-10-09
+
+Someone liked your post. See what you missed.

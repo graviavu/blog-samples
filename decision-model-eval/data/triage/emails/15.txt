@@ -1,0 +1,5 @@
+From: editor@blog.example
+Subject: Draft review: your post on routing
+Date: 2026-10-09
+
+Attached is the edited draft of your post. Please look it over and send changes by next Friday.

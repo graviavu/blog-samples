@@ -1,0 +1,5 @@
+From: ops@statuspage.example
+Subject: Incident: API error rate 38% for your project
+Date: 2026-10-09
+
+Your project api-prod is returning HTTP 500 on 38% of requests since 09:12 UTC. On-call has been paged. Please acknowledge the incident.

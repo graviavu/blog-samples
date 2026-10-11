@@ -1,0 +1,5 @@
+From: support@bank.example
+Subject: Unusual charge of $2,480 on your card
+Date: 2026-10-09
+
+We flagged a $2,480 charge at an unfamiliar merchant. Reply YES if this was you, otherwise call the number on your card now so we can block it.

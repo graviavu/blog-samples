@@ -1,0 +1,12 @@
+2026-01-05T09:00:00Z	demo	research	sonnet	ok	Gate 1 market research for the demo idea
+2026-01-05T09:10:00Z	demo	scorecard	sonnet	ok	Gate 1 scorecard from the research notes
+2026-01-05T09:30:00Z	demo	architecture	opus	ok	Gate 2 architecture and cost model
+2026-01-05T10:00:00Z	demo	summary	haiku	ok	Format yesterday's activity log into a digest
+2026-01-05T10:20:00Z	demo	build	sonnet	ok	Implement the CSV export with tests
+2026-01-05T10:40:00Z	demo	test	sonnet	ok	Run the test suite and report failures
+2026-01-05T11:00:00Z	demo	security-review	opus	ok	Review the auth change before merge
+2026-01-05T11:20:00Z	demo	summary	haiku	ok	Rename files to the new naming scheme
+2026-01-05T11:40:00Z	demo	pr-description	sonnet	ok	Write the pull request description
+2026-01-05T12:00:00Z	demo	architecture	opus	ok	Choose between two queue designs for payments
+2026-01-05T12:20:00Z	demo	research	sonnet	ok	Compare three competitor pricing pages
+2026-01-05T12:40:00Z	demo	summary	haiku	ok	Boilerplate README sections from a template

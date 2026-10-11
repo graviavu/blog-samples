@@ -1,0 +1,5 @@
+From: survey@retail.example
+Subject: Rate your recent experience
+Date: 2026-10-09
+
+Take 2 minutes to answer our survey and enter a prize draw.

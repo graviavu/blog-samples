@@ -1,0 +1,5 @@
+From: dev@oss-project.example
+Subject: Re: question about your PR
+Date: 2026-10-09
+
+Thanks for the PR. Looks good overall, a couple of nits on naming. Whenever you get a chance, could you rename the helper? Not blocking.
