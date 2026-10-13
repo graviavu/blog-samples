@@ -168,6 +168,10 @@ check_inputs() {
   [ "$BUCKET_SECONDS" -ge 20 ] && [ "$BUCKET_SECONDS" -le 600 ] || die "BUCKET_SECONDS must be 20 to 600 (got '$BUCKET_SECONDS')"
   printf '%s' "$PROP_WAIT" | grep -Eq '^[0-9]{1,4}$' && [ "$PROP_WAIT" -ge 30 ] || die "PROP_WAIT must be a whole number of seconds, at least 30"
   printf '%s' "$POLL_GAP" | grep -Eq '^[0-9]{1,3}$' && [ "$POLL_GAP" -ge 1 ] || die "POLL_GAP must be a whole number of seconds, at least 1"
+  printf '%s' "$HIT_GAP" | grep -Eq '^[0-9]{1,2}$' && [ "$HIT_GAP" -ge 1 ] || die "HIT_GAP must be a whole number of seconds, 1 to 99"
+  printf '%s' "$WARMUP_TRIES" | grep -Eq '^[0-9]{1,3}$' && [ "$WARMUP_TRIES" -ge 1 ] || die "WARMUP_TRIES must be a whole number, at least 1"
+  printf '%s' "$SETTLE_POLLS" | grep -Eq '^[0-9]{1,4}$' && [ "$SETTLE_POLLS" -ge 1 ] || die "SETTLE_POLLS must be a whole number, at least 1"
+  printf '%s' "$STACK_POLL_SECS" | grep -Eq '^[0-9]{1,3}$' && [ "$STACK_POLL_SECS" -ge 5 ] || die "STACK_POLL_SECS must be a whole number of seconds, at least 5"
   case "$REGION" in *[!a-z0-9-]*|'') die "SAMPLE_REGION looks wrong" ;; esac
 }
 compute_windows() {

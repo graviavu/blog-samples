@@ -27,7 +27,7 @@ is()     { [ "$1" = "$2" ]; }
 reset_env() {
   unset STUB_FAIL STUB_FAIL_CODE STUB_SIG STUB_SIG_AT STUB_FOREIGN_TAG STUB_S3_REJECT STUB_S3_ALWAYS403 STUB_PROP_DELAY STUB_START_EPOCH BUCKET_SECONDS PROP_WAIT
   export AWS_PROFILE=testprof
-  export RT_RUNID="$RUNID_A" POLL_GAP=10 STACK_POLL_SECS=1
+  export RT_RUNID="$RUNID_A" POLL_GAP=10 STACK_POLL_SECS=5
 }
 newdir() { rm -rf "$TMP/$1"; STUB_DIR="$TMP/$1/state"; RESULTS_DIR="$TMP/$1/res"; mkdir -p "$STUB_DIR/res" "$RESULTS_DIR"; export STUB_DIR RESULTS_DIR; OUT="$TMP/$1/out.txt"; }
 seed_foreign() { echo OTHERRUN > "$STUB_DIR/res/s3__cftb-$OTHER-content"; printf 'CREATE_COMPLETE\n%s\n' "$OTHER" > "$STUB_DIR/res/cfn__cftb-$OTHER"; }
