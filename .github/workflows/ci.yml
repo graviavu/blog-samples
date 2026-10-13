@@ -58,10 +58,14 @@ jobs:
         working-directory: cloudfront-business-hours-cache
         run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/stack.yaml"
 
+      - name: cfn-lint (time-bucket template)
+        working-directory: cloudfront-cff-time-bucket-cache
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/stack.yaml"
+
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/*
+          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/* cloudfront-cff-time-bucket-cache/*.sh cloudfront-cff-time-bucket-cache/tests/run.sh cloudfront-cff-time-bucket-cache/tests/bin/aws cloudfront-cff-time-bucket-cache/tests/bin/curl cloudfront-cff-time-bucket-cache/tests/bin/date cloudfront-cff-time-bucket-cache/tests/bin/sleep cloudfront-cff-time-bucket-cache/tests/bin/stub-lib.sh
 
       - name: verify.sh against the local mock (tests the script, not CloudFront)
         working-directory: cloudfront-request-routing
@@ -85,4 +89,12 @@ jobs:
 
       - name: business-hours-cache run-test.sh against fake aws, curl, date, sleep and zip
         working-directory: cloudfront-business-hours-cache
+        run: tests/run.sh
+
+      - name: time-bucket function and template unit tests (node, no dependencies)
+        working-directory: cloudfront-cff-time-bucket-cache
+        run: node --test tests/*.test.mjs
+
+      - name: time-bucket run-sample.sh against fake aws, curl, date and sleep, plus mutation checks
+        working-directory: cloudfront-cff-time-bucket-cache
         run: tests/run.sh
