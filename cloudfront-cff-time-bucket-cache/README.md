@@ -42,7 +42,7 @@ Needs aws CLI v2, jq, curl, bash, in a throwaway account with rights to create C
 and CloudFormation stacks. Region `us-east-1` unless `SAMPLE_REGION` is set (CloudFront itself is global).
 
 ```
-./run-sample.sh --dry-run     # read-only: identity, template validation, the plan and the windows. Changes nothing.
+./run-sample.sh --dry-run     # needs a login: read-only identity and template validation calls, then the plan and the windows. Changes nothing.
 ./run-sample.sh               # asks you to type DELETE-SAMPLE, then runs for about 15-20 minutes
 ```
 
@@ -85,7 +85,7 @@ aws cloudformation create-stack --stack-name cftb-<RunId> --template-body file:/
   --parameters ParameterKey=RunId,ParameterValue=<RunId> ParameterKey=StartHour,ParameterValue=8 ParameterKey=EndHour,ParameterValue=17
 ```
 
-`<RunId>` looks like `2610101200-ab12`. For your own origin, replace the S3 origin and keep the cache policy and the function.
+Empty the bucket before `delete-stack` (a non-empty bucket gives DELETE_FAILED). `<RunId>` looks like `2610101200-ab12`. For your own origin, replace the S3 origin and keep the cache policy and the function.
 Cache policy: min TTL 0, default and max TTL `LongTtl`, header `x-cache-bust` in the key (so also forwarded to the origin), no cookies, no query strings.
 Min TTL 0 means that if your origin ever does send `no-store`/`private`/`no-cache`, CloudFront obeys it and no long caching happens; with
 min TTL above 0 CloudFront would cache anyway.
@@ -132,7 +132,9 @@ invocations a month are free), a few S3 requests, CloudFormation is free. Teardo
 - **Browsers.** Nothing here sets browser cache headers (the origin sends none), so a browser may apply its own heuristics. A
   viewer-response function could add `Cache-Control`; it is out of scope.
 - **Window switch is not instant.** A function update takes time to reach all edges (the run measures it for one location) and entries cached
-  just before the window starts stay under the plain key, unused while the window is on.
+  just before the window starts stay under the plain key, unused while the window is on. **They come back after the window closes:** an
+  object cached under the plain key at 07:59 and edited in S3 at 09:00 is served stale once the window ends, until its `LongTtl` runs out
+  (up to 24 hours by default). The run shows this (P4-LONG-CACHE). Mitigations: a shorter `LongTtl`, or an invalidation when the window closes.
 - **UTC hours only.** No time zones, no daylight saving, no weekdays or holidays. Whole hours only.
 - **Cache pollution.** Each bucket stores another copy of an in-window object for up to `LongTtl` (the origin sends no headers to shorten it).
   Whether those copies push other objects out of the cache early is not measured.

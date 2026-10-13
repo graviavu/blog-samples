@@ -164,6 +164,7 @@ preflight() {
 }
 check_inputs() {
   printf '%s' "$BUCKET_SECONDS" | grep -Eq '^[0-9]{1,3}$' || die "BUCKET_SECONDS must be a whole number of seconds, 20 to 600 (got '$BUCKET_SECONDS')"
+  BUCKET_SECONDS=$((10#$BUCKET_SECONDS))
   [ "$BUCKET_SECONDS" -ge 20 ] && [ "$BUCKET_SECONDS" -le 600 ] || die "BUCKET_SECONDS must be 20 to 600 (got '$BUCKET_SECONDS')"
   printf '%s' "$PROP_WAIT" | grep -Eq '^[0-9]{1,4}$' && [ "$PROP_WAIT" -ge 30 ] || die "PROP_WAIT must be a whole number of seconds, at least 30"
   printf '%s' "$POLL_GAP" | grep -Eq '^[0-9]{1,3}$' && [ "$POLL_GAP" -ge 1 ] || die "POLL_GAP must be a whole number of seconds, at least 1"
