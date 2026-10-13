@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake date: "date -u +FORMAT" shows the fake clock; anything else goes to the real date.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "$#" = 2 ] && [ "$1" = -u ] && [ "${2#+}" != "$2" ]; then
+  e="$(now_epoch)"
+  /bin/date -u -d "@$e" "$2" 2>/dev/null || /bin/date -u -r "$e" "$2"
+else
+  exec /bin/date "$@"
+fi

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls run-sample.sh makes; anything else exits 99.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
+if [ "${1:-}" = "--region" ]; then shift 2; fi
+svc="$1"; cmd="$2"; shift 2
+echo "$svc $cmd $*" >> "$S/calls.log"
+mkdir -p "$S/res" "$S/s3"
+q="$(arg --query "$@")"
+acct12="$(acct)"
+STACKNAME="$(arg --stack-name "$@")"
+
+# STUB_FAIL=<cmd>[:<n>]  the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
+# STUB_SIG=INT|TERM STUB_SIG_AT=<cmd>  signal the script (once) during that command.
+if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
+  n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
+  want="${STUB_FAIL#*:}"; [ "$want" = "$STUB_FAIL" ] && want=1
+  if [ "$n" = "$want" ]; then
+    echo "An error occurred (${STUB_FAIL_CODE:-AccessDenied}) when calling $cmd: denied arn:aws:iam::$acct12:role/x not allowed, account $acct12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(fake_domain), x-amz-security-token: $(printf '%s' abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ)" >&2
+    exit 254
+  fi
+fi
+if [ -n "${STUB_SIG:-}" ] && [ "$cmd" = "${STUB_SIG_AT:-}" ] && [ ! -e "$S/sig_done" ]; then
+  : > "$S/sig_done"; kill -"$STUB_SIG" "${RT_MAIN_PID:?}"; sleep 0.2
+fi
+
+fileof() { local f; f="$(arg "$1" "${@:2}")"; echo "${f#file://}"; }
+param() { jq -r --arg k "$1" '.[] | select(.ParameterKey==$k) | .ParameterValue' "$2"; }
+nostack() { echo "An error occurred (ValidationError) when calling the $cmd operation: Stack with id $STACKNAME does not exist" >&2; exit 254; }
+status_of() { cat "$S/res/cfn__$STACKNAME" 2>/dev/null | sed -n 1p; }
+tag_of() { sed -n 2p "$S/res/cfn__$STACKNAME"; }
+write_stack() { printf '%s\n%s\n' "$1" "$2" > "$S/res/cfn__$STACKNAME"; }   # status, tag
+
+case "$svc $cmd" in
+  "sts get-caller-identity") echo "$acct12" ;;
+  "cloudformation validate-template")
+    f="$(fileof --template-body "$@")"; grep -q '^Resources:' "$f" || { echo "stub: not a template" >&2; exit 254; }; echo '{}' ;;
+  "cloudformation create-stack")
+    [ -e "$S/res/cfn__$STACKNAME" ] && { echo "An error occurred (AlreadyExistsException) when calling the CreateStack operation: exists" >&2; exit 254; }
+    pf="$(fileof --parameters "$@")"; cp "$pf" "$S/params.json"; cp "$pf" "$S/params.prev.json"; put params.t "$(get slept 0)"
+    tag="$(printf '%s' "$*" | sed -n 's/.*Key=RunId,Value=\([A-Za-z0-9-]*\).*/\1/p')"
+    if [ -n "${STUB_FOREIGN_TAG:-}" ]; then tag=OTHERRUN; fi
+    write_stack CREATE_COMPLETE "$tag"
+    echo "$(param RunId "$pf")" > "$S/runid"
+    : > "$S/res/s3__cftb-$(param RunId "$pf")-content"
+    cp "$(fileof --template-body "$@")" "$S/template.yaml"
+    echo '{}' ;;
+  "cloudformation update-stack")
+    [ -e "$S/res/cfn__$STACKNAME" ] || nostack
+    pf="$(fileof --parameters "$@")"; cp "$S/params.json" "$S/params.prev.json"; cp "$pf" "$S/params.json"; put params.t "$(get slept 0)"
+    echo '{}' ;;
+  "cloudformation wait")
+    # wait stack-create-complete | stack-update-complete | stack-delete-complete
+    case "$1" in
+      stack-delete-complete) [ "$(status_of)" = DELETE_FAILED ] && { echo "Waiter StackDeleteComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; }; exit 0 ;;
+      *) [ -e "$S/res/cfn__$STACKNAME" ] || nostack; exit 0 ;;
+    esac ;;
+  "cloudformation describe-stacks")
+    [ -e "$S/res/cfn__$STACKNAME" ] || nostack
+    case "$q" in
+      'Stacks[0].Outputs') jq -n --arg d "$(fake_dist_id)" --arg h "$(fake_domain)" --arg b "cftb-$(get runid)-content" \
+        '[{OutputKey:"DistributionId",OutputValue:$d},{OutputKey:"DistributionDomain",OutputValue:$h},{OutputKey:"ContentBucketName",OutputValue:$b}]' ;;
+      'Stacks[0].StackStatus') status_of ;;
+      *Tags*) tag_of ;;
+      *) echo "stub: unknown describe-stacks query $q" >&2; exit 99 ;;
+    esac ;;
+  "cloudformation delete-stack")
+    [ -e "$S/res/cfn__$STACKNAME" ] || nostack
+    echo "DELETE stack-requested $STACKNAME" >> "$S/deleted.log"
+    if [ -n "$(ls "$S/s3" 2>/dev/null)" ]; then write_stack DELETE_FAILED "$(tag_of)"; exit 0; fi   # a non-empty bucket blocks the delete, like AWS
+    rm -f "$S/res/cfn__$STACKNAME" "$S/res/s3__cftb-$(get runid)-content"
+    echo "DELETE stack $STACKNAME" >> "$S/deleted.log" ;;
+  "s3api head-bucket")
+    if [ -e "$S/res/s3__$(arg --bucket "$@")" ]; then echo '{}'; else echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254; fi ;;
+  "s3api put-object")
+    cp "$(arg --body "$@")" "$S/s3/$(arg --key "$@")"; echo "PUT $(arg --key "$@")" >> "$S/puts.log"; echo '{}' ;;
+  "s3api delete-object") rm -f "$S/s3/$(arg --key "$@")"; echo "DELETE s3object $(arg --key "$@")" >> "$S/deleted.log"; echo '{}' ;;
+  *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
+esac
