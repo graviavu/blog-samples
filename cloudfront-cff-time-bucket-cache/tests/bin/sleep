@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake sleep: moves the fake clock instead of waiting.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+echo "sleep $*" >> "$S/calls.log"
+put slept $(( $(get slept 0) + ${1%.*} ))

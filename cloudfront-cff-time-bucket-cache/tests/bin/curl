@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fake curl: parses the options run-sample.sh uses and hands the request to fake-cloudfront.mjs (a tiny CloudFront simulation).
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+out="" dump="" url=""; hdrs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    -D) dump="$2"; shift ;;
+    -H) hdrs+=("$2"); shift ;;
+    --max-time) shift ;;
+    -sS|--path-as-is) ;;
+    -*) echo "stub curl: unexpected option $1" >&2; exit 99 ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+echo "curl $url ${hdrs[*]:-}" >> "$S/calls.log"
+host="${url#https://}"; host="${host%%/*}"
+[ "$host" = "$(fake_domain)" ] || { echo "curl: (6) Could not resolve host" >&2; exit 6; }
+export STUB_NOW="$(now_epoch)"
+exec node "$(dirname "$0")/fake-cloudfront.mjs" "$url" "$out" "$dump" ${hdrs[@]+"${hdrs[@]}"}
