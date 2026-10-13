@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Time-bucket cache key sample. One CloudFront distribution with an S3 origin (origin access control, no Cache-Control headers
+  from the origin) and a viewer-request CloudFront Function. Inside a daily UTC window the function sets the header x-cache-bust
+  to a time bucket, the cache policy has that header in the cache key, so objects are re-fetched every bucket. Outside the window
+  the header is absent (and any viewer-supplied copy is deleted), so objects are cached for LongTtl.
+
+# Deploy by hand (without run-sample.sh), see the README:
+#   aws cloudformation create-stack --stack-name cftb-<RunId> --template-body file://cfn/stack.yaml \
+#     --parameters ParameterKey=RunId,ParameterValue=<RunId> ParameterKey=StartHour,ParameterValue=8 ParameterKey=EndHour,ParameterValue=17
+
+Parameters:
+  RunId:
+    Type: String
+    Description: Short id used in resource names and as the RunId tag, for example 2610101200-ab12.
+    AllowedPattern: '[0-9]{10}-[0-9a-f]{4}'
+    ConstraintDescription: ten digits, a dash, four lowercase hex characters
+  StartHour:
+    Type: Number
+    Default: 8
+    MinValue: 0
+    MaxValue: 23
+    Description: First UTC hour of the daily window (inclusive). The time bucket is set inside the window.
+  EndHour:
+    Type: Number
+    Default: 17
+    MinValue: 0
+    MaxValue: 24
+    Description: >-
+      UTC hour where the window ends (exclusive); 24 means midnight. If EndHour is smaller than StartHour the window wraps past
+      midnight (for example 22 to 6). It must differ from StartHour.
+  BucketSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 86400
+    Description: Length of a time bucket in seconds = the longest an object can be stale inside the window.
+  LongTtl:
+    Type: Number
+    Default: 86400
+    MinValue: 60
+    MaxValue: 31536000
+    Description: Default and maximum TTL in seconds for objects outside the window (the origin sends no Cache-Control).
+
+Rules:
+  WindowIsNotEmpty:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref StartHour, !Ref EndHour]]
+        AssertDescription: StartHour and EndHour must differ.
+
+Resources:
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'cftb-${RunId}-content'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: RunId
+          Value: !Ref RunId
+        - Key: Purpose
+          Value: cftb-sample
+
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ContentBucket.Arn
+              - !Sub '${ContentBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowThisDistributionToRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${ContentBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'cftb-${RunId}-oac'
+        Description: Signs requests to the content bucket (SigV4, always).
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # The function code is the same text as function/time-bucket.js (a test checks that). !Sub puts the three parameters in.
+  TimeBucketFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub 'cftb-${RunId}-fn'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Time-bucket cache key (viewer-request)
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        // Viewer-request CloudFront Function (runtime cloudfront-js-2.0).
+        // Inside the daily UTC window [startHour, endHour) it sets the request header x-cache-bust to the current time bucket, so the
+        // cache key changes every bucketSeconds. Outside the window it sets nothing. In both cases a viewer-supplied x-cache-bust is
+        // removed first, so a client can never choose its own cache key. startHour > endHour means the window wraps past midnight.
+        var CFG = { startHour: ${StartHour}, endHour: ${EndHour}, bucketSeconds: ${BucketSeconds} };
+
+        function isInt(n, min, max) {
+          return typeof n === 'number' && isFinite(n) && n === Math.floor(n) && n >= min && n <= max;
+        }
+
+        // Returns the bucket as a string, or '' when the time is outside the window or the settings are unusable (fail to long cache).
+        function bucketFor(cfg, nowMs) {
+          if (!isInt(cfg.startHour, 0, 23) || !isInt(cfg.endHour, 0, 24) || !isInt(cfg.bucketSeconds, 1, 86400)) { return ''; }
+          if (cfg.startHour === cfg.endHour) { return ''; }
+          if (typeof nowMs !== 'number' || !isFinite(nowMs)) { return ''; }
+          var hour = new Date(nowMs).getUTCHours();
+          var inWindow = cfg.startHour < cfg.endHour
+            ? (hour >= cfg.startHour && hour < cfg.endHour)
+            : (hour >= cfg.startHour || hour < cfg.endHour);
+          if (!inWindow) { return ''; }
+          return String(Math.floor(nowMs / 1000 / cfg.bucketSeconds));
+        }
+
+        function handler(event) {
+          var request = event.request;
+          delete request.headers['x-cache-bust'];
+          var bucket = bucketFor(CFG, new Date().getTime());
+          if (bucket !== '') { request.headers['x-cache-bust'] = { value: bucket }; }
+          return request;
+        }
+
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub 'cftb-${RunId}-cp'
+        Comment: x-cache-bust is part of the cache key; the origin sends no Cache-Control so DefaultTTL decides.
+        MinTTL: 0
+        DefaultTTL: !Ref LongTtl
+        MaxTTL: !Ref LongTtl
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - x-cache-bust
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: RunId
+          Value: !Ref RunId
+        - Key: Purpose
+          Value: cftb-sample
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'cftb-${RunId} time-bucket cache key sample'
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: content
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: content
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          CachePolicyId: !Ref CachePolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt TimeBucketFunction.FunctionARN
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  ContentBucketName:
+    Value: !Ref ContentBucket
