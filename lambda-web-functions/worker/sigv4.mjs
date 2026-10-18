@@ -26,9 +26,23 @@ export async function signingKey(secret, date8, region, service) {
 // RFC 3986 unreserved set only, as SigV4 requires (encodeURIComponent leaves !'()* alone).
 const uriEncode = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
-function canonicalQuery(searchParams) {
+// The query is read as RFC 3986: '+' is a literal plus (sent as %2B), a space must arrive as %20. URLSearchParams would read '+'
+// as a space, and the service might read it either way, so the signer decodes the raw query itself and the caller sends the
+// canonical form it returns (`url`): what is sent is then exactly what was signed.
+function queryPairs(search) {
+  const q = search.startsWith('?') ? search.slice(1) : search;
+  if (!q) return [];
+  return q.split('&').filter((p) => p !== '').map((p) => {
+    const i = p.indexOf('=');
+    const k = i < 0 ? p : p.slice(0, i); const v = i < 0 ? '' : p.slice(i + 1);
+    const dec = (x) => { try { return decodeURIComponent(x); } catch { return x; } };
+    return [dec(k), dec(v)];
+  });
+}
+
+function canonicalQuery(search) {
   const pairs = [];
-  for (const [k, v] of searchParams) pairs.push([uriEncode(k), uriEncode(v)]);
+  for (const [k, v] of queryPairs(search)) pairs.push([uriEncode(k), uriEncode(v)]);
   pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
   return pairs.map(([k, v]) => `${k}=${v}`).join('&');
 }
@@ -47,7 +61,7 @@ function canonicalPath(pathname) {
  * @param {string} [o.payloadHash] hex SHA-256 of the body, or 'UNSIGNED-PAYLOAD' (default: hash of the empty string)
  * @param {boolean} [o.includeContentSha256] send x-amz-content-sha256 (default true; Lambda web functions require it)
  * @param {Date} [o.now]
- * @returns {Promise<{headers: Record<string,string>, canonicalRequest: string, signature: string}>}
+ * @returns {Promise<{url: string, headers: Record<string,string>, canonicalRequest: string, signature: string}>} send to `url`
  */
 export async function signRequest(o) {
   const url = new URL(o.url);
@@ -67,11 +81,12 @@ export async function signRequest(o) {
   }
   const names = Object.keys(toSign).sort();
   const canonicalHeaders = names.map((n) => `${n}:${toSign[n]}\n`).join('');
+  const cq = canonicalQuery(url.search);
   const signedHeaders = names.join(';');
   const canonicalRequest = [
     o.method.toUpperCase(),
     canonicalPath(url.pathname),
-    canonicalQuery(url.searchParams),
+    cq,
     canonicalHeaders,
     signedHeaders,
     payloadHash,
@@ -86,5 +101,5 @@ export async function signRequest(o) {
   if (includeSha) headers['x-amz-content-sha256'] = payloadHash;
   if (o.sessionToken) headers['x-amz-security-token'] = o.sessionToken;
   headers.authorization = `AWS4-HMAC-SHA256 Credential=${o.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-  return { headers, canonicalRequest, signature };
+  return { url: `${url.origin}${url.pathname}${cq ? '?' + cq : ''}`, headers, canonicalRequest, signature };
 }

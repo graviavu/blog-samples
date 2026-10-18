@@ -51,3 +51,14 @@ test('missing signHeaders entry is an error, not a silent skip', async () => {
     method: 'GET', url: 'https://h/', signHeaders: ['x-nope'], accessKeyId: 'a', secretAccessKey: 'b', region: 'r', service: 's',
   }), /not given/);
 });
+
+test("query: '+' is a literal plus, a space is %20, and the returned url is exactly what was signed", async () => {
+  const r = await signRequest({
+    method: 'GET', url: 'https://h.example/p?q=a+b&s=c%20d&z', accessKeyId: EXAMPLE_ID, secretAccessKey: EXAMPLE_KEY,
+    region: 'us-east-1', service: 'lambda', now: new Date('2026-10-18T00:00:00Z'),
+  });
+  assert.match(r.canonicalRequest, /\nq=a%2Bb&s=c%20d&z=\n/);
+  assert.equal(r.url, 'https://h.example/p?q=a%2Bb&s=c%20d&z=');
+  const plain = await signRequest({ method: 'GET', url: 'https://h.example/p', accessKeyId: 'a', secretAccessKey: 'b', region: 'r', service: 's' });
+  assert.equal(plain.url, 'https://h.example/p');
+});

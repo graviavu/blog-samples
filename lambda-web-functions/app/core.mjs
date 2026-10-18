@@ -15,6 +15,12 @@ const hdr = (headers, name) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// /slow is capped: a stranger (or a loop) holding requests open for long would keep execution environments busy and billed.
+export const SLOW_MAX_MS = 3000;
+export function slowMs(v) {
+  return Math.min(Math.max(parseInt(v || '2000', 10) || 0, 0), SLOW_MAX_MS);
+}
+
 // The distribution has /wf/* and /fu/* behaviors and CloudFront forwards the full path; the Worker strips its prefix.
 export function normalisePath(p) {
   return p.replace(/^\/(wf|fu)(?=\/|$)/, '') || '/';
@@ -58,7 +64,7 @@ export async function route(req, out) {
       });
     }
     if (path === '/slow') {
-      const ms = Math.min(Math.max(parseInt(req.query.get('ms') || '2000', 10) || 0, 0), 10000);
+      const ms = slowMs(req.query.get('ms'));
       await sleep(ms);
       return json(200, { kind: req.kind, env: ENV_ID, n, slept: ms, inflight, maxInflight, t: Date.now() });
     }

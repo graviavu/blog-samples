@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { route, normalisePath, ENV_ID } from '../app/core.mjs';
+import { route, normalisePath, ENV_ID, slowMs, SLOW_MAX_MS } from '../app/core.mjs';
 
 async function call(path, headers = {}, method = 'GET') {
   const u = new URL(path, 'http://x');
@@ -47,4 +47,12 @@ test('/slow waits and reports concurrency; /stream writes the requested chunks',
   assert.ok(Math.max(JSON.parse(a.body).maxInflight, JSON.parse(b.body).maxInflight) >= 2);
   const s = await call('/stream?chunks=3&gap=5');
   assert.equal(s.body.trim().split('\n').length, 3);
+});
+
+test('/slow is capped at 3000 ms (a long hold would keep environments busy and billed)', () => {
+  assert.equal(SLOW_MAX_MS, 3000);
+  assert.equal(slowMs('99999'), 3000);
+  assert.equal(slowMs('2000'), 2000);
+  assert.equal(slowMs('-5'), 0);
+  assert.equal(slowMs(null), 2000);
 });

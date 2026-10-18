@@ -25,13 +25,14 @@ async function signedFetch(req, env, host, rest, search) {
   const url = `https://${host}${rest}${search}`;
   // Lambda removes a SigV4 Authorization header before the app sees it, so the viewer's Authorization is NOT forwarded
   // (it could not arrive anyway); an application token has to travel in x-app-auth.
-  const { headers } = await signRequest({
+  const signed = await signRequest({
     method: req.method, url, headers: forwardHeaders(req),
     accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
     region: env.AWS_REGION || 'us-east-1', service: 'lambda', payloadHash: 'UNSIGNED-PAYLOAD',
   });
   const t0 = Date.now();
-  const upstream = await fetch(url, { method: req.method, headers });
+  // send exactly what was signed: the signer returns the URL with the query in canonical form ('+' is a literal plus)
+  const upstream = await fetch(signed.url, { method: req.method, headers: signed.headers });
   return withTiming(upstream, 'worker-subrequest', Date.now() - t0, 'worker-signed');
 }
 
@@ -78,8 +79,9 @@ export default {
     if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed', { status: 405 });
     if (p === '/health') return new Response('ok');
     // Per-run shared token (secret LWF_TOKEN): keeps drive-by traffic off the signed routes, so a stranger who finds the
-    // host name cannot spend the AWS side or the Workers quota. Not a security boundary for real data.
-    if (env.LWF_TOKEN && req.headers.get('x-lwf-token') !== env.LWF_TOKEN) return new Response('forbidden', { status: 403 });
+    // host name cannot spend the AWS side or the Workers quota. Not a security boundary for real data. Fails closed: a Worker
+    // whose LWF_TOKEN secret is missing (for example a failed secret upload) refuses everything but /health.
+    if (!env.LWF_TOKEN || req.headers.get('x-lwf-token') !== env.LWF_TOKEN) return new Response('forbidden', { status: 403 });
     let m;
     if ((m = p.match(/^\/wf(\/.*|)$/))) return signedFetch(req, env, env.WF_HOST, m[1] || '/', url.search);
     if ((m = p.match(/^\/fu(\/.*|)$/))) return signedFetch(req, env, env.FU_HOST, m[1] || '/', url.search);
