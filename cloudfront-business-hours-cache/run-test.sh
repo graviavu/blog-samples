@@ -33,7 +33,7 @@ export RT_MAIN_PID=$$   # lets the test stubs signal this script
 exec 3>&1 4>&2
 RESULTS_FILE=""
 
-# shellcheck disable=SC2329  # runs from the EXIT trap
+# shellcheck disable=SC2317,SC2329  # runs from the EXIT trap (SC2317 is what shellcheck 0.9, the CI version, reports)
 on_exit() {
   local rc=$?
   trap '' INT TERM HUP    # a second Ctrl-C must not interrupt the teardown
@@ -165,7 +165,7 @@ create_all() {
   CF_DOMAIN="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="DistributionDomain") | .OutputValue')"
   # shellcheck disable=SC2034  # used by redact()
   ORIGIN_HOST="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="OriginHost") | .OutputValue')"
-  [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] && [ -n "$CF_DOMAIN" ] && [ "$CF_DOMAIN" != null ] || fail "the stack outputs have no distribution"
+  if ! { [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] && [ -n "$CF_DOMAIN" ] && [ "$CF_DOMAIN" != null ]; }; then fail "the stack outputs have no distribution"; fi
   printf '%s' "$CF_DOMAIN" | grep -Eq '^[a-z0-9]+\.cloudfront\.net$' || fail "the distribution domain does not look like <id>.cloudfront.net; not sending requests to it"
 
   say "[5/5] initial window config and best-effort reserved concurrency for the public origin"
