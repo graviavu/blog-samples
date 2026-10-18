@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  lambda-web-functions sample, stack 2 of 2 in us-east-1: CloudFront in front of (a) a Lambda Web Function endpoint (IamAuth)
+  and (b) an Event Function behind a Function URL (AWS_IAM), both locked to this distribution with origin access control,
+  plus the IAM user the Cloudflare Worker signs with (two invoke permissions only) and the kill switch (a Lambda that a
+  one-time EventBridge schedule starts after KillAt: it disables the distribution, deactivates the user's keys, throttles both
+  functions). No public (ApplicationManaged) endpoint exists in this template. Names carry the run id so teardown can find them.
+  The web function resource policy for CloudFront is NOT in this template (no CloudFormation resource for it was found);
+  lwf-sample.sh puts it with the CLI after this stack is created and removes it in teardown.
+Parameters:
+  RunId:
+    Type: String
+    AllowedPattern: '^[0-9]{10}-[0-9a-f]{4}$'
+  CodeBucket:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  WfCodeKey:
+    Type: String
+    Default: wf.zip
+  FuCodeKey:
+    Type: String
+    Default: fu.zip
+  WfRuntime:
+    Type: String
+    Default: nodejs24.x
+  FuRuntime:
+    Type: String
+    Default: nodejs24.x
+  KillAt:
+    Type: String
+    AllowedPattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$'
+    Description: UTC time (yyyy-mm-ddThh:mm:ss) when the kill switch runs. lwf-sample.sh passes now plus 6 hours.
+  RateLimit:
+    Type: Number
+    Default: 200
+    AllowedValues: [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    Description: Endpoint requests per second. The schema allows 0 or 100 and up, so the smallest non-zero value is 100.
+  MaxEnvironments:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+  MaxConcurrencyPerEnvironment:
+    Type: Number
+    Default: 64
+    MinValue: 1
+    MaxValue: 128
+  AliasGrey:
+    Type: String
+    Default: ''
+    Description: O1, host name for the DNS-only record (empty = no aliases, default certificate)
+  AliasOrange:
+    Type: String
+    Default: ''
+    Description: O1, host name for the proxied record
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: O1, ACM certificate (us-east-1) covering both aliases
+Conditions:
+  HasAliases: !Not [!Equals [!Ref CertificateArn, '']]
+Resources:
+  # ------------------------------------------------------------------------------------------------ log groups (1 day)
+  WfLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/web/lwf-${RunId}-wf'
+      RetentionInDays: 1
+  WfLocalLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/web/lwf-${RunId}-wf.local'
+      RetentionInDays: 1
+  FuLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/lwf-${RunId}-fu'
+      RetentionInDays: 1
+  KillLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/lwf-${RunId}-kill'
+      RetentionInDays: 14
+  # ------------------------------------------------------------------------------------------------ execution roles
+  WfRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lwf-${RunId}-wf-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource:
+                  - !Sub '${WfLogGroup.Arn}:*'
+                  - !Sub '${WfLocalLogGroup.Arn}:*'
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  FuRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lwf-${RunId}-fu-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub '${FuLogGroup.Arn}:*'
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  # ------------------------------------------------------------------------------------------------ (a) Web Function
+  WebFunction:
+    Type: AWS::Lambda::WebFunction
+    Properties:
+      FunctionName: !Sub 'lwf-${RunId}-wf'
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  WebFunctionRevision:
+    Type: AWS::Lambda::WebFunctionRevision
+    DependsOn: [WfLogGroup, WfLocalLogGroup]
+    Properties:
+      FunctionName: !Ref WebFunction
+      BuildConfig:
+        CodeConfig:
+          S3Object:
+            Bucket: !Ref CodeBucket
+            Key: !Ref WfCodeKey
+        RuntimeConfig:
+          Runtime: !Ref WfRuntime
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt WfRole.Arn
+        TimeoutSeconds: 30
+        MaxConcurrencyPerEnvironment: !Ref MaxConcurrencyPerEnvironment
+  WebFunctionEndpoint:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    Properties:
+      FunctionName: !Ref WebFunction
+      EndpointName: live
+      EndpointType: HomeRegion
+      AuthType: IamAuth
+      RevisionWeights:
+        - RevisionId: !GetAtt WebFunctionRevision.RevisionId
+          Weight: 100
+      ScalingConfig:
+        MaxEnvironments: !Ref MaxEnvironments
+      ThrottleConfig:
+        RateLimit: !Ref RateLimit
+  # ------------------------------------------------------------------------------------------------ (b) Event Function + URL
+  FuFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'lwf-${RunId}-fu'
+      Runtime: !Ref FuRuntime
+      Architectures: [arm64]
+      Handler: fu-handler.handler
+      Timeout: 30
+      MemorySize: 512
+      Role: !GetAtt FuRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref FuCodeKey
+      LoggingConfig:
+        LogGroup: !Ref FuLogGroup
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  FuUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt FuFunction.Arn
+      AuthType: AWS_IAM
+      InvokeMode: RESPONSE_STREAM
+  FuPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FuFunction
+      Action: 'lambda:InvokeFunctionUrl'
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  FuPermissionInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FuFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  # ------------------------------------------------------------------------------------------------ CloudFront
+  WfOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'lwf-${RunId}-wf-oac'
+        Description: Web Function endpoint, SigV4, always-amz-auth (the only value allowed for web functions)
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always-amz-auth
+        SigningProtocol: sigv4
+  FuOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'lwf-${RunId}-fu-oac'
+        Description: Function URL, SigV4, always
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub 'lwf-${RunId}-cache'
+        Comment: Honours origin Cache-Control (max 300 s); Authorization is part of the key (and so reaches the origin)
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 300
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [Authorization]
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: all
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub 'lwf-${RunId}-timing'
+        Comment: Server-Timing on every response (cdn-upstream-fbl and friends)
+        ServerTimingHeadersConfig:
+          Enabled: true
+          SamplingRate: 100
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'lwf-${RunId} lambda-web-functions sample'
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Aliases: !If [HasAliases, [!Ref AliasGrey, !Ref AliasOrange], !Ref 'AWS::NoValue']
+        ViewerCertificate: !If
+          - HasAliases
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: wf
+            DomainName: !GetAtt WebFunctionEndpoint.DomainName
+            OriginAccessControlId: !GetAtt WfOac.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+          - Id: fu
+            DomainName: !Select [2, !Split ['/', !GetAtt FuUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt FuOac.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: wf
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          Compress: false
+          CachePolicyId: !Ref CachePolicy
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # managed AllViewerExceptHostHeader
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: '/wf/*'
+            TargetOriginId: wf
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            Compress: false
+            CachePolicyId: !Ref CachePolicy
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          - PathPattern: '/fu/*'
+            TargetOriginId: fu
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            Compress: false
+            CachePolicyId: !Ref CachePolicy
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  # ------------------------------------------------------------------------------------------------ Worker's IAM user
+  WorkerUser:
+    Type: AWS::IAM::User
+    Metadata:
+      cfn-lint:
+        config:
+          # W3037: cfn-lint's IAM action list predates Lambda Web Functions (launched 2026-10-12); the action is from the AWS docs.
+          ignore_checks: [W3037]
+    Properties:
+      UserName: !Sub 'lwf-${RunId}-worker'
+      Policies:
+        - PolicyName: invoke-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeTheWebFunctionEndpoint
+                Effect: Allow
+                Action: 'lambda:InvokeWebFunctionEndpoint'
+                Resource: !GetAtt WebFunctionEndpoint.EndpointArn
+              - Sid: InvokeTheFunctionUrl
+                Effect: Allow
+                Action: ['lambda:InvokeFunctionUrl', 'lambda:InvokeFunction']
+                Resource: !GetAtt FuFunction.Arn
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  # ------------------------------------------------------------------------------------------------ kill switch
+  KillRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3037]
+    Properties:
+      RoleName: !Sub 'lwf-${RunId}-kill-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: brake
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub '${KillLogGroup.Arn}:*'
+              - Sid: DisableTheDistribution
+                Effect: Allow
+                Action: ['cloudfront:GetDistributionConfig', 'cloudfront:UpdateDistribution']
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+              - Sid: DeactivateTheWorkerKeys
+                Effect: Allow
+                Action: ['iam:ListAccessKeys', 'iam:UpdateAccessKey']
+                Resource: !GetAtt WorkerUser.Arn
+              - Sid: ThrottleTheEventFunction
+                Effect: Allow
+                Action: 'lambda:PutFunctionConcurrency'
+                Resource: !GetAtt FuFunction.Arn
+              # UNVERIFIED action name: derived from the API operation UpdateWebFunctionEndpoint. If it is wrong, the
+              # kill switch reports web_function=error and the other three actions still run.
+              - Sid: ThrottleTheWebFunction
+                Effect: Allow
+                Action: ['lambda:UpdateWebFunctionEndpoint', 'lambda:GetWebFunctionEndpoint']
+                Resource: !GetAtt WebFunctionEndpoint.EndpointArn
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  KillFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'lwf-${RunId}-kill'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt KillRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref KillLogGroup
+      Environment:
+        Variables:
+          DIST_ID: !Ref Distribution
+          USER_NAME: !Ref WorkerUser
+          FU_NAME: !Ref FuFunction
+          WF_NAME: !Ref WebFunction
+          WF_ENDPOINT: live
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+      Code:
+        ZipFile: |
+          # Kill switch: each action is independent; the result of every one is returned and logged. Idempotent.
+          import json, os
+          import boto3
+
+          def step(out, name, fn):
+              try:
+                  out[name] = fn()
+              except Exception as e:  # report the error class only
+                  out[name] = 'error:' + type(e).__name__
+
+          def handler(event, context):
+              out = {}
+              def cf():
+                  c = boto3.client('cloudfront')
+                  r = c.get_distribution_config(Id=os.environ['DIST_ID'])
+                  cfg = r['DistributionConfig']
+                  if not cfg['Enabled']:
+                      return 'already-disabled'
+                  cfg['Enabled'] = False
+                  c.update_distribution(Id=os.environ['DIST_ID'], IfMatch=r['ETag'], DistributionConfig=cfg)
+                  return 'disabled'
+              def keys():
+                  i = boto3.client('iam')
+                  n = 0
+                  for k in i.list_access_keys(UserName=os.environ['USER_NAME'])['AccessKeyMetadata']:
+                      if k['Status'] == 'Active':
+                          i.update_access_key(UserName=os.environ['USER_NAME'], AccessKeyId=k['AccessKeyId'], Status='Inactive')
+                          n += 1
+                  return 'deactivated:%d' % n
+              def fu():
+                  boto3.client('lambda').put_function_concurrency(FunctionName=os.environ['FU_NAME'], ReservedConcurrentExecutions=0)
+                  return 'reserved-concurrency-0'
+              def wf():
+                  # UNVERIFIED: the Lambda runtime's boto3 may not know the 'lambda-web' service yet, and the parameter names
+                  # below are guesses from the CloudFormation schema. Failure is reported, not hidden.
+                  c = boto3.client('lambda-web')
+                  c.update_web_function_endpoint(FunctionName=os.environ['WF_NAME'], EndpointName=os.environ['WF_ENDPOINT'],
+                                                 ThrottleConfig={'RateLimit': 0})
+                  return 'rate-limit-0'
+              step(out, 'cloudfront', cf)
+              step(out, 'worker_keys', keys)
+              step(out, 'function_url', fu)
+              step(out, 'web_function', wf)
+              print(json.dumps(out))
+              return out
+  KillSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lwf-${RunId}-sched-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: invoke-kill
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt KillFunction.Arn
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  KillSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub 'lwf-${RunId}-kill'
+      Description: One-time kill switch for the lambda-web-functions sample
+      ScheduleExpression: !Sub 'at(${KillAt})'
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt KillFunction.Arn
+        RoleArn: !GetAtt KillSchedulerRole.Arn
+        Input: '{"source":"schedule"}'
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  WebFunctionName:
+    Value: !Ref WebFunction
+  WebFunctionArn:
+    Value: !GetAtt WebFunction.FunctionArn
+  WebFunctionEndpointDomain:
+    Value: !GetAtt WebFunctionEndpoint.DomainName
+  WebFunctionEndpointArn:
+    Value: !GetAtt WebFunctionEndpoint.EndpointArn
+  FunctionUrlHost:
+    Value: !Select [2, !Split ['/', !GetAtt FuUrl.FunctionUrl]]
+  FuFunctionName:
+    Value: !Ref FuFunction
+  WorkerUserName:
+    Value: !Ref WorkerUser
+  KillFunctionName:
+    Value: !Ref KillFunction
+  KillScheduleName:
+    Value: !Ref KillSchedule

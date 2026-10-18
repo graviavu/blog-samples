@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  lambda-web-functions sample, stack 1 of 2 in us-east-1: a versioned S3 bucket for the two code zips. It exists as its own
+  stack because the web function revision needs its code in S3 before the app stack is created. Teardown must empty ALL
+  object versions and delete markers before this stack can be deleted (lwf-sample.sh does).
+Parameters:
+  RunId:
+    Type: String
+    AllowedPattern: '^[0-9]{10}-[0-9a-f]{4}$'
+    Description: Run id made by lwf-sample.sh (yymmddhhmm-xxxx)
+  BucketName:
+    Type: String
+    AllowedPattern: '^lwf-[0-9]{10}-[0-9a-f]{4}-art-[0-9a-z-]{1,30}$'
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub '${ArtifactsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+Outputs:
+  BucketName:
+    Value: !Ref ArtifactsBucket
