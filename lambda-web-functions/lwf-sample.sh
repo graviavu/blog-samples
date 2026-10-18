@@ -364,11 +364,12 @@ step_worker() {
 step_dns() {
   done_step dns && { say "skip: DNS records (done)"; return 0; }
   say "step: DNS records"
+  # the extras are experiments: a record Cloudflare refuses (for example a proxied CNAME to an AWS endpoint) is reported, not fatal
   if [ "$O1" = 1 ]; then
-    dns_upsert "$H_G" "$CFD" false || die "could not create $H_G"
-    dns_upsert "$H_O" "$CFD" true || die "could not create $H_O"
+    dns_upsert "$H_G" "$CFD" false || warn "could not create $H_G (O1 grey path); its tests will fail"
+    dns_upsert "$H_O" "$CFD" true || warn "could not create $H_O (O1 orange path); its tests will fail"
   fi
-  if [ "$O3" = 1 ]; then dns_upsert "$H_X" "$WFH" true || die "could not create $H_X"; fi
+  if [ "$O3" = 1 ]; then dns_upsert "$H_X" "$WFH" true || warn "could not create $H_X (O3 negative control); that result will be an error, not a status code"; fi
   mark_done dns
 }
 
@@ -387,13 +388,23 @@ wait_worker() {
     [ "$st" = 200 ] && { say "ok: the Worker answers on its custom domain"; break; }
     nap 20
   done
-  [ "$st" = 200 ] || die "the Worker did not answer on https://<zone host>/health (last status $st); certificate issuance may still be running, re-run with --resume $RUN"
+  [ "$st" = 200 ] || die "the Worker did not answer on https://lwf-w.<zone>/health (last status $st); Cloudflare certificate issuance for a new custom domain can be slow. The restore removes this run; start again with a longer wait (READY_TRIES=90 in the environment, each try is 20 s)"
   for i in $(seq 1 "${READY_TRIES:-30}"); do
     pj_worker wready2 get "https://$H_W/wf/ping"; st="$(jq -r '.status // 0' "$TMP/pj.wready2")"
     [ "$st" = 200 ] && { say "ok: Worker -> web function answers 200"; return 0; }
     nap 15
   done
   warn "Worker -> web function did not return 200 (last status $st); the tests will report what happens"
+}
+wait_alias() { # O1: the DNS-only alias needs DNS and the distribution's alias to be live; never fatal
+  [ "$O1" = 1 ] || return 0
+  local i st=""
+  for i in $(seq 1 "${READY_TRIES:-30}"); do
+    pj_plain gready get "https://$H_G/wf/ping"; st="$(pv gready '.status // 0')"
+    [ "$st" = 200 ] && { say "ok: the DNS-only alias answers 200"; return 0; }
+    nap 15
+  done
+  warn "the DNS-only alias did not return 200 (last status $st); A3, A5 and A6 will show what happens on that path"
 }
 
 # ---------------------------------------------------------------------------------------------------- probe helpers
@@ -978,6 +989,7 @@ main() {
   step_dns
   step_probe
   wait_worker
+  wait_alias
   run_tests
   write_report
   if [ "$KEEP" = 1 ]; then

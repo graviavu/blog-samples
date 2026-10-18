@@ -70,10 +70,12 @@ cd lambda-web-functions
 ./lwf-sample.sh --zone example.com               # asks for the token, then for the phrase: deploy lwf sample
 ```
 
-Other forms: `--keep` (leave it up for inspection; the kill switch still fires at +6 h), `--resume <run-id>` (continue after a stop;
-finished steps are skipped, the AWS key is not recoverable so the signed tests become INCONCLUSIVE), `--status <run-id>`
+Other forms: `--keep` (leave it up for inspection; the kill switch still fires at +6 h), `--resume <run-id>` (continue a run that
+stopped hard, for example `kill -9`, a lost terminal or `--keep`; an ordinary failure or Ctrl-C is torn down by the restore trap instead. Finished steps are
+skipped; the AWS key is not recoverable, so the signed tests become INCONCLUSIVE), `--status <run-id>`
 (state plus a leftover scan, read-only), `--teardown <run-id>` (remove everything of that run).
-Never run it with `bash -x`; the script refuses (it would print the token).
+Never run it with `bash -x`; the script refuses (it would print the token). Waits can be lengthened from the environment:
+`READY_TRIES` (default 30; each try 20 s) for CloudFront and the Worker, `CERT_ISSUE_TRIES` (60, 15 s each) for ACM.
 
 What happens, in order: preflight (identity, budget, `lambda-web` CLI, the three CloudFormation types against the properties the
 template uses, token, zone, existing records) -> plan -> typed phrase -> artifacts stack and code upload -> ACM certificate (O1) -> app stack
