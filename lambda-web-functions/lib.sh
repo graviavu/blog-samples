@@ -14,6 +14,7 @@ STATE_DIR="${LWF_STATE_DIR:-$HERE/lwf-state}"
 RESULTS_ROOT="${LWF_RESULTS_DIR:-$HERE/results}"
 NODE="${LWF_NODE:-node}"
 KILL_HOURS="${LWF_KILL_HOURS:-6}"
+ACM_STATUSES="PENDING_VALIDATION ISSUED INACTIVE EXPIRED VALIDATION_TIMED_OUT REVOKED FAILED"   # list-certificates shows only ISSUED by default
 COMPAT_DATE="2026-10-01"           # Workers compatibility date; must not be in the future
 export AWS_PAGER=""
 
@@ -77,7 +78,7 @@ _aws() {
   local rc
   aws --region "${AWS_R:-$REGION}" "$@" 2>"$TMP/aws.err"; rc=$?
   if [ -s "$TMP/aws.err" ]; then redact < "$TMP/aws.err" >&2; fi
-  return $rc
+  return "$rc"
 }
 aws_ro() { _aws "$@"; }
 aws_do() {

@@ -35,6 +35,7 @@ case "$cls" in
       if [ "$status" = 200 ] && [ "$killed" = 1 ]; then case "$path" in /wf*|/fu*|/cache*) status=403 ;; esac; fi
     fi ;;
   orange) status="${STUB_ORANGE_STATUS:-200}" ;;
+  neg) status="${STUB_NEG_STATUS:-526}" ;;
 esac
 [ "${STUB_WORKER_DOWN:-}" = 1 ] && [ "$cls" = worker ] && status=000
 [ "${STUB_CF_DOWN:-}" = 1 ] && [ "$cls" = cf ] && status=000

@@ -133,7 +133,7 @@ case "$svc $cmd" in
 
   # ---------------------------------------------------------------- ACM
   "acm request-certificate")
-    d="$(arg --domain-name "$@")"; arn="arn:aws:acm:us-east-1:$acct12:certificate/00000000-0000-0000-0000-000000000001"
+    d="$(arg --domain-name "$@")"; arn="arn:aws:acm:us-east-1:$acct12:certificate/abcdef01-2345-6789-abcd-ef0123456789"
     reg cert "$arn" "$d"; put "certrun" "$(printf '%s' "$*" | sed -n 's/.*Key=RunId,Value=\([^ ]*\).*/\1/p')"; echo "$arn" ;;
   "acm describe-certificate")
     case "$q" in

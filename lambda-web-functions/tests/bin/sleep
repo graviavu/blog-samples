@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Fake sleep: returns at once and keeps a log (the script's waits are polling loops).
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
 . "$(dirname "$0")/stub-lib.sh"
 echo "sleep $*" >> "$S/sleep.log"
 exit 0

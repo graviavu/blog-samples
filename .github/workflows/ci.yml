@@ -14,8 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # cfn-lint is installed into a throwaway venv; PyPI wheels are not hash-pinned.
-  CFN_LINT_VERSION: "1.57.1"
+  # cfn-lint is installed into a throwaway venv; PyPI wheels are not hash-pinned. 1.57.2 is the first version that knows the
+  # AWS::Lambda::WebFunction* types (1.57.1 reports E3006 for them).
+  CFN_LINT_VERSION: "1.57.2"
 
 defaults:
   run:
@@ -58,10 +59,18 @@ jobs:
         working-directory: cloudfront-business-hours-cache
         run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/stack.yaml"
 
+      - name: cfn-lint (lambda-web-functions templates)
+        working-directory: lambda-web-functions
+        run: "${RUNNER_TEMP}/cfn-venv/bin/cfn-lint cfn/artifacts.yaml cfn/app.yaml cfn/probe.yaml"
+
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/*
+          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/* lambda-web-functions/*.sh lambda-web-functions/tests/run.sh lambda-web-functions/tests/bin/*
+
+      - name: lambda-web-functions node tests (SigV4 vectors, Worker, probe, app; no dependencies)
+        working-directory: lambda-web-functions
+        run: node --test test/*.test.mjs
 
       - name: verify.sh against the local mock (tests the script, not CloudFront)
         working-directory: cloudfront-request-routing
@@ -85,4 +94,8 @@ jobs:
 
       - name: business-hours-cache run-test.sh against fake aws, curl, date, sleep and zip
         working-directory: cloudfront-business-hours-cache
+        run: tests/run.sh
+
+      - name: lambda-web-functions run script against fake aws, curl, node and sleep (no cloud, no network)
+        working-directory: lambda-web-functions
         run: tests/run.sh

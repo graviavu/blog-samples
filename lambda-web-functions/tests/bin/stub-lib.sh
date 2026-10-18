@@ -4,7 +4,9 @@ S="${STUB_DIR:?STUB_DIR not set}"
 get() { cat "$S/$1" 2>/dev/null || printf '%s' "${2:-}"; }
 put() { printf '%s' "$2" > "$S/$1"; }
 # Values that look like real ids are built at run time so that the repo secret scan has nothing to flag.
-acct() { printf '%s%s' 1234 56789012; }
+acct() { if [ -n "${STUB_OTHER_ACCOUNT:-}" ]; then printf '%s%s' 9876 54321098; else printf '%s%s' 1234 56789012; fi; }
+# the Cloudflare token must never be in a child's environment (the script un-exports it)
+[ -z "${CF_API_TOKEN:-}" ] || echo "$0" >> "$S/leak.log"
 fake_akid() { printf '%s%s%s' AK IA ABCDEFGHIJKLMNOP; }
 fake_key() { printf '%s%s%s' abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMN 0123; }
 fake_cfd() { printf 'd%s.cloudfront.net' faketest12345; }

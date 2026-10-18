@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2329,SC2015,SC2154  # (SC2154: O_<OutputKey> variables are set by stack_outputs via eval) functions are called indirectly through td(); "A && B || C" is used where C only reports
 case "$-" in *x*) set +x; echo "refusing to run with xtrace (bash -x / set -x): it would print the Cloudflare token and the AWS key" >&2; exit 2 ;; esac
 case ":${SHELLOPTS:-}:" in *:xtrace:*) echo "refusing to run with SHELLOPTS=xtrace" >&2; exit 2 ;; esac
 # lwf-sample.sh - the ONE script of the lambda-web-functions sample (blog post 4).
@@ -194,7 +195,7 @@ print_plan() {
   say "  Cloudflare ($ZONE): Worker $WORKER on custom domain $H_W (Advanced Certificate may appear)"
   [ "$O1" = 0 ] || say "    records: $H_G (DNS only CNAME to CloudFront), $H_O (proxied CNAME to CloudFront)"
   [ "$O3" = 0 ] || say "    record:  $H_X (proxied CNAME straight to the web function endpoint, the negative control)"
-  say "  Tests A1-A8 (about 3,000 requests), results in $OUTDIR, then full teardown and a leftover scan."
+  say "  Tests A1-A8 (about 3,000 requests), results in results/$RUN/ next to the script, then full teardown and a leftover scan."
   say "  Cost (estimate, not a measurement): under \$1 per run, mostly CloudFront/Lambda requests inside free tiers; see README."
   say "  Kill switch at +${KILL_HOURS} h disables CloudFront, deactivates the Worker key, throttles both functions."
 }
@@ -299,7 +300,7 @@ load_app_outputs() {
   KILL_FN="$O_KillFunctionName"
   [ -n "$DIST_ID" ] && [ -n "$CFD" ] && [ -n "$WFH" ] && [ -n "$FUH" ] || die "app stack outputs are incomplete"
   redact_add "$DIST_ID" "<distribution-id>"; redact_add "$CFD" "<cloudfront-domain>"; redact_add "$WFH" "<wf-endpoint-host>"; redact_add "$FUH" "<fu-host>"
-  state_set DIST_ID "$DIST_ID"; state_set CFD "$CFD"
+  state_set DIST_ID "$DIST_ID"; state_set CFD "$CFD"; state_set EP_ARN "$EP_ARN"
 }
 
 step_policy() {
@@ -418,14 +419,14 @@ pv() { jq -r "$2" "$TMP/pj.$1" 2>/dev/null; }   # pv label jq-expression
 # ---------------------------------------------------------------------------------------------------- tests
 FAKE_JWT=""; FAKE_APP=""
 run_tests() {
-  say "tests A1-A8 (raw output in $RAWDIR)"
+  say "tests A1-A8 (raw output in results/$RUN/raw/)"
   FAKE_JWT="Bearer lwf-fake-jwt-$RUN"; FAKE_APP="lwf-fake-app-token-$RUN"
   T_START="$(date +%s)"
   test_a1; test_a2; test_a3; test_a4; test_a5; test_a6; test_a7; test_a8
 }
 
 test_a1() {
-  local s1 s2 s3 s4 cf1 cf2 w1 w2 w0 bad="" inc="" detail
+  local s1 s2 s3 s4 cf1 cf2 w1 w2 w0 neg bad="" inc="" detail
   pj_plain a1_wf_unsigned get "https://$WFH/ping"; s1="$(pv a1_wf_unsigned .status)"
   pj_plain a1_fu_unsigned get "https://$FUH/ping"; s2="$(pv a1_fu_unsigned .status)"
   if [ -n "$AK_SECRET" ]; then
@@ -437,10 +438,13 @@ test_a1() {
   pj_worker a1_w_wf get "https://$H_W/wf/ping"; w1="$(pv a1_w_wf .status)"
   pj_worker a1_w_fu get "https://$H_W/fu/ping"; w2="$(pv a1_w_fu .status)"
   pj_plain a1_w_notoken get "https://$H_W/wf/ping"; w0="$(pv a1_w_notoken .status)"
-  REQ_TOTAL=$((REQ_TOTAL + 9))
-  detail="direct unsigned wf=$s1 fu=$s2 (want 403 403); direct signed wf=$s3 fu=$s4 (want 200 200); via CloudFront wf=$cf1 fu=$cf2; via Worker wf=$w1 fu=$w2; Worker without run token=$w0 (want 403)"
+  neg="not run (--no-negative)"
+  if [ "$O3" = 1 ]; then pj_plain a1_negative get "https://$H_X/ping"; neg="$(pv a1_negative '.error // (.status|tostring)')"; fi
+  REQ_TOTAL=$((REQ_TOTAL + 10))
+  detail="direct unsigned wf=$s1 fu=$s2 (want 403 403); direct signed wf=$s3 fu=$s4 (want 200 200); via CloudFront wf=$cf1 fu=$cf2; via Worker wf=$w1 fu=$w2; Worker without run token=$w0 (want 403); negative control, orange CNAME straight to the endpoint without a Worker (O3)=$neg (expect 403, 404 or 52x, never 2xx; it cannot sign, so it cannot reach an IamAuth endpoint)"
   case "$s1" in 2??) bad="web function endpoint answers unsigned requests" ;; esac
   case "$s2" in 2??) bad="$bad function URL answers unsigned requests" ;; esac
+  case "$neg" in 2??) bad="$bad the proxied CNAME to the endpoint answers without a signature" ;; esac
   if [ -n "$bad" ]; then rec A1 FAIL "LOCK-DOWN BROKEN: $bad. $detail"
   elif [ "$s1" = 403 ] && [ "$s2" = 403 ] && [ "$cf1" = 200 ] && [ "$cf2" = 200 ] && [ "$w1" = 200 ] && [ "$w2" = 200 ] && [ "$w0" = 403 ] && { [ "$inc" = 1 ] || { [ "$s3" = 200 ] && [ "$s4" = 200 ]; }; }; then
     if [ "$inc" = 1 ]; then rec A1 INCONCLUSIVE "everything else as expected, direct signed calls skipped (no key in memory). $detail"; else rec A1 PASS "$detail"; fi
@@ -457,7 +461,7 @@ test_a2() {
   pj_worker a2_w_fu get "https://$H_W/fu/headers" --header "Authorization: $FAKE_JWT" --header "x-app-auth: $FAKE_APP"
   REQ_TOTAL=$((REQ_TOTAL + 4))
   for lab in a2_cf_wf a2_cf_fu a2_w_wf a2_w_fu; do
-    lines="$lines $lab[viewer-jwt=$(hdr_of "$lab" authorization) x-app-auth=$(hdr_of "$lab" x-app-auth) host=$(pv "$lab" '.body|fromjson?|.host // "?"')]"
+    lines="$lines ${lab}[viewer-jwt=$(hdr_of "$lab" authorization) x-app-auth=$(hdr_of "$lab" x-app-auth) host=$(pv "$lab" '.body|fromjson?|.host // "?"')]"
   done
   [ "$(hdr_of a2_cf_wf authorization)" = "$want_j" ] || issues="$issues CloudFront->WebFunction did not pass the viewer Authorization unchanged;"
   [ "$(hdr_of a2_cf_fu authorization)" != "$want_j" ] || issues="$issues CloudFront->FunctionUrl passed the viewer Authorization (expected it overwritten by OAC 'always');"
@@ -604,7 +608,7 @@ a6_pair() { # label mode url
   n1="$(pv "a6_${lab}_1" '.body|fromjson?|.nonce // "?"')"; n2="$(pv "a6_${lab}_2" '.body|fromjson?|.nonce // "?"')"
   same=different; [ "$n1" = "$n2" ] && [ "$n1" != "?" ] && same=same
   A6_HIT=0; case "$x2" in Hit*|HIT*) [ "$same" = same ] && A6_HIT=1 ;; esac
-  A6_LINE="$lab[1st=$x1,2nd=$x2,body=$same,cf-cache-status=$(pv "a6_${lab}_2" '.headers["cf-cache-status"] // "none"')];"
+  A6_LINE="${lab}[1st=$x1,2nd=$x2,body=$same,cf-cache-status=$(pv "a6_${lab}_2" '.headers["cf-cache-status"] // "none"')];"
 }
 
 test_a7() {
@@ -673,7 +677,7 @@ write_report() {
     echo
     echo "Raw (redacted) responses: \`raw/\`. Read both files before sharing them."
   } | redact > "$md"
-  say "report: $md and $json"
+  say "report: results/$RUN/report.md and results/$RUN/results.json"
 }
 
 # ---------------------------------------------------------------------------------------------------- teardown
@@ -749,7 +753,8 @@ td_schedule() { aws_do scheduler delete-schedule --name "$SCHEDULE" >/dev/null 2
 td_cert() {
   local arn="${CERT_ARN:-$(state_get CERT_ARN)}" i found=""
   if [ -z "$arn" ]; then # discovery: certificates for our alias name that carry this run's tag
-    for a in $(aws_ro acm list-certificates --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null); do
+    # shellcheck disable=SC2086  # ACM_STATUSES is a list of words on purpose
+    for a in $(aws_ro acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null); do
       if [ "$(aws_ro acm list-tags-for-certificate --certificate-arn "$a" --query "Tags[?Key=='RunId'].Value | [0]" --output text 2>/dev/null)" = "$RUN" ]; then found="$a"; fi
     done
     arn="$found"
@@ -771,7 +776,7 @@ td_logs() {
       done
     done
   done
-  return $rc
+  return "$rc"
 }
 do_teardown() {
   [ "$TEARDOWN_DONE" = 0 ] || return 0
@@ -839,7 +844,8 @@ scan_leftovers() {
   for x in $names; do left "iam user" "$x"; done
   names="$(aws_ro scheduler list-schedules --name-prefix "$P" --query 'Schedules[].Name' --output text 2>/dev/null)" || { gap "scheduler" "$(aws_code)"; names=""; }
   for x in $names; do left "schedule" "$x"; done
-  names="$(aws_ro acm list-certificates --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null)" || { gap "acm certificates" "$(aws_code)"; names=""; }
+  # shellcheck disable=SC2086  # ACM_STATUSES is a list of words on purpose
+  names="$(aws_ro acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null)" || { gap "acm certificates" "$(aws_code)"; names=""; }
   for x in $names; do
     if [ "$(aws_ro acm list-tags-for-certificate --certificate-arn "$x" --query "Tags[?Key=='RunId'].Value | [0]" --output text 2>/dev/null)" = "$RUN" ]; then left "acm certificate" "$x"; fi
   done
@@ -884,12 +890,14 @@ trap 'exit 129' HUP
 main_teardown_or_status() {
   preflight_tools
   ACCOUNT="$(aws_ro sts get-caller-identity --query Account --output text)" || die "AWS credentials do not work"
+  [ -z "$ZONE" ] || [ -z "$(state_get_run ZONE)" ] || [ "$ZONE" = "$(state_get_run ZONE)" ] || die "run $RUN was created for another Cloudflare zone than --zone; refusing (a teardown for the wrong zone would report 'nothing left' without having looked at the right records)"
   [ -n "$ZONE" ] || ZONE="$(state_get_run ZONE)"
   if [ -z "$ZONE" ]; then
     [ -t 0 ] || die "--zone is required (the state file of run $RUN does not name it)"
     printf 'Cloudflare zone (domain name): ' >&2; IFS= read -r ZONE
   fi
   [[ "$ZONE" =~ $HOST_RE ]] || die "zone '$ZONE' is not a lower-case DNS name"
+  guard_state
   set_names
   mkdir -p "$RAWDIR"
   if get_token; then lookup_zone || { warn "Cloudflare zone lookup failed (HTTP $CF_HTTP); Cloudflare resources cannot be checked"; HDR=""; }; else HDR=""; warn "no Cloudflare token: Cloudflare resources will not be handled"; fi
@@ -900,6 +908,10 @@ main_teardown_or_status() {
   do_teardown
   [ "$TEARDOWN_RC" = 0 ] && say "teardown complete, nothing left" || say "teardown finished with leftovers (exit 3): see LEFTOVER / SCAN-GAP / TEARDOWN lines above"
   exit "$TEARDOWN_RC"
+}
+guard_state() { # the run's resources are named after the account; another account would look empty and "clean"
+  local a4; a4="$(state_get_run ACCOUNT_LAST4)"
+  [ -z "$a4" ] || [ "$a4" = "${ACCOUNT: -4}" ] || die "run $RUN was created in the AWS account ending $a4, but these credentials are for the account ending ${ACCOUNT: -4}; refusing"
 }
 state_get_run() { # key from the state file of --run (before set_names has run)
   [ -f "$STATE_DIR/$RUN.env" ] || return 0
@@ -924,6 +936,7 @@ main() {
   fi
   [[ "$ZONE" =~ $HOST_RE ]] || die "zone '$ZONE' is not a lower-case DNS name"
   preflight_aws
+  [ "$RESUME" = 0 ] || guard_state
   set_names
   if [ "$DRY" = 0 ]; then
     mkdir -p "$RAWDIR"
@@ -950,7 +963,7 @@ main() {
     say "a Worker, DNS records) and removes them at the end. To continue type exactly: $PHRASE"
     printf '> ' >&2; IFS= read -r typed || typed=""
     [ "$typed" = "$PHRASE" ] || die "confirmation phrase did not match; nothing was changed"
-    state_set RUN "$RUN"; state_set ZONE "$ZONE"; state_set O1 "$O1"; state_set O2 "$O2"; state_set O3 "$O3"
+    state_set RUN "$RUN"; state_set ZONE "$ZONE"; state_set ACCOUNT_LAST4 "${ACCOUNT: -4}"; state_set O1 "$O1"; state_set O2 "$O2"; state_set O3 "$O3"
     state_set KILL_AT "$(future_utc "$KILL_HOURS")"
   fi
   CREATE_STARTED=1

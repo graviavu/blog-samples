@@ -15,6 +15,7 @@ ZONE=example.test
 TOKEN=cftoken_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345   # fake, 40 characters
 PHRASE="deploy lwf sample"
 SCRIPT="$root/lwf-sample.sh"
+ACCT12="$(STUB_DIR="$TMP" bash -c '. "$1/bin/stub-lib.sh"; acct' _ "$here")"   # the fake account id, built at run time
 
 check() { # description, then a command; passes when the command succeeds
   local d="$1"; shift
@@ -53,9 +54,9 @@ lwfsig() {
   printf '%s\n' "$input" | bash -c 'echo $$ > "$STUB_PIDFILE"; exec "$0" "$@"' "$SCRIPT" "$@" > "$OUT" 2>&1; RC=$?
 }
 # aws_clean: no resource of this run in the fake registry (the other run's may remain). cf_clean: no Worker, domain, pack; records: only the unrelated one.
-aws_clean() { [ "$(ls "$STUB_DIR/res" | grep -vc "lwf-$RUN_OTHER")" = 0 ]; }
+aws_clean() { [ "$(find "$STUB_DIR/res" -type f ! -name "*lwf-$RUN_OTHER*" | wc -l | tr -d ' ')" = 0 ]; }
 run_clean() { aws_clean && cf_clean; }
-cf_clean() { [ -z "$(find "$STUB_DIR/cf/scripts" "$STUB_DIR/cf/domains" "$STUB_DIR/cf/packs" -type f 2>/dev/null)" ] && [ "$(ls "$STUB_DIR/cf/records" 2>/dev/null | grep -v '^foreign1.json$' | wc -l | tr -d ' ')" = 0 ]; }
+cf_clean() { [ -z "$(find "$STUB_DIR/cf/scripts" "$STUB_DIR/cf/domains" "$STUB_DIR/cf/packs" -type f 2>/dev/null)" ] && [ "$(find "$STUB_DIR/cf/records" -type f ! -name foreign1.json 2>/dev/null | wc -l | tr -d ' ')" = 0 ]; }
 # only reads: every aws call is describe/get/list/help (or sts, budgets), every curl is a GET
 # aws call lines are "<region> <service> <command> <args>"; the CLI "help" probes of the preflight end in " help"
 aws_lines() { grep -E '^(us-east-1|eu-west-1) ' "$STUB_DIR/calls.log" | grep -Ev ' help *$'; }
@@ -73,7 +74,7 @@ seed_foreign() { # resources of ANOTHER run that must never be touched
 foreign_intact() { [ -e "$STUB_DIR/res/cfn__lwf-$RUN_OTHER-app" ] && [ -e "$STUB_DIR/res/user__lwf-$RUN_OTHER-worker" ] && [ -e "$STUB_DIR/res/s3__lwf-$RUN_OTHER-art-1" ] \
   && [ -e "$STUB_DIR/res/fn__lwf-$RUN_OTHER-fu" ] && [ -e "$STUB_DIR/res/lg__%aws%lambda%lwf-$RUN_OTHER-fu" ] && [ -e "$STUB_DIR/cf/records/foreign1.json" ]; }
 result_of() { jq -r --arg i "$2" '.results[] | select(.id == $i) | .status' "$LWF_RESULTS_DIR/$RUN_A/results.json"; }
-SECRET_VALUES() { "$here/bin/aws" --version >/dev/null; . "$here/bin/stub-lib.sh"; fake_key; }
+SECRET_VALUES() { STUB_DIR="$TMP" bash -c '. "$1/bin/stub-lib.sh"; fake_key' _ "$here"; }
 
 echo "== node tests (worker, signer, probe, app)"
 if [ -n "$REAL_NODE" ]; then
@@ -160,9 +161,9 @@ check "the AWS secret key is NOT in any command line" hasnot "$STUB_DIR/calls.lo
 check "the Cloudflare token is NOT in any command line" hasnot "$STUB_DIR/calls.log" "$TOKEN"
 check "token and key are not in the output" bash -c "! grep -q '$TOKEN' '$OUT' && ! grep -q '$SECRET' '$OUT'"
 check "token and key are not in state, results or raw files" bash -c "! grep -rq -e '$TOKEN' -e '$SECRET' '$LWF_STATE_DIR' '$LWF_RESULTS_DIR'"
-check "account id, ARNs and the access key id do not appear in the output or results" bash -c "! grep -rEq '123456789012|arn:aws|AKIA[0-9A-Z]{16}' '$OUT' '$LWF_RESULTS_DIR'"
+check "account id, ARNs and the access key id do not appear in the output or results" bash -c "! grep -rEq '$ACCT12|arn:aws|AKIA[0-9A-Z]{16}' '$OUT' '$LWF_RESULTS_DIR'"
 check "the zone name is masked in output and results" bash -c "! grep -rq 'example.test' '$OUT' '$LWF_RESULTS_DIR'"
-check "state file is mode 600 and the dir 700" bash -c "[ \$(stat -f %Lp '$LWF_STATE_DIR/$RUN_A.env' 2>/dev/null || stat -c %a '$LWF_STATE_DIR/$RUN_A.env') = 600 ] && [ \$(stat -f %Lp '$LWF_STATE_DIR' 2>/dev/null || stat -c %a '$LWF_STATE_DIR') = 700 ]"
+check "state file is mode 600 and the dir 700" bash -c "[ \"\$(ls -ld '$LWF_STATE_DIR/$RUN_A.env' | cut -c1-10)\" = -rw------- ] && [ \"\$(ls -ld '$LWF_STATE_DIR' | cut -c1-10)\" = drwx------ ]"
 check "no temp dir (with the token header file) left behind" bash -c "[ -z \"\$(ls '$TMPDIR')\" ]"
 check "teardown order: schedule and Worker go before the app stack, certificate and bucket after" bash -c "
   d='$STUB_DIR/deleted.log'
@@ -171,6 +172,8 @@ check "teardown order: schedule and Worker go before the app stack, certificate 
   [ \$s -lt \$a ] && [ \$w -lt \$a ] && [ \$a -lt \$c ] && [ \$a -lt \$b ]"
 check "object versions were deleted before the artifacts stack" bash -c "grep -n 'DELETE s3obj' '$STUB_DIR/deleted.log' | head -1 | cut -d: -f1 | xargs -I{} sh -c '[ {} -lt \$(grep -n \"DELETE s3 \" \"$STUB_DIR/deleted.log\" | head -1 | cut -d: -f1) ]'"
 check "never an ApplicationManaged call (no public endpoint exists)" hasnot "$STUB_DIR/calls.log" "ApplicationManaged"
+check "the Cloudflare token was never in the environment of aws, curl or node" bash -c "[ ! -e '$STUB_DIR/leak.log' ]"
+check "A1 recorded the negative control (lwf-x) and it did not answer 200" has "$LWF_RESULTS_DIR/$RUN_A/report.md" "negative control"
 
 echo "== flags turn the extras off"
 reset_env; newdir noextras
@@ -192,7 +195,7 @@ stage() { # name, "svc cmd" or "METHOD substring", N
   check "$name: restore ran and the scan is clean" bash -c "grep -q 'RESTORE: the run failed' '$OUT' && grep -q 'scan: nothing left' '$OUT'"
   check "$name: nothing of this run remains" run_clean
   check "$name: the other run and the unrelated record are untouched" foreign_intact
-  check "$name: error text is redacted (no account id, key id, token, ARN, CloudFront domain)" bash -c "! grep -Eq '123456789012|AKIA[0-9A-Z]{16}|arn:aws|cloudfront.net|$TOKEN|abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ' '$OUT'"
+  check "$name: error text is redacted (no account id, key id, token, ARN, CloudFront domain)" bash -c "! grep -Eq '$ACCT12|AKIA[0-9A-Z]{16}|arn:aws|cloudfront.net|$TOKEN|abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ' '$OUT'"
 }
 stage fail-artifacts "cloudformation deploy" 1
 stage fail-upload "s3api put-object" 1
@@ -254,7 +257,7 @@ echo "== --keep, --status, --teardown, --resume"
 reset_env; newdir keep; seed_foreign
 lwf "$PHRASE" --zone "$ZONE" --keep
 check "--keep exits 0 and leaves the resources" bash -c "[ $RC = 0 ] && [ -e '$STUB_DIR/res/dist__lwf-$RUN_A' ] && grep -q 'kill switch fires at' '$OUT'"
-n_deploy="$(count "$STUB_DIR/calls.log" 'cloudformation deploy')"; n_rec="$(ls "$STUB_DIR/cf/records" | wc -l | tr -d ' ')"
+n_deploy="$(count "$STUB_DIR/calls.log" 'cloudformation deploy')"
 lwf "" --status "$RUN_A" --zone "$ZONE"
 check "--status lists what is still there (exit 3) and hides the Worker token" bash -c "[ $RC = 3 ] && grep -q 'LEFTOVER cloudfront distribution' '$OUT' && ! grep -q WTOKEN '$OUT'"
 lwf "" --resume "$RUN_A"
@@ -268,6 +271,16 @@ check "...and nothing of the run remains" run_clean
 lwf "" --teardown "$RUN_A" --zone "$ZONE"
 check "--teardown a second time is idempotent (exit 0, nothing left)" bash -c "[ $RC = 0 ] && grep -q 'scan: nothing left' '$OUT'"
 check "--teardown never touched the other run" foreign_intact
+reset_env; newdir wrong-account; seed_foreign
+lwf "$PHRASE" --zone "$ZONE" --keep
+export STUB_OTHER_ACCOUNT=1
+lwf "" --teardown "$RUN_A" --zone "$ZONE"
+check "--teardown with credentials of another account is refused (it would look clean)" bash -c "[ $RC = 2 ] && grep -q 'was created in the AWS account ending' '$OUT'"
+unset STUB_OTHER_ACCOUNT
+lwf "" --teardown "$RUN_A" --zone other.example.test
+check "--teardown with another zone than the run's is refused" bash -c "[ $RC = 2 ] && grep -q 'another Cloudflare zone' '$OUT'"
+lwf "" --teardown "$RUN_A"
+check "--teardown takes the zone from the state file when --zone is not given" bash -c "[ $RC = 0 ] && grep -q 'scan: nothing left' '$OUT'"
 reset_env; newdir teardown-notoken; seed_foreign
 lwf "$PHRASE" --zone "$ZONE" --keep
 unset CF_API_TOKEN
