@@ -8,11 +8,11 @@
 //   /edge/*        answered by the Worker itself (the "Workers baseline": ping, stream)
 //   /health        "ok"
 //
-// Bindings (set by lwf-sample.sh): plain text WF_HOST, FU_HOST, CF_ORIGIN, AWS_REGION; secrets AWS_ACCESS_KEY_ID and
+// Bindings (set by lwf-sample.sh): plain text WF_HOST, FU_HOST, CF_ORIGIN, AWS_REGION; secrets LWF_TOKEN, AWS_ACCESS_KEY_ID and
 // AWS_SECRET_ACCESS_KEY (an IAM user that may only invoke the two sample endpoints). The Worker never logs a header value.
 import { signRequest } from './sigv4.mjs';
 
-const DROP = /^(host|authorization|connection|content-length|cf-|x-forwarded-|x-real-ip|true-client-ip|cdn-loop|x-amz-)/i;
+const DROP = /^(host|authorization|connection|content-length|cf-|x-forwarded-|x-real-ip|true-client-ip|cdn-loop|x-lwf-token|x-amz-)/i;
 
 function forwardHeaders(req) {
   const h = {};
@@ -77,6 +77,9 @@ export default {
     const p = url.pathname;
     if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed', { status: 405 });
     if (p === '/health') return new Response('ok');
+    // Per-run shared token (secret LWF_TOKEN): keeps drive-by traffic off the signed routes, so a stranger who finds the
+    // host name cannot spend the AWS side or the Workers quota. Not a security boundary for real data.
+    if (env.LWF_TOKEN && req.headers.get('x-lwf-token') !== env.LWF_TOKEN) return new Response('forbidden', { status: 403 });
     let m;
     if ((m = p.match(/^\/wf(\/.*|)$/))) return signedFetch(req, env, env.WF_HOST, m[1] || '/', url.search);
     if ((m = p.match(/^\/fu(\/.*|)$/))) return signedFetch(req, env, env.FU_HOST, m[1] || '/', url.search);

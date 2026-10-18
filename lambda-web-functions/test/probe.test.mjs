@@ -32,7 +32,7 @@ test.after(() => { server.close(); rmSync(dir, { recursive: true, force: true })
 // async: the test server lives in this process, so a blocking spawnSync would deadlock
 function run(args, input) {
   return new Promise((resolve) => {
-    const c = spawn('node', [probe, ...args], { env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' } });
+    const c = spawn(process.execPath, [probe, ...args], { env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' } });
     let out = ''; let err = '';
     c.stdout.on('data', (d) => { out += d; }); c.stderr.on('data', (d) => { err += d; });
     c.on('close', (code) => resolve({ code, out: out.trim() ? JSON.parse(out) : null, err }));

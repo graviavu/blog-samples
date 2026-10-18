@@ -5,6 +5,7 @@
 //   probe.mjs latency  URL [--sign] [--n 30] [--warm 3] [--header ..]  sequential GETs on a kept-alive connection: ttfb p50/p90
 //   probe.mjs parallel URL [--sign] [--n 64]                           N concurrent GETs: status counts, distinct environments, wall time
 //   probe.mjs stream   URL [--sign] [--header ..]                      first byte and arrival time of each chunk
+// --worker: add the header x-lwf-token with the value of the environment variable LWF_TOKEN (the Worker's per-run token).
 //
 // --sign: SigV4 (service lambda, region --region, default us-east-1) with the key read from STDIN as {"id":"..","secret":".."},
 // so the secret is never in argv or the environment. Request header VALUES are never printed (only response headers listed below).
@@ -21,6 +22,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (t === '--sign') a.sign = true;
+    else if (t === '--worker') a.worker = true;
     else if (t === '--header') a.header.push(argv[++i]);
     else if (t.startsWith('--')) a[t.slice(2)] = argv[++i];
     else a._.push(t);
@@ -39,6 +41,7 @@ function loadCreds() {
 async function buildHeaders(url, opts) {
   const h = {};
   for (const line of opts.header) { const i = line.indexOf(':'); if (i > 0) h[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim(); }
+  if (opts.worker && process.env.LWF_TOKEN) h['x-lwf-token'] = process.env.LWF_TOKEN; // per-run Worker token, from the environment, never argv
   if (!opts.sign) return h;
   const c = loadCreds();
   const s = await signRequest({

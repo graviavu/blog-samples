@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Fake node for tests/run.sh: answers the version probe and plays tools/probe.mjs (no network). The real probe.mjs and the Worker
+# are tested with `node --test` in test/. Every call is logged with its arguments; the AWS key arrives on stdin and must never be in argv.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = -p ]; then echo 22; exit 0; fi
+case "${1:-}" in *probe.mjs) ;; *) echo "stub node: unhandled: $*" >&2; exit 99 ;; esac
+shift
+cmd="$1"; url="$2"; shift 2
+echo "node probe $cmd $url $*" >> "$S/calls.log"
+signed=0; worker=0; hdrs=()
+while [ $# -gt 0 ]; do
+  case "$1" in --sign) signed=1 ;; --worker) worker=1 ;; --header) hdrs+=("$2"); shift ;; --n) n="$2"; shift ;; esac
+  shift
+done
+if [ "$signed" = 1 ]; then
+  creds="$(cat)"
+  printf '%s' "$creds" | jq -e '.id and .secret' >/dev/null 2>&1 || { echo '{"error":"no key on stdin"}'; exit 2; }
+fi
+host="${url#https://}"; host="${host%%/*}"; path="/${url#https://*/}"; path="${path%%\?*}"
+cls=other
+case "$host" in
+  "$(fake_cfd)") cls=cf ;; "$(fake_wfh)") cls=wf ;; "$(fake_fuh)") cls=fu ;;
+  lwf-w.*) cls=worker ;; lwf-g.*) cls=grey ;; lwf-o.*) cls=orange ;; lwf-x.*) cls=neg ;;
+esac
+killed=0; [ -e "$S/killed" ] && killed=1
+status=200
+case "$cls" in
+  wf|fu) [ "$signed" = 1 ] && [ "$killed" = 0 ] || status=403 ;;
+  cf) [ "$killed" = 1 ] && status=403 ;;
+  worker)
+    if [ "$path" != /health ]; then
+      { [ "$worker" = 1 ] && [ -n "${LWF_TOKEN:-}" ]; } || status=403
+      if [ "$status" = 200 ] && [ "$killed" = 1 ]; then case "$path" in /wf*|/fu*|/cache*) status=403 ;; esac; fi
+    fi ;;
+  orange) status="${STUB_ORANGE_STATUS:-200}" ;;
+esac
+[ "${STUB_WORKER_DOWN:-}" = 1 ] && [ "$cls" = worker ] && status=000
+[ "${STUB_CF_DOWN:-}" = 1 ] && [ "$cls" = cf ] && status=000
+[ "${STUB_UNLOCKED:-}" = 1 ] && [ "$cls" = wf ] && status=200
+status=$((10#$status))
+
+hval() { local h; for h in "${hdrs[@]+"${hdrs[@]}"}"; do case "$h" in "$1:"*) printf '%s' "${h#*: }"; return ;; esac; done; }
+shaof() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+case "$cmd" in
+  get)
+    h='{}'; body='{"ok":true}'
+    case "$path" in
+      */headers)
+        aj="$(hval Authorization)"; xa="$(hval x-app-auth)"; seen_host="$host"
+        case "$cls$path" in cf/wf*) seen_host="$(fake_wfh)"; auth="$aj" ;; cf/fu*) seen_host="$(fake_fuh)"; auth="AWS4-HMAC-SHA256 replaced-by-oac" ;; *) auth="" ;; esac
+        [ "${STUB_AUTH_DROPPED:-}" = 1 ] && [ "$cls" = cf ] && auth=""
+        body="$(jq -nc --arg h "$seen_host" --arg a "$auth" --arg x "$xa" --arg ah "$([ -n "$auth" ] && shaof "$auth")" --arg xh "$([ -n "$xa" ] && shaof "$xa")" \
+          '{host:$h, authorization:(if $a=="" then {present:false} else {present:true,sha256:$ah} end), "x-app-auth":(if $x=="" then {present:false} else {present:true,sha256:$xh} end)}')" ;;
+      */cache)
+        k="cache-$cls-${path//\//_}"; c=$(( $(get "$k" 0) + 1 )); put "$k" "$c"
+        body='{"nonce":"n1"}'
+        case "$cls$path" in
+          worker*) [ "$c" -gt 1 ] && h='{"x-lwf-cache":"HIT"}' || h='{"x-lwf-cache":"MISS"}' ;;
+          orange*) h='{"cf-cache-status":"DYNAMIC"}'; [ "$c" -gt 1 ] && body='{"nonce":"n2"}' ;;
+          *) [ "$c" -gt 1 ] && h='{"x-cache":"Hit from cloudfront"}' || h='{"x-cache":"Miss from cloudfront"}' ;;
+        esac
+        [ "${STUB_NO_CACHE_HIT:-}" = 1 ] && [ "$cls" = cf ] && { h='{"x-cache":"Miss from cloudfront"}'; body="$(jq -nc --arg n "n$c" '{nonce:$n}')"; } ;;
+    esac
+    jq -nc --argjson s "$status" --argjson h "$h" --arg b "$body" '{status:$s,headers:$h,body:$b,error:null,ttfbMs:12.3,totalMs:15.1}' ;;
+  latency)
+    jq -nc --argjson n "${n:-30}" --argjson s "$status" '{n:$n,ok:(if $s==200 then $n else 0 end),errors:0,status:{($s|tostring):$n},p50:12.5,p90:20.1,min:9,max:31,firstHeaders:{"x-amz-cf-pop":"DUB56-P1","server-timing":"cdn-upstream-fbl;dur=10"}}' ;;
+  parallel)
+    e=2; case "$url" in */fu/*) e="${n:-64}" ;; esac
+    [ "${STUB_WF_MANY_ENVS:-}" = 1 ] && e="${n:-64}"
+    if [ "${STUB_THROTTLED:-}" = 1 ]; then jq -nc --argjson n "${n:-64}" '{n:$n,status:{"200":2,"503":($n-2)},errors:0,distinctEnvironments:1,distinctLogStreams:1,wallMs:900}'
+    else jq -nc --argjson n "${n:-64}" --argjson e "$e" '{n:$n,status:{"200":$n},errors:0,distinctEnvironments:$e,distinctLogStreams:$e,wallMs:2300,p50:2100,p90:2200}'; fi ;;
+  stream)
+    fb=120; [ "${STUB_BUFFERED:-}" = 1 ] && [ "$cls" = cf ] && fb=3050
+    jq -nc --argjson s "$status" --argjson fb "$fb" '{status:$s,headers:{},error:null,firstByteMs:$fb,totalMs:3100,dataEvents:10,chunkArrivalMs:[120,420,720],lines:10}' ;;
+  *) echo '{"error":"stub: unknown command"}'; exit 2 ;;
+esac
+exit 0

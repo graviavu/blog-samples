@@ -57,12 +57,12 @@ Resources:
           Value: !Ref RunId
       Code:
         ZipFile: |
-          // event: {"urls": ["https://..."], "n": 30, "warm": 3}. Unsigned GETs only; prints and returns ttfb p50/p90 per URL.
+          // event: {"urls": [{"u": "https://...", "token": true}], "n": 30, "warm": 3, "token": "..."}. Unsigned GETs only; returns ttfb p50/p90 per URL.
           const https = require('https');
           const agent = new https.Agent({ keepAlive: true });
-          const one = (u) => new Promise((ok) => {
+          const one = (u, h) => new Promise((ok) => {
             const t0 = process.hrtime.bigint();
-            const r = https.get(u, { agent, timeout: 20000 }, (res) => {
+            const r = https.get(u, { agent, timeout: 20000, headers: h }, (res) => {
               const ttfb = Number(process.hrtime.bigint() - t0) / 1e6;
               res.resume(); res.on('end', () => ok({ s: res.statusCode, ttfb, pop: res.headers['x-amz-cf-pop'] || res.headers['cf-ray'] || null }));
             });
@@ -71,10 +71,11 @@ Resources:
           const pct = (a, p) => (a.length ? [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(p * a.length / 100))] : null);
           exports.handler = async (ev) => {
             const out = {};
-            for (const u of (ev.urls || []).slice(0, 12)) {
+            for (const item of (ev.urls || []).slice(0, 12)) {
+              const u = item.u; const h = item.token && ev.token ? { 'x-lwf-token': ev.token } : {};
               const t = []; const st = {}; let pop = null;
               for (let i = 0; i < (ev.warm || 3) + (ev.n || 30); i++) {
-                const r = await one(u);
+                const r = await one(u, h);
                 if (i < (ev.warm || 3)) continue;
                 st[r.s] = (st[r.s] || 0) + 1; pop = pop || r.pop;
                 if (r.s === 200) t.push(r.ttfb);

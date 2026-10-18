@@ -43,6 +43,17 @@ test('/fu goes to the function URL host; /cf is unsigned and goes to CloudFront'
   assert.equal(calls[1].init.headers.authorization, undefined);
 }));
 
+test('with LWF_TOKEN set, requests without the matching x-lwf-token are refused (except /health)', () => withFakes(async (calls) => {
+  const e = { ...env, LWF_TOKEN: 'run-token' };
+  assert.equal((await worker.fetch(new Request('https://w.test/wf/ping'), e, ctx)).status, 403);
+  assert.equal((await worker.fetch(new Request('https://w.test/wf/ping', { headers: { 'x-lwf-token': 'wrong' } }), e, ctx)).status, 403);
+  assert.equal((await worker.fetch(new Request('https://w.test/health'), e, ctx)).status, 200);
+  assert.equal(calls.length, 0);
+  const ok = await worker.fetch(new Request('https://w.test/wf/ping', { headers: { 'x-lwf-token': 'run-token' } }), e, ctx);
+  assert.equal(ok.status, 200);
+  assert.equal(calls[0].init.headers['x-lwf-token'], undefined); // not forwarded to AWS
+}));
+
 test('missing key gives a clear 500 and no upstream call', () => withFakes(async (calls) => {
   const res = await worker.fetch(new Request('https://w.test/wf/ping'), { ...env, AWS_SECRET_ACCESS_KEY: '' }, ctx);
   assert.equal(res.status, 500);
