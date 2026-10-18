@@ -8,5 +8,6 @@ Samples are for testing in a throwaway account. Read the safety notes in each RE
 |---|---|
 | [cloudfront-request-routing](cloudfront-request-routing/) | CloudFront as a reverse proxy for many backends: one catch-all behavior, a CloudFront Function and a KeyValueStore route table, no distribution change per route. CloudFormation, unit tests, a verify script and teardown. |
 | [cloudfront-business-hours-cache](cloudfront-business-hours-cache/) | No cache in business hours, long cache outside, with a Lambda@Edge origin-response function and one window in an S3 object. One script builds a temporary stack, measures it (Hit/Miss, Age, origin hits, the boundary-expiry limitation) and tears it down. |
+| [lambda-web-functions](lambda-web-functions/) | Lambda Web Functions or a Function URL behind CloudFront or Cloudflare: both endpoints locked to one distribution (OAC), a Cloudflare Worker that signs SigV4, eight tests (lock-down, JWT header, latency, concurrency, streaming, cache, cost per 10M, kill switch) recorded to JSON and markdown. One script with `--dry-run`, a typed confirmation, a restore trap, full teardown and a leftover scan. Stub tests only, no cloud calls. |
 
 License: [MIT](LICENSE).

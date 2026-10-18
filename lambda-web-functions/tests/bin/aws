@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls lwf-sample.sh makes; anything else exits 99.
+# Every call is appended to $S/calls.log WITH its arguments, so the tests can prove that no secret is ever in argv.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
+REG=us-east-1; if [ "${1:-}" = "--region" ]; then REG="$2"; shift 2; fi
+svc="${1:-}"; cmd="${2:-}"; shift 2 2>/dev/null || shift $#
+echo "$REG $svc $cmd $*" >> "$S/calls.log"
+mkdir -p "$S/res"
+q="$(arg --query "$@")"
+acct12="$(acct)"
+
+# ---- the CLI "help" probes of the preflight
+if [ "$svc" = lambda-web ]; then
+  [ -z "${STUB_NO_LAMBDA_WEB:-}" ] || { echo "aws: [ERROR]: argument command: Found invalid choice 'lambda-web'" >&2; exit 252; }
+  if [ "$cmd" = help ] || [ "${*: -1}" = help ]; then
+    case " ${STUB_MISSING_CMDS:-} " in *" $cmd "*) exit 252 ;; esac
+    exit 0
+  fi
+fi
+
+# ---- failure and signal injection
+# STUB_FAIL="svc cmd" [STUB_FAIL_N=n]: the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
+if [ -n "${STUB_FAIL:-}" ] && [ "$svc $cmd" = "$STUB_FAIL" ]; then
+  n=$(( $(get "n_${svc}_$cmd" 0) + 1 )); put "n_${svc}_$cmd" "$n"
+  if [ "$n" = "${STUB_FAIL_N:-1}" ]; then
+    echo "An error occurred (${STUB_FAIL_CODE:-AccessDenied}) when calling the $cmd operation: denied arn:aws:iam::$acct12:role/x account $acct12 key $(fake_akid) $(fake_cfd) x-amz-security-token: abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ" >&2
+    exit 254
+  fi
+fi
+# STUB_SIG=INT|TERM at the first STUB_SIG_TIMES (default 1) calls of STUB_SIG_AT="svc cmd". STUB_SIG_DIE=1: this call then dies
+# too, as a child does when Ctrl-C reaches the whole process group.
+if [ -n "${STUB_SIG:-}" ] && [ "$svc $cmd" = "${STUB_SIG_AT:-}" ] && [ "$(get sig_n 0)" -lt "${STUB_SIG_TIMES:-1}" ]; then
+  put sig_n $(( $(get sig_n 0) + 1 )); kill -"$STUB_SIG" "$(cat "${STUB_PIDFILE:?}")"; sleep 0.3
+  [ -z "${STUB_SIG_DIE:-}" ] || exit 130
+fi
+
+notfound() { echo "An error occurred ($1) when calling the $cmd operation: $2 does not exist (arn:aws:x::$acct12:y)" >&2; exit 254; }
+prefix_of_query() { printf '%s' "$q" | sed -n "s/.*'\\(lwf-[^' ]*\\).*/\\1/p" | head -n 1; }
+killed() { [ -e "$S/killed" ]; }
+
+case "$svc $cmd" in
+  "sts get-caller-identity") case "$q" in *Arn*) printf '%s\tarn:aws:iam::%s:user/tester\n' "$acct12" "$acct12" ;; *) echo "$acct12" ;; esac ;;
+  "budgets describe-budgets") if [ -n "${STUB_NO_BUDGET:-}" ]; then echo '[]'; else echo '["monthly test budget"]'; fi ;;
+  "budgets describe-notifications-for-budget")
+    [ "$(arg --budget-name "$@")" = "monthly test budget" ] || notfound NotFoundException budget
+    if [ -n "${STUB_NO_NOTIFICATION:-}" ]; then echo 0; else echo 1; fi ;;
+  "lambda get-account-settings") echo "${STUB_CONC:-1000}" ;;
+  "lambda get-function-concurrency") get "fuconc" None; echo ;;
+
+  # ---------------------------------------------------------------- CloudFormation
+  "cloudformation describe-type")
+    t="$(arg --type-name "$@")"
+    case "$t" in
+      AWS::Lambda::WebFunction) f=schema-function ;; AWS::Lambda::WebFunctionRevision) f=schema-revision ;; AWS::Lambda::WebFunctionEndpoint) f=schema-endpoint ;;
+      *) notfound TypeNotFoundException "$t" ;;
+    esac
+    j="$(jq -c . "$(dirname "$0")/../fixtures/$f.json")"
+    case "${STUB_SCHEMA_DRIFT:-}" in
+      ThrottleConfig) j="$(printf '%s' "$j" | jq -c 'del(.definitions.ThrottleConfig) | del(.properties.ThrottleConfig)')" ;;
+      NewRequired) j="$(printf '%s' "$j" | jq -c '.required += ["Mandatory"]')" ;;
+    esac
+    printf '%s\n' "$j" ;;
+  "cloudformation deploy")
+    stack="$(arg --stack-name "$@")"; tpl="$(arg --template-file "$@")"
+    [ -f "$tpl" ] || { echo "stub: template missing" >&2; exit 254; }
+    printf '%s' "$*" | grep -q 'RunId=' || { echo "stub: no RunId tag/parameter" >&2; exit 254; }
+    printf '%s' "$*" | grep -q 'CAPABILITY_NAMED_IAM' || { echo "stub: capability missing" >&2; exit 254; }
+    printf '%s\n' "$*" > "$S/params-$stack"
+    P="${stack%-art}"; P="${P%-app}"; P="${P%-probe}"
+    reg cfn "$stack" "$REG"
+    case "$stack" in
+      *-art) b="$(printf '%s' "$*" | sed -n 's/.*BucketName=\([^ ]*\).*/\1/p')"; reg s3 "$b" "$REG"; put "bucket-of-$stack" "$b" ;;
+      *-app)
+        printf '%s' "$*" | grep -q 'KillAt=' || { echo "stub: KillAt missing" >&2; exit 254; }
+        for k in wf-oac fu-oac; do reg oac "$P-$k" "$REG"; done
+        reg cp "$P-cache" "$REG"; reg rhp "$P-timing" "$REG"; reg dist "$P" "$REG"
+        for k in wf-role fu-role kill-role sched-role; do reg role "$P-$k" "$REG"; done
+        reg user "$P-worker" "$REG"; reg fn "$P-fu" "$REG"; reg fn "$P-kill" "$REG"; reg wfn "$P-wf" "$REG"; reg sched "$P-kill" "$REG"
+        reg lg "/aws/lambda/web/$P-wf" "$REG"; reg lg "/aws/lambda/web/$P-wf.local" "$REG"; reg lg "/aws/lambda/$P-fu" "$REG"; reg lg "/aws/lambda/$P-kill" "$REG"
+        reg alarm "$P-kill-failed" "$REG"
+        printf '%s' "$*" | grep -q 'AlertEmail=' && reg topic "arn:aws:sns:us-east-1:$acct12:$P-kill-alerts" "$REG"
+        c="$(printf '%s' "$*" | sed -n 's/.*FuReservedConcurrency=\([-0-9]*\).*/\1/p')"
+        if [ "$c" = -1 ]; then put fuconc None; else put fuconc "$c"; fi
+        put distenabled true ;;
+      *-probe) reg fn "$P-probe" "$REG"; reg role "$P-probe-role" "$REG"; reg lg "/aws/lambda/$P-probe" "$REG" ;;
+    esac ;;
+  "cloudformation describe-stacks")
+    stack="$(arg --stack-name "$@")"
+    has cfn "$stack" || { echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id $stack does not exist" >&2; exit 254; }
+    case "$q" in
+      *StackStatus*) if [ -e "$S/delfail-$stack" ]; then echo DELETE_FAILED; else echo CREATE_COMPLETE; fi ;;
+      *Outputs*)
+        P="${stack%-app}"
+        case "$stack" in
+          *-app) jq -n --arg d "$(fake_dist)" --arg cfd "$(fake_cfd)" --arg p "$P" --arg a "$acct12" --arg wfh "$(fake_wfh)" --arg fuh "$(fake_fuh)" \
+            '[{OutputKey:"DistributionId",OutputValue:$d},{OutputKey:"DistributionDomain",OutputValue:$cfd},{OutputKey:"WebFunctionName",OutputValue:($p+"-wf")},
+              {OutputKey:"WebFunctionArn",OutputValue:("arn:aws:lambda:us-east-1:"+$a+":web-function/"+$p+"-wf")},{OutputKey:"WebFunctionEndpointDomain",OutputValue:$wfh},
+              {OutputKey:"WebFunctionEndpointArn",OutputValue:("arn:aws:lambda:us-east-1:"+$a+":web-function/"+$p+"-wf/endpoint/live")},{OutputKey:"FunctionUrlHost",OutputValue:$fuh},
+              {OutputKey:"FuFunctionName",OutputValue:($p+"-fu")},{OutputKey:"WorkerUserName",OutputValue:($p+"-worker")},{OutputKey:"KillFunctionName",OutputValue:($p+"-kill")},
+              {OutputKey:"KillScheduleName",OutputValue:($p+"-kill")}]' ;;
+          *) echo '[]' ;;
+        esac ;;
+      *) echo "{}" ;;
+    esac ;;
+  "cloudformation delete-stack")
+    stack="$(arg --stack-name "$@")"
+    has cfn "$stack" || exit 0
+    P="${stack%-art}"; P="${P%-app}"; P="${P%-probe}"
+    case "$stack" in
+      *-art)
+        b="$(get "bucket-of-$stack")"
+        if [ -n "$(names s3obj "$b/")" ]; then : > "$S/delfail-$stack"; exit 0; fi
+        rm -f "$S/delfail-$stack"; unreg s3 "$b"; unreg cfn "$stack" ;;
+      *-app)
+        [ "${STUB_NODELETE:-}" = stack ] && exit 0
+        for k in oac:wf-oac oac:fu-oac cp:cache rhp:timing; do [ "${STUB_NODELETE:-}" = "${k%%:*}" ] || unreg "${k%%:*}" "$P-${k#*:}"; done
+        [ "${STUB_NODELETE:-}" = dist ] || unreg dist "$P"
+        for k in wf-role fu-role kill-role sched-role; do unreg role "$P-$k"; done
+        unreg user "$P-worker"; unreg fn "$P-fu"; unreg fn "$P-kill"; unreg wfn "$P-wf"; unreg sched "$P-kill"; rm -f "$S/res/key__$P-worker"
+        unreg alarm "$P-kill-failed"; [ -z "$(names topic "")" ] || unreg topic "arn:aws:sns:us-east-1:$acct12:$P-kill-alerts"
+        for g in "/aws/lambda/web/$P-wf" "/aws/lambda/web/$P-wf.local" "/aws/lambda/$P-fu" "/aws/lambda/$P-kill"; do unreg lg "$g"; done
+        [ -z "${STUB_RECREATE_LOGS:-}" ] || reg lg "/aws/lambda/web/$P-wf" "$REG"   # Lambda re-creates its web log group
+        unreg cfn "$stack" ;;
+      *-probe) unreg fn "$P-probe"; unreg role "$P-probe-role"; unreg lg "/aws/lambda/$P-probe"; unreg cfn "$stack" ;;
+    esac ;;
+  "cloudformation wait")
+    stack="$(arg --stack-name "$@")"
+    if [ -e "$S/delfail-$stack" ]; then echo "Waiter StackDeleteComplete failed: DELETE_FAILED" >&2; exit 255; fi ;;
+  "cloudformation describe-stack-events") : ;;
+
+  # ---------------------------------------------------------------- S3
+  "s3api put-object") reg s3obj "$(arg --bucket "$@")/$(arg --key "$@")" v1; echo '{"VersionId":"v1"}' ;;
+  "s3api head-bucket") has s3 "$(arg --bucket "$@")" || { echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254; } ;;
+  "s3api list-object-versions")
+    b="$(arg --bucket "$@")"
+    { for o in $(names s3obj "$b/"); do printf '%s\n' "${o#"$b/"}"; done; } | jq -R -s --arg m "$([ -e "$S/markers_deleted" ] || printf '%s' "${STUB_MARKERS:-}")" \
+      '{Versions: (split("\n") | map(select(length>0) | {Key: ., VersionId: "v1"})), DeleteMarkers: (if $m != "" then [{Key:"gone.zip",VersionId:"m1"}] else [] end)}' ;;
+  "s3api delete-objects")
+    b="$(arg --bucket "$@")"; f="$(arg --delete "$@")"; f="${f#file://}"
+    jq -r '.Objects[].Key' "$f" | while read -r k; do unreg s3obj "$b/$k"; done
+    : > "$S/markers_deleted"; echo '{}' ;;
+  "s3api list-buckets") textlist s3 "$(prefix_of_query)" ;;
+
+  # ---------------------------------------------------------------- ACM
+  "acm request-certificate")
+    d="$(arg --domain-name "$@")"; arn="arn:aws:acm:us-east-1:$acct12:certificate/abcdef01-2345-6789-abcd-ef0123456789"
+    reg cert "$arn" "$d"; put "certrun" "$(printf '%s' "$*" | sed -n 's/.*Key=RunId,Value=\([^ ]*\).*/\1/p')"; echo "$arn" ;;
+  "acm describe-certificate")
+    case "$q" in
+      *ResourceRecord*) jq -n '[{Name:"_a1.lwf-g.example.test.",Type:"CNAME",Value:"_v1.acm-validations.example."},{Name:"_a2.lwf-o.example.test.",Type:"CNAME",Value:"_v2.acm-validations.example."}]' ;;
+      *Status*) echo "${STUB_CERT_STATUS:-ISSUED}" ;;
+    esac ;;
+  "acm list-certificates")
+    found=""
+    for c in $(names cert ""); do [ "$(cat "$S/res/cert__$(printf '%s' "$c" | tr '/' '%')")" = "$(printf '%s' "$q" | sed -n "s/.*=='\\([^']*\\)'.*/\\1/p")" ] && { echo "$c"; found=1; }; done
+    [ -n "$found" ] || echo None ;;
+  "acm list-tags-for-certificate") get certrun ;;
+  "acm delete-certificate")
+    if [ -n "$(names dist "")" ] && [ -z "${STUB_CERT_FREE:-}" ] && [ "$(get cert_tries 0)" -lt "${STUB_CERT_BUSY:-0}" ]; then
+      put cert_tries $(( $(get cert_tries 0) + 1 )); echo "An error occurred (ResourceInUseException) when calling the DeleteCertificate operation: in use" >&2; exit 254
+    fi
+    unreg cert "$(arg --certificate-arn "$@")" ;;
+
+  # ---------------------------------------------------------------- IAM
+  "iam create-access-key")
+    u="$(arg --user-name "$@")"; has user "$u" || notfound NoSuchEntity "user"
+    reg key "$u" Active
+    jq -n --arg i "$(fake_akid)" --arg s "$(fake_key)" '{AccessKey:{AccessKeyId:$i,SecretAccessKey:$s,Status:"Active"}}' ;;
+  "iam list-access-keys")
+    u="$(arg --user-name "$@")"; has user "$u" || notfound NoSuchEntity "user"
+    if has key "$u"; then
+      case "$q" in *Status*) if killed; then echo Inactive; else echo Active; fi ;; *) fake_akid; echo ;; esac
+    else echo None   # not what the real CLI prints for an empty list, but a filter that copes with None copes with both
+    fi ;;
+  "iam delete-access-key") unreg key "$(arg --user-name "$@")" ;;
+  "iam list-roles") textlist role "$(prefix_of_query)" ;;
+  "iam list-users") textlist user "$(prefix_of_query)" ;;
+
+  # ---------------------------------------------------------------- Lambda, Lambda Web
+  "lambda invoke")
+    fn="$(arg --function-name "$@")"; out="${*: -1}"
+    case "$fn" in
+      *-kill)
+        echo "$*" >> "$S/kill.log"
+        : > "$S/killed"; put distenabled false
+        if [ -n "${STUB_KILL_FAIL:-}" ]; then   # the function URL step failed: the function raises with the results as message
+          jq -nc --arg w "${STUB_WF_KILL:-rate-limit-0}" '{errorMessage: ({cloudfront:"disabled",worker_keys:"deactivated:1",function_url:"error:AccessDeniedException",web_function:$w} | tojson), errorType:"RuntimeError"}' > "$out"
+          echo '{"StatusCode":200,"FunctionError":"Unhandled"}'; exit 0
+        fi
+        put fuconc 0
+        printf '{"cloudfront":"disabled","worker_keys":"deactivated:1","function_url":"reserved-concurrency-0","web_function":"%s"}' "${STUB_WF_KILL:-rate-limit-0}" > "$out" ;;
+      *-probe) jq -n '{"https://x/wf/ping":{status:{"200":30},p50:20,p90:30,pop:"DUB"}}' > "$out" ;;
+      *) echo "{}" > "$out" ;;
+    esac
+    echo '{"StatusCode":200}' ;;
+  "lambda list-functions") textlist fn "$(prefix_of_query)" "$REG" ;;
+  "lambda-web get-web-function") has wfn "$(arg --function-name "$@")" || notfound ResourceNotFoundException "web function"; echo '{}' ;;
+  "lambda-web put-resource-policy")
+    f="$(arg --policy "$@")"; f="${f#file://}"
+    jq -e '.Statement[0].Condition.StringEquals["aws:SourceArn"] | test("distribution/")' "$f" >/dev/null 2>&1 || { echo "stub: bad resource policy" >&2; exit 254; }
+    cp "$f" "$S/policy.json"; echo '{}' ;;
+  "lambda-web delete-resource-policy")
+    a="$(arg --resource-arn "$@")"
+    case "$a" in "arn:aws:lambda:us-east-1:$acct12:web-function/lwf-"*) ;; *) echo "stub: bad resource arn" >&2; exit 254 ;; esac
+    has wfn "${a##*/}" || notfound ResourceNotFoundException "web function"
+    [ -z "${STUB_POLICY_DELETE_FAIL:-}" ] || { echo "An error occurred (AccessDeniedException) when calling the DeleteResourcePolicy operation: no" >&2; exit 254; }
+    rm -f "$S/policy.json"; echo "DELETE policy $a" >> "$S/deleted.log" ;;
+  "scheduler list-schedules") textlist sched "$(arg --name-prefix "$@")" ;;
+  "cloudwatch describe-alarms") textlist alarm "$(arg --alarm-name-prefix "$@")" ;;
+  "sns list-topics") p="$(printf '%s' "$q" | sed -n "s/.*':\\(lwf-[^']*\\)'.*/\\1/p")"; r=""; for t in $(names topic ""); do case "$t" in *":$p"*) r="$r$t " ;; esac; done; if [ -n "$r" ]; then echo "$r"; else echo None; fi ;;
+
+  # ---------------------------------------------------------------- CloudFront
+  "cloudfront get-distribution") if [ "$(get distenabled true)" = true ]; then echo True; else echo False; fi ;;
+  "cloudfront list-distributions") textlist dist "$(prefix_of_query)" | sed 's/ \{0,\}$//' | sed "s/^lwf-.*/$(fake_dist)/" ;;
+  "cloudfront list-origin-access-controls") textlist oac "$(prefix_of_query)" ;;
+  "cloudfront list-cache-policies") textlist cp "$(prefix_of_query)" ;;
+  "cloudfront list-response-headers-policies") textlist rhp "$(prefix_of_query)" ;;
+
+  # ---------------------------------------------------------------- CloudWatch, Logs
+  "cloudwatch list-metrics")
+    jq -n --arg fn "$(names wfn lwf- | awk '{print $1}')" \
+      '{Metrics:[{Namespace:"AWS/Lambda/Web",MetricName:"EnvironmentActiveTime",Dimensions:[{Name:"FunctionName",Value:$fn}]},{Namespace:"AWS/Lambda/Web",MetricName:"EnvironmentCPUTime",Dimensions:[{Name:"FunctionName",Value:$fn}]},{Namespace:"AWS/Lambda/Web",MetricName:"EndpointActiveEnvironments",Dimensions:[{Name:"FunctionName",Value:$fn}]}]}' ;;
+  "cloudwatch get-metric-statistics") jq -n '{Datapoints:[{Maximum:2,Sum:120,Unit:"Seconds"}]}' ;;
+  "logs filter-log-events")   # STUB_REPORTS REPORT lines (default 50), billed 11 or 21 ms
+    jq -n --argjson n "${STUB_REPORTS:-50}" '{events:[range(0; $n) | {message:("REPORT RequestId: r\(.) Duration: 10.00 ms Billed Duration: \(if . % 2 == 0 then 11 else 21 end) ms Memory Size: 512 MB Max Memory Used: 80 MB")}]}' ;;
+  "logs describe-log-groups") textlist lg "$(arg --log-group-name-prefix "$@")" "$REG" ;;
+  "logs delete-log-group")
+    n="$(arg --log-group-name "$@")"; has lg "$n" || notfound ResourceNotFoundException "log group"
+    unreg lg "$n"
+    if [ -n "${STUB_RECREATE_ONCE:-}" ] && [ ! -e "$S/recreated" ]; then : > "$S/recreated"; reg lg "$n" "$REG"; fi ;;
+  *) echo "stub aws: unhandled call: $svc $cmd" >&2; exit 99 ;;
+esac
+exit 0

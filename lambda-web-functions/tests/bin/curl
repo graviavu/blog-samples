@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Fake curl: speaks only the Cloudflare API paths lwf-sample.sh uses, backed by files in $S/cf. Logs every call WITH its arguments
+# (tests prove the token and the AWS key are never in argv). STUB_TOKEN is the token the fake API accepts.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+method=GET out=""; hdrfile=""; body=""; url=""; fmt=""; forms=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift ;;
+    -o) out="$2"; shift ;;
+    -w) fmt="$2"; shift ;;
+    -H) case "$2" in @*) hdrfile="${2#@}" ;; esac; shift ;;
+    --data) body="$2"; shift ;;
+    -F) forms+=("$2"); shift ;;
+    --max-time) shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+echo "curl $method $url ${body:+body=$body} ${forms[*]:+forms=${forms[*]}}" >> "$S/calls.log"
+C="$S/cf"; mkdir -p "$C/records" "$C/scripts" "$C/domains" "$C/packs" "$C/secrets"
+[ -n "$out" ] || out=/dev/null
+reply() { # http-code json
+  printf '%s' "$2" > "$out"
+  [ -z "$fmt" ] || printf '%s' "$1"
+  exit 0
+}
+ok() { reply 200 "$(jq -nc --argjson r "$1" '{success:true,errors:[],result:$r,result_info:{page:1,per_page:100,total_pages:1,count:1}}')"; }
+fail() { reply "$1" "$(jq -nc --arg m "$2" '{success:false,errors:[{code:1000,message:$m}],result:null}')"; }
+nextid() { local n; n=$(( $(get cfid 0) + 1 )); put cfid "$n"; printf 'id%030d' "$n"; }
+
+path="${url#*/client/v4}"; query=""; case "$path" in *\?*) query="${path#*\?}"; path="${path%%\?*}" ;; esac
+qparam() { printf '%s' "$query" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n 1; }
+
+# stdin body
+if [ "$body" = "@-" ]; then cat > "$S/stdin.json"; cat "$S/stdin.json" >> "$S/stdin.log"; echo >> "$S/stdin.log"; bodyfile="$S/stdin.json"
+elif [ -n "$body" ]; then bodyfile="${body#@}"; else bodyfile=""; fi
+
+# auth
+if [ -z "$hdrfile" ] || ! grep -q "^Authorization: Bearer ${STUB_TOKEN:-tok}\$" "$hdrfile" 2>/dev/null; then fail 403 "invalid token"; fi
+# failure injection: STUB_CF_FAIL="METHOD substring"
+if [ -n "${STUB_CF_FAIL:-}" ] && [ "$method" = "${STUB_CF_FAIL%% *}" ]; then
+  case "$path" in *"${STUB_CF_FAIL#* }"*) fail 500 "injected failure token=$(fake_key)" ;; esac
+fi
+
+Z="$(fake_zid)"; A="$(fake_cfacc)"
+case "$method $path" in
+  "GET /user/tokens/verify") ok '{"status":"active"}' ;;
+  "GET /zones")
+    if [ "$(qparam name)" = "$(zone)" ]; then
+      ok "$(jq -nc --arg z "$Z" --arg a "$A" '[{id:$z,account:{id:$a},plan:{name:"Free Website"},status:"active"}]')"
+    else ok '[]'; fi ;;
+  "GET /zones/$Z/settings/ssl") ok '{"value":"full"}' ;;
+  "GET /zones/$Z/dns_records")
+    n="$(qparam name)"
+    ok "$(cat "$C"/records/*.json 2>/dev/null | jq -s --arg n "$n" '[.[] | select($n == "" or .name == $n)]')" ;;
+  "POST /zones/$Z/dns_records")
+    id="$(nextid)"; jq -c --arg id "$id" '. + {id:$id}' "$bodyfile" > "$C/records/$id.json"; ok "$(cat "$C/records/$id.json")" ;;
+  "GET /zones/$Z/ssl/certificate_packs") ok "$(cat "$C"/packs/*.json 2>/dev/null | jq -s '.')" ;;
+  "GET /accounts/$A/workers/scripts") ok "$(for f in "$C"/scripts/*; do [ -e "$f" ] && jq -nc --arg n "$(basename "$f")" '{id:$n}'; done | jq -s '.')" ;;
+  "GET /accounts/$A/workers/domains") ok "$(cat "$C"/domains/*.json 2>/dev/null | jq -s '.')" ;;
+  "PUT /accounts/$A/workers/domains")
+    id="$(nextid)"; jq -c --arg id "$id" '. + {id:$id}' "$bodyfile" > "$C/domains/$id.json"
+    if [ -n "${STUB_CERT_PACK:-}" ]; then h="$(jq -r .hostname "$bodyfile")"; jq -nc --arg id "pk$id" --arg h "$h" '{id:$id,type:"advanced",hosts:[$h]}' > "$C/packs/pk$id.json"; fi
+    ok "$(cat "$C/domains/$id.json")" ;;
+esac
+case "$method $path" in
+  "DELETE /zones/$Z/dns_records/"*) id="${path##*/}"; [ -e "$C/records/$id.json" ] || fail 404 "not found"; rm -f "$C/records/$id.json"; echo "cf DELETE record $id" >> "$S/deleted.log"; ok '{"id":"x"}' ;;
+  "GET /zones/$Z/dns_records/"*) id="${path##*/}"; [ -e "$C/records/$id.json" ] || fail 404 "not found"; ok "$(cat "$C/records/$id.json")" ;;
+  "DELETE /zones/$Z/ssl/certificate_packs/"*) id="${path##*/}"; [ -e "$C/packs/$id.json" ] || fail 404 "not found"; rm -f "$C/packs/$id.json"; echo "cf DELETE pack $id" >> "$S/deleted.log"; ok '{"id":"x"}' ;;
+  "DELETE /accounts/$A/workers/domains/"*) id="${path##*/}"; [ -e "$C/domains/$id.json" ] || fail 404 "not found"; rm -f "$C/domains/$id.json"; echo "cf DELETE domain $id" >> "$S/deleted.log"; ok '{"id":"x"}' ;;
+  "PUT /accounts/$A/workers/scripts/"*/secrets)
+    nm="${path#*/scripts/}"; nm="${nm%/secrets}"; [ -e "$C/scripts/$nm" ] || fail 404 "no such script"
+    jq -e '.type == "secret_text" and (.name|length>0) and (.text|length>0)' "$bodyfile" >/dev/null 2>&1 || fail 400 "bad secret body"
+    jq -r .name "$bodyfile" >> "$C/secrets/$nm"; ok '{"name":"x"}' ;;
+  "POST /accounts/$A/workers/scripts/"*/subdomain) ok '{"enabled":false}' ;;
+  "PUT /accounts/$A/workers/scripts/"*)
+    nm="${path#*/scripts/}"
+    have=""; for f in "${forms[@]}"; do have="$have ${f%%=*}"; done
+    case "$have" in *metadata*worker.mjs*sigv4.mjs*|*metadata*sigv4.mjs*worker.mjs*) ;; *) fail 400 "multipart parts missing:$have" ;; esac
+    printf '%s' "$have" > "$C/scripts/$nm"; ok "$(jq -nc --arg n "$nm" '{id:$n}')" ;;
+  "DELETE /accounts/$A/workers/scripts/"*)
+    nm="${path#*/scripts/}"; [ -e "$C/scripts/$nm" ] || fail 404 "not found"; rm -f "$C/scripts/$nm" "$C/secrets/$nm"; echo "cf DELETE worker $nm" >> "$S/deleted.log"; ok '{"id":"x"}' ;;
+  "GET /accounts/$A/workers/scripts/"*/settings)
+    nm="${path#*/scripts/}"; nm="${nm%/settings}"; [ -e "$C/scripts/$nm" ] || fail 404 "not found"; ok '{}' ;;
+esac
+echo "stub curl: unhandled $method $path" >&2
+fail 501 "stub: unhandled $method $path"
