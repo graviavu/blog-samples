@@ -3,8 +3,8 @@ Description: >-
   lambda-web-functions sample, stack 2 of 2 in us-east-1: CloudFront in front of (a) a Lambda Web Function endpoint (IamAuth)
   and (b) an Event Function behind a Function URL (AWS_IAM), both locked to this distribution with origin access control,
   plus the IAM user the Cloudflare Worker signs with (two invoke permissions only) and the kill switch (a Lambda that a
-  one-time EventBridge schedule starts after KillAt: it disables the distribution, deactivates the user's keys, throttles both
-  functions). No public (ApplicationManaged) endpoint exists in this template. Names carry the run id so teardown can find them.
+  one-time EventBridge schedule starts after KillAt: it disables the distribution, deactivates the user's keys, sets the Event
+  Function to reserved concurrency 0, and tries to throttle the web function). No public (ApplicationManaged) endpoint exists in this template. Names carry the run id so teardown can find them.
   The web function resource policy for CloudFront is NOT in this template (no CloudFormation resource for it was found);
   lwf-sample.sh puts it with the CLI after this stack is created and removes it in teardown.
 Parameters:
@@ -57,8 +57,23 @@ Parameters:
     Type: String
     Default: ''
     Description: O1, ACM certificate (us-east-1) covering both aliases
+  FuReservedConcurrency:
+    Type: Number
+    Default: 130
+    MinValue: -1
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency of the Event Function behind the URL (a hard cap on how many run at once; A4 needs 128).
+      -1 = no reservation (accounts whose limit cannot spare it). lwf-sample.sh passes min(130, account limit - 100) or -1.
+  AlertEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Optional. An email address for the kill-switch failure alarm (SNS asks the address to confirm). Empty = alarm only.
 Conditions:
   HasAliases: !Not [!Equals [!Ref CertificateArn, '']]
+  HasFuCap: !Not [!Equals [!Ref FuReservedConcurrency, -1]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 Resources:
   # ------------------------------------------------------------------------------------------------ log groups (1 day)
   WfLogGroup:
@@ -190,6 +205,7 @@ Resources:
       Handler: fu-handler.handler
       Timeout: 30
       MemorySize: 512
+      ReservedConcurrentExecutions: !If [HasFuCap, !Ref FuReservedConcurrency, !Ref 'AWS::NoValue']
       Role: !GetAtt FuRole.Arn
       Code:
         S3Bucket: !Ref CodeBucket
@@ -221,6 +237,7 @@ Resources:
       FunctionName: !Ref FuFunction
       Action: 'lambda:InvokeFunction'
       Principal: cloudfront.amazonaws.com
+      InvokedViaFunctionUrl: true   # only as part of a Function URL call, never a direct Invoke
       SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
   # ------------------------------------------------------------------------------------------------ CloudFront
   WfOac:
@@ -350,8 +367,16 @@ Resources:
                 Resource: !GetAtt WebFunctionEndpoint.EndpointArn
               - Sid: InvokeTheFunctionUrl
                 Effect: Allow
-                Action: ['lambda:InvokeFunctionUrl', 'lambda:InvokeFunction']
+                Action: 'lambda:InvokeFunctionUrl'
                 Resource: !GetAtt FuFunction.Arn
+              - Sid: InvokeOnlyThroughTheFunctionUrl
+                Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt FuFunction.Arn
+                Condition:
+                  Bool:
+                    'lambda:InvokedViaFunctionUrl': 'true'
+
       Tags:
         - Key: sample
           Value: lambda-web-functions
@@ -393,8 +418,9 @@ Resources:
                 Effect: Allow
                 Action: 'lambda:PutFunctionConcurrency'
                 Resource: !GetAtt FuFunction.Arn
-              # UNVERIFIED action name: derived from the API operation UpdateWebFunctionEndpoint. If it is wrong, the
-              # kill switch reports web_function=error and the other three actions still run.
+              # UNVERIFIED action name: derived from the API operation UpdateWebFunctionEndpoint. If it is wrong, or the
+              # runtime's boto3 has no 'lambda-web' client, the kill switch reports web_function as not throttled; the web
+              # function is still unreachable once the distribution is disabled and the Worker key is inactive.
               - Sid: ThrottleTheWebFunction
                 Effect: Allow
                 Action: ['lambda:UpdateWebFunctionEndpoint', 'lambda:GetWebFunctionEndpoint']
@@ -430,9 +456,18 @@ Resources:
           Value: !Ref RunId
       Code:
         ZipFile: |
-          # Kill switch: each action is independent; the result of every one is returned and logged. Idempotent.
+          # Kill switch. Every action is independent and idempotent; the result of each is returned and logged.
+          # The three that cut access (CloudFront, the Worker's key, the Event Function's concurrency) must succeed: if one
+          # fails, the function raises with all results as the message. EventBridge Scheduler invokes Lambda asynchronously,
+          # so Lambda retries a failed run (KillInvokeConfig) and the alarm lwf-<run>-kill-failed goes off.
+          # The web function step is best effort: the runtime's boto3 may not know 'lambda-web' yet and the parameter names
+          # are guesses from the CloudFormation schema. Its endpoint is IamAuth, so with the distribution disabled and the
+          # Worker key inactive nobody outside the account can reach it either way.
           import json, os
           import boto3
+          import botocore.exceptions
+
+          ESSENTIAL = ('cloudfront', 'worker_keys', 'function_url')
 
           def step(out, name, fn):
               try:
@@ -463,9 +498,10 @@ Resources:
                   boto3.client('lambda').put_function_concurrency(FunctionName=os.environ['FU_NAME'], ReservedConcurrentExecutions=0)
                   return 'reserved-concurrency-0'
               def wf():
-                  # UNVERIFIED: the Lambda runtime's boto3 may not know the 'lambda-web' service yet, and the parameter names
-                  # below are guesses from the CloudFormation schema. Failure is reported, not hidden.
-                  c = boto3.client('lambda-web')
+                  try:
+                      c = boto3.client('lambda-web')
+                  except botocore.exceptions.DataNotFoundError:  # UnknownServiceError: this boto3 has no lambda-web client
+                      return 'not-throttled:no-lambda-web-client'
                   c.update_web_function_endpoint(FunctionName=os.environ['WF_NAME'], EndpointName=os.environ['WF_ENDPOINT'],
                                                  ThrottleConfig={'RateLimit': 0})
                   return 'rate-limit-0'
@@ -474,7 +510,63 @@ Resources:
               step(out, 'function_url', fu)
               step(out, 'web_function', wf)
               print(json.dumps(out))
+              if any(str(out.get(k, 'error')).startswith('error') for k in ESSENTIAL):
+                  raise RuntimeError(json.dumps(out))
               return out
+  KillInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref KillFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2           # the maximum Lambda allows for an asynchronous invoke that raises
+      MaximumEventAgeInSeconds: 21600
+  KillFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'lwf-${RunId}-kill-failed'
+      AlarmDescription: The lambda-web-functions kill switch raised (a step that cuts access failed). Check its log group.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref KillFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref KillAlertTopic], !Ref 'AWS::NoValue']
+  KillAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub 'lwf-${RunId}-kill-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  KillAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasAlertEmail
+    Properties:
+      Topics: [!Ref KillAlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AlarmPublishes
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref KillAlertTopic
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:lwf-${RunId}-kill-failed'
   KillSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -512,6 +604,9 @@ Resources:
         Arn: !GetAtt KillFunction.Arn
         RoleArn: !GetAtt KillSchedulerRole.Arn
         Input: '{"source":"schedule"}'
+        RetryPolicy:                    # delivery retries (throttling, the function not reachable); errors the function raises are
+          MaximumRetryAttempts: 10      # retried by Lambda (KillInvokeConfig), because Scheduler invokes Lambda asynchronously
+          MaximumEventAgeInSeconds: 21600
 Outputs:
   DistributionId:
     Value: !Ref Distribution
