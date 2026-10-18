@@ -85,7 +85,7 @@ not_found() {
   local code
   case "$1" in
     s3) code=NoSuchBucket ;; iam) code=NoSuchEntity ;; lambda) code=ResourceNotFoundException ;;
-    stack) grep -Fq "(ValidationError)" "$WORK/aws.err" 2>/dev/null && grep -Fq "Stack with id $STACK does not exist" "$WORK/aws.err" 2>/dev/null; return ;;
+    stack) grep -Fq "(ValidationError)" "$WORK/aws.err" 2>/dev/null && grep -Fq "Stack with id $STACK does not exist" "$WORK/aws.err" 2>/dev/null; return $? ;;   # explicit: a bare return in a function run from the EXIT trap uses the status from before the trap on bash >= 5
     *) return 1 ;;
   esac
   grep -Eq "\\($code\\)" "$WORK/aws.err" 2>/dev/null
