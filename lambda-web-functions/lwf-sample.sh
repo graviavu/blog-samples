@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2329,SC2015,SC2154  # (SC2154: O_<OutputKey> variables are set by stack_outputs via eval) functions are called indirectly through td(); "A && B || C" is used where C only reports
 case "$-" in *x*) set +x; echo "refusing to run with xtrace (bash -x / set -x): it would print the Cloudflare token and the AWS key" >&2; exit 2 ;; esac
 case ":${SHELLOPTS:-}:" in *:xtrace:*) echo "refusing to run with SHELLOPTS=xtrace" >&2; exit 2 ;; esac
 # lwf-sample.sh - the ONE script of the lambda-web-functions sample (blog post 4).
@@ -7,7 +6,8 @@ case ":${SHELLOPTS:-}:" in *:xtrace:*) echo "refusing to run with SHELLOPTS=xtra
 #   ./lwf-sample.sh --dry-run --zone example.com     read-only: checks everything, prints the plan, changes nothing
 #   ./lwf-sample.sh --zone example.com               real run: preflight, typed confirmation, deploy, tests A1-A8, teardown, leftover scan
 #   ./lwf-sample.sh --zone example.com --keep        like the real run but leave everything up (the kill switch still fires at +6 h)
-#   ./lwf-sample.sh --resume <run-id>                continue a run that stopped (finished steps are skipped)
+#   ./lwf-sample.sh --resume <run-id>                continue a run that stopped (finished steps are skipped; asks for the phrase;
+#                                                    refused when the kill switch fires within the hour or the run was torn down)
 #   ./lwf-sample.sh --teardown <run-id> [--zone Z]   remove EVERYTHING of that run, then scan for leftovers
 #   ./lwf-sample.sh --status <run-id> [--zone Z]     show the run's state and scan for leftovers (read-only)
 #
@@ -16,16 +16,19 @@ case ":${SHELLOPTS:-}:" in *:xtrace:*) echo "refusing to run with SHELLOPTS=xtra
 # Needs (R supplies): AWS admin credentials for a TEST account in the environment/profile; a Cloudflare API token typed at the
 #   hidden prompt (or CF_API_TOKEN in the environment); the Cloudflare zone name (--zone or prompt). Tools: aws CLI v2 with
 #   `lambda-web`, curl, jq, node 20+, zip, openssl. Set ACK_BUDGET=true if you have an AWS Budget the script cannot see.
+#   Optional: LWF_ALERT_EMAIL=you@example.com to be emailed (SNS, confirm the subscription) if the kill switch fails.
 # The token is never exported to a child process, never put in argv, a log or a file other than a mode-600 header file that is
-# removed on exit. The IAM access key of the Worker goes from `aws iam create-access-key` straight into the Cloudflare secrets
+# removed on exit (also after Ctrl-C; only kill -9 can leave it in $TMPDIR). The IAM access key of the Worker goes from `aws iam create-access-key` straight into the Cloudflare secrets
 # API on stdin; the script keeps it in memory for the signed tests only.
-# Exit codes: 0 done and clean; 1 dry run found blockers; 2 error (the restore trap then tears the run down); 3 leftovers found.
+# Exit codes: 0 done and clean; 1 dry run found blockers; 2 error (the restore trap then tears the run down); 3 leftovers found;
+#   130/143/129 interrupted by INT/TERM/HUP (the teardown still ran to the end; a third interrupt during it stops it).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
 
-usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '/^# lwf-sample.sh - /,/^# Exit codes/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
@@ -55,7 +58,7 @@ if [ "$DRY" = 0 ]; then mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; fi
 HOST_RE='^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$'
 set_names() {
   P="lwf-$RUN"; ART_STACK="$P-art"; APP_STACK="$P-app"; PROBE_STACK="$P-probe"; USERN="$P-worker"; WORKER="$P"
-  BUCKET="$P-art-$ACCOUNT"; COMMENT="lwf-sample $RUN"; SCHEDULE="$P-kill"
+  BUCKET="$P-art-$ACCOUNT"; COMMENT="lwf-sample $RUN"
   H_W="lwf-w.$ZONE"; H_G="lwf-g.$ZONE"; H_O="lwf-o.$ZONE"; H_X="lwf-x.$ZONE"
   STATE_FILE="$STATE_DIR/$RUN.env"
   OUTDIR="$RESULTS_ROOT/$RUN"; RAWDIR="$OUTDIR/raw"; RES_TSV="$OUTDIR/results.tsv"
@@ -123,29 +126,63 @@ check_cfn_type() { # "type|used|readonly|provided"
 preflight_tools() {
   local t v
   for t in aws curl jq zip openssl "$NODE"; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done
-  v="$("$NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || v=0
+  v="$("${NOAWS[@]}" "$NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || v=0
   [ "${v:-0}" -ge 20 ] 2>/dev/null || die "node 20 or newer is required (found major version ${v:-none})"
   say "ok: tools present (node $v)"
 }
 
-preflight_aws() {
-  local bc code cmd
-  ACCOUNT="$(aws_ro sts get-caller-identity --query Account --output text)" || die "AWS credentials do not work"
-  [ -n "$ACCOUNT" ] || die "AWS credentials do not work"
+aws_identity() { # sets ACCOUNT and PARTITION (from the caller ARN, so no ARN below hardcodes "aws")
+  local id arn
+  id="$(aws_ro sts get-caller-identity --query '[Account,Arn]' --output text)" || return 1
+  ACCOUNT="$(printf '%s' "$id" | cut -f1)"; arn="$(printf '%s' "$id" | cut -f2)"
+  case "$ACCOUNT" in ''|*[!0-9]*) ACCOUNT=""; return 1 ;; esac
+  PARTITION="$(printf '%s' "$arn" | cut -d: -f2)"; [ -n "$PARTITION" ] || PARTITION=aws
   redact_add "$ACCOUNT" "<account-id>"
-  say "ok: AWS identity works (account ending ${ACCOUNT: -4}), region $REGION"
-
-  # budget guard: fail closed unless a Budget exists (or ACK_BUDGET=true). Only the error code is printed.
-  if [ "${ACK_BUDGET:-}" = true ]; then
-    say "ok: budget check skipped (ACK_BUDGET=true)"
-  else
-    bc="$(aws_ro budgets describe-budgets --account-id "$ACCOUNT" --query 'length(Budgets)' --output text 2>/dev/null)" || { code="$(aws_code)"; bc="unknown:${code:-error}"; }
-    case "$bc" in
-      ''|*[!0-9]*) blocker "could not check for an AWS Budget (${bc#unknown:}). Create a budget alert first, then re-run, or set ACK_BUDGET=true to confirm you have one." ;;
-      0) blocker "no AWS Budget in this account. Create a budget alert first (README: Before you run), then re-run, or set ACK_BUDGET=true." ;;
-      *) say "ok: $bc budget(s) found" ;;
-    esac
+}
+check_budget() { # fail closed unless a Budget with at least one notification exists (or ACK_BUDGET=true). Only error codes are printed.
+  local names code b n
+  if [ "${ACK_BUDGET:-}" = true ]; then say "ok: budget check skipped (ACK_BUDGET=true)"; return 0; fi
+  if ! names="$(aws_ro budgets describe-budgets --account-id "$ACCOUNT" --query 'Budgets[].BudgetName' --output json 2>/dev/null)"; then
+    code="$(aws_code)"
+    blocker "could not check for an AWS Budget (${code:-error}). Create a budget alert first, then re-run, or set ACK_BUDGET=true to confirm you have one."
+    return 0
   fi
+  names="$(printf '%s' "$names" | jq -r '.[]?' 2>/dev/null)"
+  if [ -z "$names" ]; then
+    blocker "no AWS Budget in this account. Create a budget alert first (README: Before you run), then re-run, or set ACK_BUDGET=true."; return 0
+  fi
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    n="$(aws_ro budgets describe-notifications-for-budget --account-id "$ACCOUNT" --budget-name "$b" --query 'length(Notifications)' --output text 2>/dev/null)" || n=0
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "$n" -gt 0 ]; then say "ok: an AWS Budget with $n notification(s) exists"; return 0; fi
+  done <<< "$names"
+  blocker "AWS Budget(s) exist but none has a notification, so nobody would be told. Add an alert to a budget, then re-run, or set ACK_BUDGET=true."
+}
+check_concurrency() { # sets FU_CAP: reserved concurrency for the Function URL function, or -1 (no cap) when the account cannot spare it
+  local conc
+  conc="$(aws_ro lambda get-account-settings --query 'AccountLimit.ConcurrentExecutions' --output text 2>/dev/null)" || conc=""
+  case "$conc" in
+    ''|*[!0-9]*) FU_CAP=-1; warn "could not read the account's Lambda concurrency limit ($(aws_code)); the Function URL function gets no reserved-concurrency cap (/slow is still limited to ${SLOW_MAX_MS} ms)" ;;
+    *)
+      # Lambda keeps 100 of the account's concurrency unreserved
+      if [ $((conc - 100)) -ge 1 ]; then
+        FU_CAP=$(( conc - 100 < FU_CAP_DEFAULT ? conc - 100 : FU_CAP_DEFAULT ))
+        say "ok: account concurrency limit $conc; the Function URL function is capped at $FU_CAP concurrent executions"
+        [ "$FU_CAP" -ge 128 ] || warn "the cap is below 128, so A4 with N=128 will show throttling (429) on the Function URL"
+      else
+        FU_CAP=-1
+        warn "the account's Lambda concurrency limit is $conc (new accounts start low) and Lambda keeps 100 unreserved, so the Function URL function cannot get a reserved cap; the account limit of $conc is the cap. A4 with N=64/128 will show throttling"
+      fi ;;
+  esac
+}
+
+preflight_aws() {
+  local cmd
+  aws_identity || die "AWS credentials do not work"
+  say "ok: AWS identity works (account ending ${ACCOUNT: -4}), region $REGION"
+  check_budget
+  check_concurrency
 
   if ! aws lambda-web help >/dev/null 2>&1; then
     blocker "this AWS CLI has no 'lambda-web' command ($(aws --version 2>&1 | cut -d' ' -f1)). Update AWS CLI v2 to a release that includes Lambda Web Functions."
@@ -181,7 +218,17 @@ preflight_cloudflare() {
   n="$(cf_list "/accounts/$ACC_CF/workers/domains" | jq -r --arg h "$H_W" --arg s "$WORKER" 'select(.hostname == $h and .service != $s) | .hostname' 2>/dev/null)" \
     || blocker "token cannot list Workers custom domains (needs Account: Workers Scripts: Edit)"
   [ -z "$n" ] || blocker "a Workers custom domain for $H_W already exists"
-  cf GET "/zones/$ZID/ssl/certificate_packs?status=all" || blocker "token cannot list certificate packs (needs Zone: SSL and Certificates: Edit) (HTTP $CF_HTTP)"
+  if bad="$(packs_touching_our_names)"; then
+    local mine id rest others=""
+    mine=" $(state_get CF_PACKS) "
+    while read -r id rest; do
+      [ -n "$id" ] || continue
+      case "$mine" in *" $id "*) ;; *) others="$others $rest" ;; esac
+    done <<< "$bad"
+    [ -z "$others" ] || blocker "a Cloudflare certificate pack already covers lwf-* names of this run ($others); this script deletes only packs it saw appear, so remove that one or pick another zone"
+  else
+    blocker "token cannot list certificate packs (needs Zone: SSL and Certificates: Edit) (HTTP $CF_HTTP)"
+  fi
   say "ok: token can read DNS, Workers scripts, Workers domains and certificate packs"
 }
 
@@ -197,7 +244,8 @@ print_plan() {
   [ "$O3" = 0 ] || say "    record:  $H_X (proxied CNAME straight to the web function endpoint, the negative control)"
   say "  Tests A1-A8 (about 3,000 requests), results in results/$RUN/ next to the script, then full teardown and a leftover scan."
   say "  Cost (estimate, not a measurement): under \$1 per run, mostly CloudFront/Lambda requests inside free tiers; see README."
-  say "  Kill switch at +${KILL_HOURS} h disables CloudFront, deactivates the Worker key, throttles both functions."
+  say "  Kill switch at +${KILL_HOURS} h: disables CloudFront, deactivates the Worker key, sets the Function URL function to reserved"
+  say "    concurrency 0; the web function is then unreachable (throttled too only if the Lambda runtime knows 'lambda-web')."
 }
 
 # ---------------------------------------------------------------------------------------------------- build code
@@ -287,26 +335,28 @@ step_app() {
   done_step app && { say "skip: app stack (done)"; load_app_outputs; return 0; }
   say "step: app stack (CloudFront takes 10-30 minutes)"
   local params
-  params=("RunId=$RUN" "CodeBucket=$BUCKET" "KillAt=$KILL_AT")
+  params=("RunId=$RUN" "CodeBucket=$BUCKET" "KillAt=$KILL_AT" "MaxEnvironments=$WF_MAX_ENVS" "FuReservedConcurrency=$FU_CAP")
+  [ -z "${LWF_ALERT_EMAIL:-}" ] || params+=("AlertEmail=$LWF_ALERT_EMAIL")
   [ "$O1" = 0 ] || params+=("AliasGrey=$H_G" "AliasOrange=$H_O" "CertificateArn=$CERT_ARN")
   deploy_stack "$APP_STACK" app.yaml "$REGION" "${params[@]}"
   load_app_outputs
   mark_done app
 }
+# shellcheck disable=SC2154  # the O_<OutputKey> variables are set by stack_outputs through eval
 load_app_outputs() {
   stack_outputs "$APP_STACK"
   DIST_ID="$O_DistributionId"; CFD="$O_DistributionDomain"; WF_NAME="$O_WebFunctionName"; WF_ARN="$O_WebFunctionArn"
   WFH="$O_WebFunctionEndpointDomain"; EP_ARN="$O_WebFunctionEndpointArn"; FUH="$O_FunctionUrlHost"; FU_NAME="$O_FuFunctionName"
   KILL_FN="$O_KillFunctionName"
-  [ -n "$DIST_ID" ] && [ -n "$CFD" ] && [ -n "$WFH" ] && [ -n "$FUH" ] || die "app stack outputs are incomplete"
+  if ! { [ -n "$DIST_ID" ] && [ -n "$CFD" ] && [ -n "$WFH" ] && [ -n "$FUH" ]; }; then die "app stack outputs are incomplete"; fi
   redact_add "$DIST_ID" "<distribution-id>"; redact_add "$CFD" "<cloudfront-domain>"; redact_add "$WFH" "<wf-endpoint-host>"; redact_add "$FUH" "<fu-host>"
-  state_set DIST_ID "$DIST_ID"; state_set CFD "$CFD"; state_set EP_ARN "$EP_ARN"
+  state_set DIST_ID "$DIST_ID"; state_set CFD "$CFD"; state_set EP_ARN "$EP_ARN"; state_set WF_ARN "$WF_ARN"
 }
 
 step_policy() {
   done_step policy && { say "skip: resource policy (done)"; return 0; }
   say "step: web function resource policy for the distribution"
-  jq -n --arg arn "$WF_ARN/endpoint/*" --arg src "arn:aws:cloudfront::$ACCOUNT:distribution/$DIST_ID" \
+  jq -n --arg arn "$WF_ARN/endpoint/*" --arg src "arn:$PARTITION:cloudfront::$ACCOUNT:distribution/$DIST_ID" \
     '{Version:"2012-10-17",Statement:[{Sid:"AllowCloudFrontDistribution",Effect:"Allow",Principal:{Service:"cloudfront.amazonaws.com"},Action:"lambda:InvokeWebFunctionEndpoint",Resource:$arn,Condition:{StringEquals:{"aws:SourceArn":$src}}}]}' > "$TMP/policy.json"
   aws_do lambda-web put-resource-policy --resource-arn "$WF_ARN" --policy "file://$TMP/policy.json" >/dev/null || die "put-resource-policy failed ($(aws_code))"
   mark_done policy
@@ -323,19 +373,26 @@ step_wait_cloudfront() {
   die "CloudFront did not return 200 for /wf/ping (last status $st). Check the web function: Application.TimeoutListenError means the server did not listen on the port Lambda expects (see app/wf-server.mjs)"
 }
 
+# The per-run Worker token lives in memory and in the Worker's secrets only, never in the state file. A resumed run sets a new one.
+new_worker_token() {
+  WTOKEN="$(openssl rand -hex 16)"; redact_add "$WTOKEN" "<worker-token>"
+  printf '%s' "$WTOKEN" | jq -Rc '{name:"LWF_TOKEN",text:.,type:"secret_text"}' | cf PUT "/accounts/$ACC_CF/workers/scripts/$WORKER/secrets" -
+}
 step_worker() {
-  done_step worker && { say "skip: worker (done; the AWS key is not recoverable, signed tests are skipped)"; WTOKEN="$(state_get WTOKEN)"; return 0; }
+  if done_step worker; then
+    say "skip: worker (done). The AWS key is not recoverable, so the signed tests are skipped; the Worker gets a new run token"
+    new_worker_token || die "could not set a new run token on the Worker (HTTP $CF_HTTP $(cf_errors))"
+    return 0
+  fi
   say "step: IAM access key, Worker upload, secrets, custom domain"
   local old k json
-  old="$(aws_ro iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].AccessKeyId' --output text)" || die "cannot list keys of the Worker user"
+  old="$(aws_names iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].AccessKeyId')" || die "cannot list keys of the Worker user"
   for k in $old; do aws_do iam delete-access-key --user-name "$USERN" --access-key-id "$k" || die "cannot remove an old key"; done
-  WTOKEN="$(openssl rand -hex 16)"; redact_add "$WTOKEN" "<worker-token>"
-  state_set WTOKEN "$WTOKEN"
   json="$(aws_do iam create-access-key --user-name "$USERN" --output json)" || die "create-access-key failed ($(aws_code))"
   AK_ID="$(printf '%s' "$json" | jq -r '.AccessKey.AccessKeyId')"
   AK_SECRET="$(printf '%s' "$json" | jq -r '.AccessKey.SecretAccessKey')"
   json=""
-  [ -n "$AK_ID" ] && [ -n "$AK_SECRET" ] && [ "$AK_ID" != null ] && [ "$AK_SECRET" != null ] || die "create-access-key returned no key"
+  if ! { [ -n "$AK_ID" ] && [ -n "$AK_SECRET" ] && [ "$AK_ID" != null ] && [ "$AK_SECRET" != null ]; }; then die "create-access-key returned no key"; fi
   redact_add "$AK_ID" "<access-key-id>"
 
   jq -n --arg wf "$WFH" --arg fu "$FUH" --arg cf "$CFD" --arg cd "$COMPAT_DATE" --arg region "$REGION" \
@@ -350,15 +407,35 @@ step_worker() {
     || die "setting secret AWS_ACCESS_KEY_ID failed (HTTP $CF_HTTP $(cf_errors))"
   printf '%s' "$AK_SECRET" | jq -Rc '{name:"AWS_SECRET_ACCESS_KEY",text:.,type:"secret_text"}' | cf PUT "/accounts/$ACC_CF/workers/scripts/$WORKER/secrets" - \
     || die "setting secret AWS_SECRET_ACCESS_KEY failed (HTTP $CF_HTTP $(cf_errors))"
-  printf '%s' "$WTOKEN" | jq -Rc '{name:"LWF_TOKEN",text:.,type:"secret_text"}' | cf PUT "/accounts/$ACC_CF/workers/scripts/$WORKER/secrets" - \
-    || die "setting secret LWF_TOKEN failed (HTTP $CF_HTTP $(cf_errors))"
+  new_worker_token || die "setting secret LWF_TOKEN failed (HTTP $CF_HTTP $(cf_errors))"
   # no workers.dev address for this Worker (best effort; the custom domain is the only intended entry)
   echo '{"enabled":false}' > "$TMP/sub.json"
   cf POST "/accounts/$ACC_CF/workers/scripts/$WORKER/subdomain" "$TMP/sub.json" || warn "could not disable the workers.dev route (HTTP $CF_HTTP); the Worker requires the run token anyway"
   jq -n --arg h "$H_W" --arg s "$WORKER" --arg z "$ZID" '{environment:"production",hostname:$h,service:$s,zone_id:$z}' > "$TMP/domain.json"
   cf PUT "/accounts/$ACC_CF/workers/domains" "$TMP/domain.json" || die "Workers custom domain failed (HTTP $CF_HTTP $(cf_errors))"
   state_set WORKER_DOMAIN_ID "$(jq -r '.result.id // empty' "$TMP/cf.out")"
+  record_packs
   mark_done worker
+}
+
+# Certificate packs: Cloudflare may issue an Advanced Certificate for the Worker's custom domain and does not delete it with the
+# domain. The ids seen after this run created the domain are recorded; teardown deletes only recorded ids. (The preflight refuses
+# when a pack for one of the run's names already exists, so a pack found later is this run's.)
+packs_for_our_names() { # -> ids of packs whose hosts are all names of this run
+  cf_list "/zones/$ZID/ssl/certificate_packs?status=all" | jq -r --arg a "$H_W" --arg b "$H_G" --arg c "$H_O" --arg d "$H_X" \
+    'select((.hosts // []) | length > 0 and all(.[]; . == $a or . == $b or . == $c or . == $d)) | .id'
+}
+packs_touching_our_names() { # -> "id hosts" of packs that cover any name of this run
+  cf_list "/zones/$ZID/ssl/certificate_packs?status=all" | jq -r --arg a "$H_W" --arg b "$H_G" --arg c "$H_O" --arg d "$H_X" \
+    'select(any((.hosts // [])[]; . == $a or . == $b or . == $c or . == $d)) | "\(.id) \((.hosts // []) | join(","))"'
+}
+record_packs() { # best effort; called after the custom domain step and again once the Worker answers over HTTPS
+  local ids have id
+  ids="$(packs_for_our_names 2>/dev/null)" || return 0
+  have=" $(state_get CF_PACKS) "
+  for id in $ids; do case "$have" in *" $id "*) ;; *) have="$have$id " ;; esac; done
+  have="$(printf '%s' "$have" | words | tr '\n' ' ' | sed 's/ $//')"
+  [ "$have" = "$(state_get CF_PACKS)" ] || state_set CF_PACKS "$have"
 }
 
 step_dns() {
@@ -385,7 +462,7 @@ wait_worker() {
   local i st=""
   for i in $(seq 1 "${READY_TRIES:-30}"); do
     pj_plain wready get "https://$H_W/health"; st="$(jq -r '.status // 0' "$TMP/pj.wready")"
-    [ "$st" = 200 ] && { say "ok: the Worker answers on its custom domain"; break; }
+    [ "$st" = 200 ] && { say "ok: the Worker answers on its custom domain"; record_packs; break; }
     nap 20
   done
   [ "$st" = 200 ] || die "the Worker did not answer on https://lwf-w.<zone>/health (last status $st); Cloudflare certificate issuance for a new custom domain can be slow. The restore removes this run; start again with a longer wait (READY_TRIES=90 in the environment, each try is 20 s)"
@@ -408,16 +485,29 @@ wait_alias() { # O1: the DNS-only alias needs DNS and the distribution's alias t
 }
 
 # ---------------------------------------------------------------------------------------------------- probe helpers
-_pj() { # mode label args...   -> $TMP/pj.<label> (JSON) and a redacted copy in raw/
+count_requests() { # probe-command URL args... -> adds the requests this probe sends to REQ_TOTAL (and REQ_WF for the web function)
+  local cmd="$1" url="$2" n=1 warm=0 a prev=""
+  shift 2
+  if [ "$cmd" = latency ]; then warm=3; fi   # probe.mjs default
+  for a in "$@"; do
+    case "$prev" in --n) n="$a" ;; --warm) warm="$a" ;; esac
+    prev="$a"
+  done
+  case "$n$warm" in *[!0-9]*) return 0 ;; esac
+  REQ_TOTAL=$((REQ_TOTAL + n + warm))
+  case "$url" in "https://$WFH/"*|*/wf/*|*/wf) REQ_WF=$((REQ_WF + n + warm)) ;; esac
+}
+_pj() { # mode label probe-command URL args...   -> $TMP/pj.<label> (JSON) and a redacted copy in raw/
   local mode="$1" label="$2"; shift 2
   local out="$TMP/pj.$label"
   case "$mode" in
-    plain) "$NODE" "$HERE/tools/probe.mjs" "$@" > "$out" 2>"$TMP/pj.err" ;;
+    plain) "${NOAWS[@]}" "$NODE" "$HERE/tools/probe.mjs" "$@" > "$out" 2>"$TMP/pj.err" ;;
     sign)
       if [ -z "$AK_SECRET" ]; then echo '{"error":"the AWS key is not in memory (resumed run); signed test skipped"}' > "$out"; return 1; fi
-      printf '{"id":"%s","secret":"%s"}' "$AK_ID" "$AK_SECRET" | "$NODE" "$HERE/tools/probe.mjs" "$@" --sign > "$out" 2>"$TMP/pj.err" ;;
-    worker) LWF_TOKEN="$WTOKEN" "$NODE" "$HERE/tools/probe.mjs" "$@" --worker > "$out" 2>"$TMP/pj.err" ;;
+      printf '{"id":"%s","secret":"%s"}' "$AK_ID" "$AK_SECRET" | "${NOAWS[@]}" "$NODE" "$HERE/tools/probe.mjs" "$@" --sign > "$out" 2>"$TMP/pj.err" ;;
+    worker) LWF_TOKEN="$WTOKEN" "${NOAWS[@]}" "$NODE" "$HERE/tools/probe.mjs" "$@" --worker > "$out" 2>"$TMP/pj.err" ;;
   esac
+  count_requests "$@"
   jq -e . "$out" >/dev/null 2>&1 || echo '{"error":"probe produced no JSON"}' > "$out"
   [ -z "$RAWDIR" ] || redact < "$out" > "$RAWDIR/$label.json"
   return 0
@@ -437,7 +527,7 @@ run_tests() {
 }
 
 test_a1() {
-  local s1 s2 s3 s4 cf1 cf2 w1 w2 w0 neg bad="" inc="" detail
+  local s1 s2 s3 s4 cf1 cf2 w1 w2 w0 neg obs bad="" inc="" detail
   pj_plain a1_wf_unsigned get "https://$WFH/ping"; s1="$(pv a1_wf_unsigned .status)"
   pj_plain a1_fu_unsigned get "https://$FUH/ping"; s2="$(pv a1_fu_unsigned .status)"
   if [ -n "$AK_SECRET" ]; then
@@ -449,10 +539,12 @@ test_a1() {
   pj_worker a1_w_wf get "https://$H_W/wf/ping"; w1="$(pv a1_w_wf .status)"
   pj_worker a1_w_fu get "https://$H_W/fu/ping"; w2="$(pv a1_w_fu .status)"
   pj_plain a1_w_notoken get "https://$H_W/wf/ping"; w0="$(pv a1_w_notoken .status)"
-  neg="not run (--no-negative)"
-  if [ "$O3" = 1 ]; then pj_plain a1_negative get "https://$H_X/ping"; neg="$(pv a1_negative '.error // (.status|tostring)')"; fi
-  REQ_TOTAL=$((REQ_TOTAL + 10))
-  detail="direct unsigned wf=$s1 fu=$s2 (want 403 403); direct signed wf=$s3 fu=$s4 (want 200 200); via CloudFront wf=$cf1 fu=$cf2; via Worker wf=$w1 fu=$w2; Worker without run token=$w0 (want 403); negative control, orange CNAME straight to the endpoint without a Worker (O3)=$neg (expect 403, 404 or 52x, never 2xx; it cannot sign, so it cannot reach an IamAuth endpoint)"
+  neg="not run (--no-negative)"; obs="O3 off"
+  if [ "$O3" = 1 ]; then
+    pj_plain a1_negative get "https://$H_X/ping"; neg="$(pv a1_negative '.error // (.status|tostring)')"
+    obs="status=$neg, answered by server=$(pv a1_negative '.headers.server // "?"'), x-amzn-errortype=$(pv a1_negative '.headers["x-amzn-errortype"] // "none"'), cf-ray=$(pv a1_negative 'if .headers["cf-ray"] then "present" else "absent" end')"
+  fi
+  detail="direct unsigned wf=$s1 fu=$s2 (want 403 403); direct signed wf=$s3 fu=$s4 (want 200 200); via CloudFront wf=$cf1 fu=$cf2; via Worker wf=$w1 fu=$w2; Worker without run token=$w0 (want 403); O3 observation, not a control (a proxied CNAME cannot sign, so an IamAuth endpoint can only refuse it; the point is WHO refuses: AWS with 403 or Cloudflare with a 52x/1xxx page): $obs. Only a 2xx there would count, as a broken lock-down"
   case "$s1" in 2??) bad="web function endpoint answers unsigned requests" ;; esac
   case "$s2" in 2??) bad="$bad function URL answers unsigned requests" ;; esac
   case "$neg" in 2??) bad="$bad the proxied CNAME to the endpoint answers without a signature" ;; esac
@@ -470,7 +562,6 @@ test_a2() {
   pj_plain a2_cf_fu get "https://$CFD/fu/headers" --header "Authorization: $FAKE_JWT" --header "x-app-auth: $FAKE_APP"
   pj_worker a2_w_wf get "https://$H_W/wf/headers" --header "Authorization: $FAKE_JWT" --header "x-app-auth: $FAKE_APP"
   pj_worker a2_w_fu get "https://$H_W/fu/headers" --header "Authorization: $FAKE_JWT" --header "x-app-auth: $FAKE_APP"
-  REQ_TOTAL=$((REQ_TOTAL + 4))
   for lab in a2_cf_wf a2_cf_fu a2_w_wf a2_w_fu; do
     lines="$lines ${lab}[viewer-jwt=$(hdr_of "$lab" authorization) x-app-auth=$(hdr_of "$lab" x-app-auth) host=$(pv "$lab" '.body|fromjson?|.host // "?"')]"
   done
@@ -498,16 +589,15 @@ test_a3() {
       worker) pj_worker "a3_$lab" latency "$url" --n "$n" ;;
       sign) pj_sign "a3_$lab" latency "$url" --n "$n" ;;
     esac
-    REQ_TOTAL=$((REQ_TOTAL + n + 3))
     p50="$(pv "a3_$lab" '.p50 // "n/a"')"; p90="$(pv "a3_$lab" '.p90 // "n/a"')"
     pop="$(pv "a3_$lab" '.firstHeaders["x-amz-cf-pop"] // .firstHeaders["cf-ray"] // "?"')"
     st="$(pv "a3_$lab" '.error // (.status|tostring)')"
     summary="$summary $lab:p50=${p50}ms,p90=${p90}ms,pop=$pop,status=$st;"
   done
   if [ "$O1" = 1 ]; then
-    pj_plain a3_grey latency "https://$H_G/wf/ping" --n "$n"; REQ_TOTAL=$((REQ_TOTAL + n + 3))
+    pj_plain a3_grey latency "https://$H_G/wf/ping" --n "$n"
     summary="$summary grey_cf_wf:p50=$(pv a3_grey '.p50 // "n/a"')ms,p90=$(pv a3_grey '.p90 // "n/a"')ms,status=$(pv a3_grey '.error // (.status|tostring)');"
-    pj_plain a3_orange latency "https://$H_O/wf/ping" --n "$n"; REQ_TOTAL=$((REQ_TOTAL + n + 3))
+    pj_plain a3_orange latency "https://$H_O/wf/ping" --n "$n"
     summary="$summary orange_cf_wf:p50=$(pv a3_orange '.p50 // "n/a"')ms,p90=$(pv a3_orange '.p90 // "n/a"')ms,status=$(pv a3_orange '.error // (.status|tostring)');"
   fi
   summary="$summary server-timing (first CloudFront response): $(pv a3_cf_wf '.firstHeaders["server-timing"] // "none"')."
@@ -523,6 +613,7 @@ probe_remote() {
   AWS_R="$PROBE_REGION" aws_do lambda invoke --function-name "$fn" --payload "file://$payload" --cli-binary-format raw-in-base64-out "$TMP/probe-out.json" >/dev/null \
     || { PROBE_SUMMARY="invoke failed ($(aws_code))"; return 0; }
   rm -f "$payload"
+  REQ_TOTAL=$((REQ_TOTAL + 33 * (4 + O1)))   # n 30 + warm 3 per URL, inside the probe function
   redact < "$TMP/probe-out.json" > "$RAWDIR/a3_probe_eu-west-1.json"
   PROBE_SUMMARY="$(jq -r 'to_entries | map("\(.key | sub("^https://[^/]*/"; "/"))=p50:\(.value.p50)ms,p90:\(.value.p90)ms,status:\(.value.status|tojson)") | join(" ")' "$TMP/probe-out.json" 2>/dev/null || echo unreadable)"
 }
@@ -544,22 +635,28 @@ metrics_snapshot() { # label -> raw/metrics-<label>.json with the four Lambda We
   METRICS_SUMMARY="$(jq -rs 'if length==0 then "no AWS/Lambda/Web datapoints found (metrics lag a few minutes; names/dimensions UNVERIFIED)" else map("\(.metric)[\(.unit)] max=\(.max) sum=\(.sum)") | join("; ") end' "$TMP/m.out" 2>/dev/null)"
 }
 
+# A4. The claim tested: ONE web function environment serves many requests at once, an Event Function environment serves one.
+# The number of environments alone proves nothing here: the endpoint is capped at MaxEnvironments (WF_MAX_ENVS) by configuration,
+# so it is reported against that cap. The app reports how many requests were in flight in its environment when each one finished.
 test_a4() {
-  local N run lab url out="" wfmax=0 fumax=0 bad=0 e n200 spec status
+  local N run lab url out="" wfenv=0 fuenv=0 wfinf=0 fuinf=0 thr="" e n200 inf spec status
   for N in 64 128; do
     for run in 1 2; do
       for spec in "wf|https://$CFD/wf/slow?ms=2000" "fu|https://$CFD/fu/slow?ms=2000"; do
         lab="${spec%%|*}"; url="${spec#*|}"
-        pj_plain "a4_${lab}_n${N}_r${run}" parallel "$url" --n "$N"; REQ_TOTAL=$((REQ_TOTAL + N))
+        pj_plain "a4_${lab}_n${N}_r${run}" parallel "$url" --n "$N"
         e="$(pv "a4_${lab}_n${N}_r${run}" '.distinctEnvironments // 0')"; n200="$(pv "a4_${lab}_n${N}_r${run}" '.status["200"] // 0')"
+        inf="$(pv "a4_${lab}_n${N}_r${run}" '.maxInflight // 0')"
         status="$(pv "a4_${lab}_n${N}_r${run}" '.status | tojson')"
-        out="$out ${lab}:N=$N,run=$run,envs=$e,logstreams=$(pv "a4_${lab}_n${N}_r${run}" '.distinctLogStreams // 0'),status=$status,wall=$(pv "a4_${lab}_n${N}_r${run}" '.wallMs')ms;"
+        out="$out ${lab}:N=$N,run=$run,envs=$e,max-in-flight-per-env=$inf,logstreams=$(pv "a4_${lab}_n${N}_r${run}" '.distinctLogStreams // 0'),status=$status,wall=$(pv "a4_${lab}_n${N}_r${run}" '.wallMs')ms;"
+        case "$e$inf$n200" in *[!0-9]*) e=0; inf=0; n200=0 ;; esac
         if [ "$lab" = wf ]; then
-          [ "$e" -le "$wfmax" ] 2>/dev/null || wfmax="$e"
-          [ "$e" -le $((N / 8)) ] 2>/dev/null || bad=1
-          [ "${n200:-0}" -ge $((N / 2)) ] 2>/dev/null || bad=2
+          [ "$e" -le "$wfenv" ] || wfenv="$e"
+          [ "$inf" -le "$wfinf" ] || wfinf="$inf"
+          [ $((n200 * 100)) -ge $((N * 95)) ] || thr="$thr N=$N/run $run: $n200 of $N were 200;"
         else
-          [ "$e" -le "$fumax" ] 2>/dev/null || fumax="$e"
+          [ "$e" -le "$fuenv" ] || fuenv="$e"
+          [ "$inf" -le "$fuinf" ] || fuinf="$inf"
         fi
       done
       nap "${A4_GAP:-20}"
@@ -568,23 +665,35 @@ test_a4() {
   nap "${METRIC_WAIT:-150}"   # CloudWatch metrics arrive a few minutes late
   metrics_snapshot a4
   out="$out CloudWatch: $METRICS_SUMMARY"
-  if [ "$bad" = 2 ]; then rec A4 INCONCLUSIVE "more than half of the web function requests were not 200 (rate limit 200 rps, environments capped at 2, new-account quotas?) so the environment count says nothing.$out"
-  elif [ "$bad" = 1 ]; then rec A4 FAIL "the web function used more than N/8 environments for N parallel slow requests (max $wfmax).$out"
-  else rec A4 PASS "web function max distinct environments $wfmax for N=64/128 slow requests (limit tested: <= N/8); function URL max $fumax (Event Functions: one request per environment).$out"; fi
+  local cap="web function environments used: max $wfenv, bounded by MaxEnvironments=$WF_MAX_ENVS by configuration (so not a finding by itself); Function URL environments: max $fuenv."
+  if [ "$wfenv" -gt "$WF_MAX_ENVS" ]; then rec A4 FAIL "the web function used $wfenv environments, more than MaxEnvironments=$WF_MAX_ENVS. $cap$out"
+  elif [ "$wfinf" -gt 1 ] && [ "$fuinf" -le 1 ]; then rec A4 PASS "one web function environment had up to $wfinf requests in flight at once; a Function URL environment never more than $fuinf. $cap${thr:+ Not every web function request was 200:$thr}$out"
+  elif [ -n "$thr" ]; then rec A4 INCONCLUSIVE "more than 5% of the web function requests were not 200 (rate limit, MaxEnvironments, new-account quotas?) and the in-flight count did not settle it (web function max $wfinf, Function URL max $fuinf):$thr $cap$out"
+  elif [ "$wfinf" -le 1 ]; then rec A4 FAIL "no web function environment had more than one request in flight (max $wfinf) although all requests were 200: the documented many-requests-per-environment did not show. $cap$out"
+  else rec A4 FAIL "a Function URL environment had $fuinf requests in flight; Event Functions are documented as one request per environment. $cap$out"; fi
 }
 
 test_a5() {
-  local spec lab mode url out=""
+  local spec lab mode url out="" cfwf="" cffu=""
   for spec in "cf_wf|plain|https://$CFD/wf/stream" "cf_fu|plain|https://$CFD/fu/stream" "worker_wf|worker|https://$H_W/wf/stream" "worker_fu|worker|https://$H_W/fu/stream" \
               "worker_edge|worker|https://$H_W/edge/stream" "direct_wf_signed|sign|https://$WFH/stream" "direct_fu_signed|sign|https://$FUH/stream"; do
     lab="${spec%%|*}"; mode="${spec#*|}"; url="${mode#*|}"; mode="${mode%%|*}"
-    case "$mode" in plain) pj_plain "a5_$lab" stream "$url" ;; worker) pj_worker "a5_$lab" stream "$url" ;; sign) pj_sign "a5_$lab" stream "$url" ;; esac
-    REQ_TOTAL=$((REQ_TOTAL + 1))
-    out="$out $(a5_line "a5_$lab" "$lab")"
+    a5_run "a5_$lab" "$mode" "$url"
+    out="$out $(a5_line "$A5_USED" "$lab")"
+    case "$lab" in cf_wf) cfwf="$A5_USED" ;; cf_fu) cffu="$A5_USED" ;; esac
   done
-  if [ "$O1" = 1 ]; then pj_plain a5_orange stream "https://$H_O/wf/stream"; out="$out $(a5_line a5_orange orange_cf_wf)"; REQ_TOTAL=$((REQ_TOTAL + 1)); fi
-  if a5_progressive a5_cf_wf && a5_progressive a5_cf_fu; then rec A5 PASS "progressive through CloudFront on both origins (first byte < 1000 ms, total >= 2500 ms, >= 5 data events).$out"
-  else rec A5 FAIL "not progressive through CloudFront on at least one origin.$out"; fi
+  if [ "$O1" = 1 ]; then a5_run a5_orange plain "https://$H_O/wf/stream"; out="$out $(a5_line "$A5_USED" orange_cf_wf)"; fi
+  if a5_progressive "$cfwf" && a5_progressive "$cffu"; then rec A5 PASS "progressive through CloudFront on both origins (first byte < 1000 ms, total >= 2500 ms, >= 5 data events).$out"
+  else rec A5 FAIL "not progressive through CloudFront on at least one origin, also on the second try.$out"; fi
+}
+A5_USED=""
+a5_run() { # label mode url -> A5_USED = the label whose result counts. One retry: the first request on a path can be a cold start.
+  local lab="$1" mode="$2" url="$3"
+  _pj "$mode" "$lab" stream "$url"
+  A5_USED="$lab"
+  if ! a5_progressive "$lab" && [ "$(pv "$lab" '.status // 0')" = 200 ]; then
+    _pj "$mode" "${lab}_retry" stream "$url"; A5_USED="${lab}_retry"
+  fi
 }
 a5_progressive() { # label
   jq -e '.status == 200 and .firstByteMs < 1000 and .totalMs >= 2500 and .dataEvents >= 5' "$TMP/pj.$1" >/dev/null 2>&1
@@ -592,6 +701,7 @@ a5_progressive() { # label
 a5_line() { # label name
   local v="buffered/failed"
   a5_progressive "$1" && v="progressive"
+  case "$1" in *_retry) v="$v,second-try" ;; esac
   printf '%s:%s(first=%sms,total=%sms,events=%s,status=%s);' "$2" "$v" "$(pv "$1" '.firstByteMs // "n/a"')" "$(pv "$1" '.totalMs // "n/a"')" "$(pv "$1" '.dataEvents // "n/a"')" "$(pv "$1" '.error // (.status|tostring)')"
 }
 
@@ -613,7 +723,6 @@ A6_LINE=""; A6_HIT=0
 a6_pair() { # label mode url
   local lab="$1" mode="$2" url="$3" x1 x2 n1 n2 same
   case "$mode" in plain) pj_plain "a6_${lab}_1" get "$url"; nap 1; pj_plain "a6_${lab}_2" get "$url" ;; worker) pj_worker "a6_${lab}_1" get "$url"; nap 1; pj_worker "a6_${lab}_2" get "$url" ;; esac
-  REQ_TOTAL=$((REQ_TOTAL + 2))
   x1="$(pv "a6_${lab}_1" '.headers["x-cache"] // .headers["x-lwf-cache"] // .headers["cf-cache-status"] // "none"')"
   x2="$(pv "a6_${lab}_2" '.headers["x-cache"] // .headers["x-lwf-cache"] // .headers["cf-cache-status"] // "none"')"
   n1="$(pv "a6_${lab}_1" '.body|fromjson?|.nonce // "?"')"; n2="$(pv "a6_${lab}_2" '.body|fromjson?|.nonce // "?"')"
@@ -622,50 +731,98 @@ a6_pair() { # label mode url
   A6_LINE="${lab}[1st=$x1,2nd=$x2,body=$same,cf-cache-status=$(pv "a6_${lab}_2" '.headers["cf-cache-status"] // "none"')];"
 }
 
+# A7. Extrapolation per 10 million requests, not a quote.
+#   Event Function: a batch of light GETs of its own (CloudFront /fu/ping), so the 2-3 s /slow and /stream requests of A4 and A5
+#     do not set the per-request duration; billed duration from its REPORT lines, 512 MB, arm64 rate.
+#   Web function: request fee plus active CPU plus memory for the environments' lifetime, from the AWS/Lambda/Web metrics of the
+#     whole run divided by the web function requests this script sent. Skewed high: the lifetime includes the pauses between tests
+#     and the 2 s sleeps of A4, which a steady production load would not have.
 test_a7() {
-  local reqs="$REQ_TOTAL" start_ms n avg
-  start_ms=$(( T_START * 1000 ))
-  aws_ro logs filter-log-events --log-group-name "/aws/lambda/$FU_NAME" --filter-pattern REPORT --start-time "$start_ms" --output json > "$TMP/fu.reports" 2>/dev/null || echo '{"events":[]}' > "$TMP/fu.reports"
-  jq -r '.events[]?.message' "$TMP/fu.reports" | sed -n 's/.*Billed Duration: \([0-9][0-9]*\) ms.*/\1/p' > "$TMP/fu.billed"
-  n="$(wc -l < "$TMP/fu.billed" | tr -d ' ')"
+  local n7="${A7_N:-50}" t7 start_ms n=0 avg="n/a" fu_gbs="n/a" fu_cost="n/a" wf_cost="n/a" cpu act ucpu uact wf_detail
+  t7="$(date +%s)"; start_ms=$(( t7 * 1000 - 1000 ))
+  pj_plain a7_fu_ping latency "https://$CFD/fu/ping" --n "$n7" --warm 0
+  for _ in $(seq 1 "${A7_TRIES:-8}"); do
+    nap 15   # REPORT lines reach CloudWatch Logs with a delay
+    aws_ro logs filter-log-events --log-group-name "/aws/lambda/$FU_NAME" --filter-pattern REPORT --start-time "$start_ms" --output json > "$TMP/fu.reports" 2>/dev/null || echo '{"events":[]}' > "$TMP/fu.reports"
+    jq -r '.events[]?.message' "$TMP/fu.reports" | sed -n 's/.*Billed Duration: \([0-9][0-9]*\) ms.*/\1/p' > "$TMP/fu.billed"
+    n="$(wc -l < "$TMP/fu.billed" | tr -d ' ')"
+    [ "$n" -lt "$n7" ] || break
+  done
   avg="$(awk '{s+=$1} END {if (NR>0) printf "%.1f", s/NR; else print "n/a"}' "$TMP/fu.billed")"
   redact < "$TMP/fu.billed" > "$RAWDIR/a7-fu-billed-ms.txt"
-  metrics_snapshot a7
-  local fu_gbs fu_cost="n/a" wf_note
   if [ "$avg" != "n/a" ]; then
-    # 512 MB function; GB-s per request = billed seconds * 0.5; x86 rate is an upper bound for arm64 (Arm rate not read)
     fu_gbs="$(awk -v a="$avg" 'BEGIN {printf "%.6f", a/1000*0.5}')"
-    fu_cost="$(awk -v g="$fu_gbs" -v r="$PRICE_FU_PER_M_REQ" -v p="$PRICE_FU_GB_S_X86" 'BEGIN {printf "%.2f", 10*r + 10000000*g*p}')"
-  else fu_gbs="n/a"; fi
-  wf_note="web function: requests alone = \$$(awk -v r="$PRICE_WF_PER_M_REQ" 'BEGIN {printf "%.2f", 10*r}') per 10M; CPU and memory need the metric units, which the pages read do not state, so no conversion is attempted (raw metrics: $METRICS_SUMMARY)"
-  rec A7 MEASURED "Extrapolation, not a quote, from this run's load shape. Event Function behind the URL: $n REPORT lines, average billed ${avg} ms at 512 MB = ${fu_gbs} GB-s/request -> about \$${fu_cost} per 10M requests (request fee \$${PRICE_FU_PER_M_REQ}/M plus duration at the x86 rate \$${PRICE_FU_GB_S_X86}/GB-s, an upper bound for arm64). $wf_note. About $reqs test requests were sent in total. List prices as read 2026-10-18; check the pricing page before quoting."
+    fu_cost="$(awk -v g="$fu_gbs" -v r="$PRICE_FU_PER_M_REQ" -v p="$PRICE_FU_GB_S_ARM" 'BEGIN {printf "%.2f", 10*r + 10000000*g*p}')"
+  fi
+  metrics_snapshot a7
+  cpu="$(jq -rs 'map(select(.metric == "EnvironmentCPUTime"))[0] // {} | "\(.sum // "") \(.unit // "")"' "$TMP/m.out" 2>/dev/null)"
+  act="$(jq -rs 'map(select(.metric == "EnvironmentActiveTime"))[0] // {} | "\(.sum // "") \(.unit // "")"' "$TMP/m.out" 2>/dev/null)"
+  ucpu="$(unit_seconds "$cpu")"; uact="$(unit_seconds "$act")"
+  if [ -n "$ucpu" ] && [ -n "$uact" ] && [ "$REQ_WF" -gt 0 ]; then
+    wf_cost="$(awk -v c="$ucpu" -v a="$uact" -v q="$REQ_WF" -v r="$PRICE_WF_PER_M_REQ" -v pc="$PRICE_WF_VCPU_S" -v pm="$PRICE_WF_GB_S" -v gb="$WF_GB" \
+      'BEGIN {printf "%.2f", 10*r + 10000000*(c*pc + a*gb*pm)/q}')"
+    wf_detail="active CPU ${ucpu} s (EnvironmentCPUTime, taken as vCPU-seconds: UNVERIFIED) and environment lifetime ${uact} s (EnvironmentActiveTime) x ${WF_GB} GB over about $REQ_WF web function requests -> about \$${wf_cost} per 10M (request fee \$${PRICE_WF_PER_M_REQ}/M, \$${PRICE_WF_VCPU_S}/vCPU-s, \$${PRICE_WF_GB_S}/GB-s). SKEWED HIGH: the lifetime includes the pauses between tests and the 2 s sleeps of A4"
+  else
+    wf_detail="requests alone = \$$(awk -v r="$PRICE_WF_PER_M_REQ" 'BEGIN {printf "%.2f", 10*r}') per 10M; CPU and lifetime not converted (metric missing or unit not Seconds/Milliseconds/Microseconds: cpu='${cpu}' lifetime='${act}')"
+  fi
+  rec A7 MEASURED "Extrapolation, not a quote. Event Function behind the URL: $n of $n7 REPORT lines of a dedicated /fu/ping batch (the /slow and /stream requests of A4/A5 are excluded), average billed ${avg} ms at 512 MB arm64 = ${fu_gbs} GB-s/request -> about \$${fu_cost} per 10M requests (request fee \$${PRICE_FU_PER_M_REQ}/M plus duration at the Arm rate \$${PRICE_FU_GB_S_ARM}/GB-s). Web function: $wf_detail. Raw metrics: $METRICS_SUMMARY. About $REQ_TOTAL test requests were sent in total. List prices as read 2026-10-18; check the pricing page before quoting."
+}
+unit_seconds() { # "sum unit" -> seconds, or empty when the unit is not a time unit
+  local v="${1% *}" u="${1##* }"
+  case "$v" in ''|*[!0-9.e+-]*) return 0 ;; esac
+  case "$u" in
+    Seconds) awk -v v="$v" 'BEGIN {printf "%.3f", v}' ;;
+    Milliseconds) awk -v v="$v" 'BEGIN {printf "%.3f", v/1000}' ;;
+    Microseconds) awk -v v="$v" 'BEGIN {printf "%.3f", v/1000000}' ;;
+  esac
 }
 
+# A8. Fire the kill switch and check every outcome: distribution disabled, Worker key inactive, Function URL function at
+# reserved concurrency 0, and the web function unreachable (through CloudFront and through the Worker). The web function itself is
+# throttled only when the Lambda runtime's boto3 knows 'lambda-web'; without that it is cut off by the other three, which the
+# kill output says.
 test_a8() {
-  local out keys en i w1 w2 pass=1 detail
-  if [ "$KEEP" = 1 ]; then rec A8 SKIPPED "--keep: the kill switch was not fired by the test, so the run stays usable. It fires by itself at $KILL_AT UTC (disables the distribution, deactivates the Worker key, throttles both functions). Run without --keep to test it."; return 0; fi
+  local inv fe out keys en conc i w1 w2 cfwf="" cffu="" wfo pass=1 inc=0 why="" detail
+  if [ "$KEEP" = 1 ]; then rec A8 SKIPPED "--keep: the kill switch was not fired by the test, so the run stays usable. It fires by itself at $KILL_AT UTC (disables the distribution, deactivates the Worker key, sets the Function URL function to reserved concurrency 0; the web function is then unreachable). Run without --keep to test it."; return 0; fi
   say "A8: invoking the kill switch (the same function the schedule starts at +${KILL_HOURS} h)"
   printf '{"source":"test-a8"}' > "$TMP/kill-event.json"
-  if aws_do lambda invoke --function-name "$KILL_FN" --payload "file://$TMP/kill-event.json" --cli-binary-format raw-in-base64-out "$TMP/kill-out.json" >/dev/null; then
-    out="$(jq -c . "$TMP/kill-out.json" 2>/dev/null || echo unreadable)"
-  else rec A8 FAIL "could not invoke the kill switch ($(aws_code))"; return 0; fi
+  if ! inv="$(aws_do lambda invoke --function-name "$KILL_FN" --payload "file://$TMP/kill-event.json" --cli-binary-format raw-in-base64-out "$TMP/kill-out.json")"; then
+    rec A8 FAIL "could not invoke the kill switch ($(aws_code))"; return 0
+  fi
+  fe="$(printf '%s' "$inv" | jq -r '.FunctionError // empty' 2>/dev/null)"
+  # when a step fails the function raises with the step results as the message
+  out="$(jq -c 'if type == "object" and .errorMessage then (.errorMessage | fromjson? // {error: .}) else . end' "$TMP/kill-out.json" 2>/dev/null || echo '{}')"
   redact < "$TMP/kill-out.json" > "$RAWDIR/a8-kill-output.json"
-  en=""; keys=""
+  [ -z "$fe" ] || { pass=0; why="$why the kill switch raised ($fe): a step that must work failed;"; }
+  wfo="$(printf '%s' "$out" | jq -r '.web_function // "missing"' 2>/dev/null)"
+  en=""; keys=""; conc=""
   for i in $(seq 1 "${A8_TRIES:-12}"); do
     en="$(aws_ro cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.DistributionConfig.Enabled' --output text)"
-    keys="$(aws_ro iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].Status' --output text | tr '\t' ' ')"
-    case "$en" in False|false) case " $keys " in *" Active "*) ;; *) break ;; esac ;; esac
+    keys="$(aws_names iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].Status' | tr '\n' ' ')"
+    conc="$(aws_ro lambda get-function-concurrency --function-name "$FU_NAME" --query ReservedConcurrentExecutions --output text 2>/dev/null)"
+    case "$en" in False|false) case " $keys " in *" Active "*) ;; *) [ "$conc" != 0 ] || break ;; esac ;; esac
     nap 10
+  done
+  # disabling a distribution takes minutes to reach every edge location: wait until it stops serving both origins
+  for i in $(seq 1 "${A8_CF_TRIES:-30}"); do
+    pj_plain a8_cf_wf get "https://$CFD/wf/ping"; cfwf="$(pv a8_cf_wf '.status // 0')"
+    pj_plain a8_cf_fu get "https://$CFD/fu/ping"; cffu="$(pv a8_cf_fu '.status // 0')"
+    [ "$cfwf" = 200 ] || [ "$cffu" = 200 ] || break
+    nap 20
   done
   nap "${A8_SETTLE:-30}"
   pj_worker a8_w_wf get "https://$H_W/wf/ping"; w1="$(pv a8_w_wf .status)"
   pj_worker a8_w_fu get "https://$H_W/fu/ping"; w2="$(pv a8_w_fu .status)"
-  pj_plain a8_cf_wf get "https://$CFD/wf/ping"
-  detail="kill switch output: $out; distribution Enabled=$en; worker key status(es): ${keys:-none}; Worker after the brake wf=$w1 fu=$w2 (want not 200); CloudFront after the brake wf=$(pv a8_cf_wf .status)"
-  case "$en" in False|false) ;; *) pass=0 ;; esac
-  case " $keys " in *" Active "*) pass=0 ;; esac
-  case "$w1$w2" in *200*) pass=0 ;; esac
-  if [ "$pass" = 1 ]; then rec A8 PASS "$detail"; else rec A8 FAIL "$detail"; fi
+  case "$en" in False|false) ;; *) pass=0; why="$why the distribution is still enabled;" ;; esac
+  case " $keys " in *" Active "*) pass=0; why="$why a Worker key is still active;" ;; esac
+  [ "$conc" = 0 ] || { pass=0; why="$why the Function URL function is not throttled (reserved concurrency ${conc:-none});"; }
+  case "$w1$w2" in *200*) pass=0; why="$why the Worker still gets 200 (wf=$w1 fu=$w2);" ;; esac
+  if [ "$cfwf" = 200 ] || [ "$cffu" = 200 ]; then inc=1; why="$why CloudFront still served 200 after the wait (wf=$cfwf fu=$cffu): disabling propagates slowly;"; fi
+  case "$wfo" in rate-limit-0) wfo="throttled (rate limit 0)" ;; *) wfo="NOT throttled by the kill switch ($wfo; known limitation, see README)" ;; esac
+  detail="outcomes: distribution Enabled=$en; Worker key status(es): ${keys:-none}; function_url: reserved concurrency ${conc:-none} (want 0 = throttled); web_function: $wfo, reachable through CloudFront=$cfwf, through the Worker=$w1 (want not 200 on both = unreachable); Function URL through CloudFront=$cffu, through the Worker=$w2. Kill switch output: $out"
+  if [ "$pass" = 0 ]; then rec A8 FAIL "$why $detail"
+  elif [ "$inc" = 1 ]; then rec A8 INCONCLUSIVE "$why $detail"
+  else rec A8 PASS "$detail"; fi
 }
 
 # ---------------------------------------------------------------------------------------------------- report
@@ -680,7 +837,7 @@ write_report() {
     echo "# lambda-web-functions results, run $RUN"
     echo
     echo "Date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ). Region $REGION. AWS CLI $cli. Cloudflare plan: ${ZPLAN:-unknown}; SSL mode: ${ZSSL:-unknown}."
-    echo "Extras: O1 alias=$O1, O2 probe=$O2, O3 negative=$O3. Statuses: PASS / FAIL (the documented expectation did not hold) / MEASURED / INCONCLUSIVE."
+    echo "Extras: O1 alias=$O1, O2 probe=$O2, O3 negative=$O3. Statuses: PASS / FAIL (the documented expectation did not hold) / MEASURED / INCONCLUSIVE / SKIPPED."
     echo
     echo "| Test | Status | Detail |"
     echo "|---|---|---|"
@@ -692,45 +849,63 @@ write_report() {
 }
 
 # ---------------------------------------------------------------------------------------------------- teardown
+# Interrupt-safe. While the teardown runs, INT, TERM and HUP do not stop it: each one is reported and the teardown carries on
+# (a step whose aws or curl child died with the Ctrl-C is tried once more). The third one stops the script; the state file stays,
+# so --teardown <run-id> finishes the job. A run is marked torn down (TORN_DOWN in the state file) only after a clean scan.
+sig_rc() { case "$1" in INT) echo 130 ;; TERM) echo 143 ;; HUP) echo 129 ;; *) echo 2 ;; esac; }
+# shellcheck disable=SC2317,SC2329  # runs from a trap
+td_on_signal() { # signal name
+  TD_SIGS=$((TD_SIGS + 1)); TD_SIGNAME="$1"
+  if [ "$TD_SIGS" -ge 3 ]; then
+    TD_ABANDONED=1
+    say "teardown interrupted ($1, third time): stopping now. Resources of run $RUN may remain; re-run --teardown: $0 --teardown $RUN --zone $ZONE"
+    rm -rf "$TMP"
+    exit "$(sig_rc "$1")"
+  fi
+  say "teardown interrupted ($1): carrying on so nothing is left half-deleted. If it stops before the scan, re-run --teardown $RUN (Ctrl-C $((3 - TD_SIGS)) more time(s) stops it now)"
+}
+td_traps() { trap 'td_on_signal INT' INT; trap 'td_on_signal TERM' TERM; trap 'td_on_signal HUP' HUP; }
 td() { # description, then a command; a failure is reported and remembered, never fatal
-  local d="$1"; shift
+  local d="$1" s0="$TD_SIGS"; shift
   if "$@"; then return 0; fi
+  if [ "$TD_SIGS" != "$s0" ]; then
+    say "teardown: trying '$d' once more (it failed while a signal arrived)"
+    if "$@"; then return 0; fi
+  fi
   TD_FAIL=1; say "TEARDOWN problem: $d"
   return 0
 }
+# shellcheck disable=SC2317,SC2329  # called through td()
 td_cloudflare() {
   [ -n "$HDR" ] || { say "TEARDOWN: no Cloudflare token, Cloudflare resources NOT removed"; TD_FAIL=1; return 0; }
   [ -n "$ZID" ] || lookup_zone || { say "TEARDOWN: Cloudflare zone lookup failed (HTTP $CF_HTTP)"; TD_FAIL=1; return 0; }
-  local id host
+  local id rc=0
   # custom domains of this Worker
-  cf_list "/accounts/$ACC_CF/workers/domains" | jq -r --arg s "$WORKER" 'select(.service == $s) | .id' > "$TMP/td.ids" 2>/dev/null \
-    || { TD_FAIL=1; say "TEARDOWN problem: cannot list Workers custom domains"; }
-  while read -r id; do
-    [ -n "$id" ] || continue
-    cf DELETE "/accounts/$ACC_CF/workers/domains/$id" || cf_gone || { TD_FAIL=1; say "TEARDOWN problem: custom domain delete failed (HTTP $CF_HTTP)"; }
-  done < "$TMP/td.ids"
-  cf DELETE "/accounts/$ACC_CF/workers/scripts/$WORKER?force=true" || cf_gone || { TD_FAIL=1; say "TEARDOWN problem: Worker delete failed (HTTP $CF_HTTP)"; }
-  # Advanced Certificate packs whose hosts are all ours (deleting a custom domain does not delete them)
-  cf_list "/zones/$ZID/ssl/certificate_packs?status=all" | jq -r --arg a "$H_W" --arg b "$H_G" --arg c "$H_O" --arg d "$H_X" \
-    'select((.hosts // []) | length > 0 and all(.[]; . == $a or . == $b or . == $c or . == $d)) | .id' > "$TMP/td.ids" 2>/dev/null \
-    || { TD_FAIL=1; say "TEARDOWN problem: cannot list certificate packs"; }
-  while read -r id; do
-    [ -n "$id" ] || continue
-    cf DELETE "/zones/$ZID/ssl/certificate_packs/$id" || cf_gone || { TD_FAIL=1; say "TEARDOWN problem: certificate pack delete failed (HTTP $CF_HTTP $(cf_errors))"; }
-  done < "$TMP/td.ids"
+  if cf_list "/accounts/$ACC_CF/workers/domains" | jq -r --arg s "$WORKER" 'select(.service == $s) | .id' > "$TMP/td.ids" 2>/dev/null; then
+    while read -r id; do
+      [ -n "$id" ] || continue
+      cf DELETE "/accounts/$ACC_CF/workers/domains/$id" || cf_gone || { rc=1; say "TEARDOWN problem: custom domain delete failed (HTTP $CF_HTTP)"; }
+    done < "$TMP/td.ids"
+  else rc=1; say "TEARDOWN problem: cannot list Workers custom domains"; fi
+  cf DELETE "/accounts/$ACC_CF/workers/scripts/$WORKER?force=true" || cf_gone || { rc=1; say "TEARDOWN problem: Worker delete failed (HTTP $CF_HTTP)"; }
+  # Advanced Certificate packs this run saw appear (deleting a custom domain does not delete them); only recorded ids
+  for id in $(state_get CF_PACKS); do
+    cf DELETE "/zones/$ZID/ssl/certificate_packs/$id" || cf_gone || { rc=1; say "TEARDOWN problem: certificate pack delete failed (HTTP $CF_HTTP $(cf_errors))"; }
+  done
   # DNS records created by this run (comment match), including the ACM validation records
-  cf_list "/zones/$ZID/dns_records" | jq -r --arg c "$COMMENT" 'select(.comment == $c) | .id' > "$TMP/td.ids" 2>/dev/null \
-    || { TD_FAIL=1; say "TEARDOWN problem: cannot list DNS records"; }
-  while read -r id; do
-    [ -n "$id" ] || continue
-    cf DELETE "/zones/$ZID/dns_records/$id" || cf_gone || { TD_FAIL=1; say "TEARDOWN problem: DNS record delete failed (HTTP $CF_HTTP)"; }
-  done < "$TMP/td.ids"
-  host="$H_W"; : "$host"
+  if cf_list "/zones/$ZID/dns_records" | jq -r --arg c "$COMMENT" 'select(.comment == $c) | .id' > "$TMP/td.ids" 2>/dev/null; then
+    while read -r id; do
+      [ -n "$id" ] || continue
+      cf DELETE "/zones/$ZID/dns_records/$id" || cf_gone || { rc=1; say "TEARDOWN problem: DNS record delete failed (HTTP $CF_HTTP)"; }
+    done < "$TMP/td.ids"
+  else rc=1; say "TEARDOWN problem: cannot list DNS records"; fi
+  return "$rc"
 }
+# shellcheck disable=SC2317,SC2329  # called through td()
 empty_bucket() { # delete every object version and delete marker
-  local b="$BUCKET" i
+  local b="$BUCKET"
   aws_ro s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 0
-  for i in $(seq 1 200); do
+  for _ in $(seq 1 200); do
     aws_ro s3api list-object-versions --bucket "$b" --max-items 1000 --output json > "$TMP/ver.json" || return 1
     jq '{Objects: ([.Versions[]?, .DeleteMarkers[]?] | map({Key, VersionId})), Quiet: true}' "$TMP/ver.json" > "$TMP/ver.del"
     [ "$(jq '.Objects | length' "$TMP/ver.del")" -gt 0 ] || return 0
@@ -738,67 +913,104 @@ empty_bucket() { # delete every object version and delete marker
   done
   return 1
 }
-delete_stack() { # stack region
+stack_status() { # stack region -> GONE or the stack status on stdout; 1 if it could not be read
   local st
-  st="$(AWS_R="$2" aws_ro cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)" || { aws_gone && return 0; return 1; }
-  [ "$st" != DELETE_COMPLETE ] || return 0
+  if st="$(AWS_R="$2" aws_ro cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)"; then
+    case "$st" in DELETE_COMPLETE|None|'') echo GONE ;; *) echo "$st" ;; esac
+  elif aws_gone; then echo GONE
+  else return 1; fi
+}
+# shellcheck disable=SC2317,SC2329  # called through td()
+delete_stack() { # stack region -> 0 only when the stack is gone afterwards
+  local st
+  st="$(stack_status "$1" "$2")" || return 1
+  [ "$st" != GONE ] || return 0
   AWS_R="$2" aws_do cloudformation delete-stack --stack-name "$1" || return 1
-  AWS_R="$2" aws_do cloudformation wait stack-delete-complete --stack-name "$1" || {
+  if ! AWS_R="$2" aws_do cloudformation wait stack-delete-complete --stack-name "$1"; then
     # one retry for DELETE_FAILED (for example a bucket that was not empty yet)
     AWS_R="$2" aws_do cloudformation delete-stack --stack-name "$1" || return 1
     AWS_R="$2" aws_do cloudformation wait stack-delete-complete --stack-name "$1" || return 1
-  }
+  fi
+  st="$(stack_status "$1" "$2")" || return 1
+  [ "$st" = GONE ] || { say "stack $1 still exists after the delete ($st)"; return 1; }
 }
+# shellcheck disable=SC2317,SC2329  # called through td()
+td_app_stack() { # the kill switch schedule is part of this stack, so it goes last, with the stack
+  delete_stack "$APP_STACK" "$REGION" && return 0
+  say "teardown: the app stack did not delete; invoking the kill switch now so that what is left cannot serve traffic"
+  fire_kill_switch || say "teardown: the kill switch could not be invoked either ($(aws_code)); the schedule at $KILL_AT UTC is still there if the stack is"
+  return 1
+}
+# shellcheck disable=SC2317,SC2329  # called from td_app_stack, which runs through td()
+fire_kill_switch() {
+  printf '{"source":"teardown"}' > "$TMP/kill-td-event.json"
+  aws_do lambda invoke --function-name "${KILL_FN:-$P-kill}" --payload "file://$TMP/kill-td-event.json" --cli-binary-format raw-in-base64-out "$TMP/kill-td.json" >/dev/null
+}
+# shellcheck disable=SC2317,SC2329  # called through td()
 td_keys() {
   local k keys
-  keys="$(aws_ro iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].AccessKeyId' --output text 2>/dev/null)" || { aws_gone && return 0; return 1; }
+  keys="$(aws_names iam list-access-keys --user-name "$USERN" --query 'AccessKeyMetadata[].AccessKeyId')" || { aws_gone && return 0; return 1; }
   for k in $keys; do aws_do iam delete-access-key --user-name "$USERN" --access-key-id "$k" || return 1; done
 }
-td_policy() { # best effort: the policy goes with the function, but the task list asks for it explicitly
-  aws lambda-web delete-resource-policy help >/dev/null 2>&1 || return 0
-  aws_ro lambda-web get-web-function --function-name "$P-wf" >/dev/null 2>&1 || return 0
-  aws_do lambda-web delete-resource-policy --resource-arn "arn:aws:lambda:$REGION:$ACCOUNT:web-function/$P-wf" >/dev/null 2>&1 || true
-  return 0
+# shellcheck disable=SC2317,SC2329  # called through td()
+td_policy() { # removed before the stack so that a stack that will not delete no longer lets CloudFront in
+  local arn
+  if ! aws lambda-web delete-resource-policy help >/dev/null 2>&1; then
+    say "teardown: this CLI has no 'lambda-web delete-resource-policy' (UNVERIFIED name); the resource policy goes with the web function (app stack)"
+    return 0
+  fi
+  arn="${WF_ARN:-$(state_get WF_ARN)}"
+  [ -n "$arn" ] || arn="arn:$PARTITION:lambda:$REGION:$ACCOUNT:web-function/$P-wf"
+  aws_do lambda-web delete-resource-policy --resource-arn "$arn" >/dev/null 2>&1 && return 0
+  aws_gone && return 0   # no function or no policy: nothing to remove
+  say "teardown: delete-resource-policy failed ($(aws_code))"
+  return 1
 }
-td_schedule() { aws_do scheduler delete-schedule --name "$SCHEDULE" >/dev/null 2>&1 || aws_gone || return 0; return 0; }
+# shellcheck disable=SC2317,SC2329  # called through td()
 td_cert() {
-  local arn="${CERT_ARN:-$(state_get CERT_ARN)}" i found=""
+  local arn="${CERT_ARN:-$(state_get CERT_ARN)}" found="" a
   if [ -z "$arn" ]; then # discovery: certificates for our alias name that carry this run's tag
     # shellcheck disable=SC2086  # ACM_STATUSES is a list of words on purpose
-    for a in $(aws_ro acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null); do
+    for a in $(aws_names acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn"); do
       if [ "$(aws_ro acm list-tags-for-certificate --certificate-arn "$a" --query "Tags[?Key=='RunId'].Value | [0]" --output text 2>/dev/null)" = "$RUN" ]; then found="$a"; fi
     done
     arn="$found"
   fi
   [ -n "$arn" ] || return 0
-  for i in $(seq 1 "${CERT_DELETE_TRIES:-12}"); do
+  for _ in $(seq 1 "${CERT_DELETE_TRIES:-12}"); do
     if aws_do acm delete-certificate --certificate-arn "$arn" 2>/dev/null; then return 0; fi
     aws_gone && return 0
     nap 30   # "in use" until CloudFront has let go of it
   done
   return 1
 }
+# shellcheck disable=SC2317,SC2329  # called through td()
 td_logs() {
   local r pfx g rc=0
   for r in "$REGION" "$PROBE_REGION"; do
     for pfx in "/aws/lambda/$P" "/aws/lambda/web/$P"; do
-      for g in $(AWS_R="$r" aws_ro logs describe-log-groups --log-group-name-prefix "$pfx" --query 'logGroups[].logGroupName' --output text 2>/dev/null); do
+      for g in $(AWS_R="$r" aws_names logs describe-log-groups --log-group-name-prefix "$pfx" --query 'logGroups[].logGroupName'); do
         AWS_R="$r" aws_do logs delete-log-group --log-group-name "$g" >/dev/null 2>&1 || aws_gone || rc=1
       done
     done
   done
   return "$rc"
 }
+td_mark_torn_down() { # the run is gone: keep the state file as a record, without the old Worker token line, marked torn down
+  [ -f "$STATE_FILE" ] || return 0
+  grep -v '^WTOKEN=' "$STATE_FILE" > "$STATE_FILE.tmp"; mv "$STATE_FILE.tmp" "$STATE_FILE"
+  state_set TORN_DOWN "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
 do_teardown() {
-  [ "$TEARDOWN_DONE" = 0 ] || return 0
-  TEARDOWN_DONE=1; TD_FAIL=0
-  [ -n "${ACCOUNT:-}" ] || ACCOUNT="$(aws_ro sts get-caller-identity --query Account --output text 2>/dev/null)"
+  [ "$TD_STATE" != 2 ] || return 0
+  TD_STATE=1; TD_FAIL=0
+  td_traps
+  [ -n "${ACCOUNT:-}" ] || aws_identity
   say "teardown of run $RUN (only resources named lwf-$RUN* or commented 'lwf-sample $RUN')"
-  td "kill switch schedule" td_schedule
   td "Cloudflare resources" td_cloudflare
   td "Worker IAM access keys" td_keys
   td "web function resource policy" td_policy
-  td "app stack $APP_STACK (CloudFront deletion takes 10-30 minutes)" delete_stack "$APP_STACK" "$REGION"
+  td "app stack $APP_STACK (CloudFront deletion takes 10-30 minutes; the kill switch schedule goes with it)" td_app_stack
   td "ACM certificate" td_cert
   td "object versions in the artifacts bucket" empty_bucket
   td "artifacts stack $ART_STACK" delete_stack "$ART_STACK" "$REGION"
@@ -813,7 +1025,18 @@ do_teardown() {
   fi
   if [ "$TD_FAIL" != 0 ] && [ "$rc" = 0 ]; then rc=3; fi
   TEARDOWN_RC=$rc
+  TD_STATE=2
+  if [ "$rc" = 0 ]; then td_mark_torn_down; fi
+  if [ "$TD_SIGS" -gt 0 ]; then
+    if [ "$rc" = 0 ]; then say "teardown completed despite the interrupt; nothing is left"
+    else say "teardown interrupted and incomplete: re-run --teardown $RUN"; fi
+  fi
   return 0
+}
+teardown_exit_code() { # leftovers win; otherwise an interrupt is still reported as one
+  if [ "$TEARDOWN_RC" != 0 ]; then echo "$TEARDOWN_RC"
+  elif [ "$TD_SIGS" -gt 0 ]; then sig_rc "$TD_SIGNAME"
+  else echo 0; fi
 }
 
 # ---------------------------------------------------------------------------------------------------- leftover scan
@@ -826,37 +1049,43 @@ scan_leftovers() {
   local r s names x
   for s in "$ART_STACK|$REGION" "$APP_STACK|$REGION" "$PROBE_STACK|$PROBE_REGION"; do
     r="${s#*|}"; s="${s%|*}"
-    x="$(AWS_R="$r" aws_ro cloudformation describe-stacks --stack-name "$s" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)" && { [ "$x" = DELETE_COMPLETE ] || left "cloudformation stack" "$s ($x)"; } || { aws_gone || gap "cloudformation $s" "$(aws_code)"; }
+    if x="$(stack_status "$s" "$r")"; then
+      [ "$x" = GONE ] || left "cloudformation stack" "$s ($x)"
+    else gap "cloudformation $s" "$(aws_code)"; fi
   done
   for r in "$REGION" "$PROBE_REGION"; do
-    names="$(AWS_R="$r" aws_ro lambda list-functions --query "Functions[?starts_with(FunctionName,'$P')].FunctionName" --output text 2>/dev/null)" || { gap "lambda functions in $r" "$(aws_code)"; names=""; }
+    names="$(AWS_R="$r" aws_names lambda list-functions --query "Functions[?starts_with(FunctionName,'$P')].FunctionName")" || { gap "lambda functions in $r" "$(aws_code)"; names=""; }
     for x in $names; do left "lambda function ($r)" "$x"; done
-    names="$(AWS_R="$r" aws_ro logs describe-log-groups --log-group-name-prefix "/aws/lambda/$P" --query 'logGroups[].logGroupName' --output text 2>/dev/null)" || { gap "log groups in $r" "$(aws_code)"; names=""; }
+    names="$(AWS_R="$r" aws_names logs describe-log-groups --log-group-name-prefix "/aws/lambda/$P" --query 'logGroups[].logGroupName')" || { gap "log groups in $r" "$(aws_code)"; names=""; }
     for x in $names; do left "log group ($r)" "$x"; done
-    names="$(AWS_R="$r" aws_ro logs describe-log-groups --log-group-name-prefix "/aws/lambda/web/$P" --query 'logGroups[].logGroupName' --output text 2>/dev/null)" || { gap "web log groups in $r" "$(aws_code)"; names=""; }
+    names="$(AWS_R="$r" aws_names logs describe-log-groups --log-group-name-prefix "/aws/lambda/web/$P" --query 'logGroups[].logGroupName')" || { gap "web log groups in $r" "$(aws_code)"; names=""; }
     for x in $names; do left "web function log group ($r)" "$x"; done
   done
   if aws lambda-web get-web-function help >/dev/null 2>&1; then
-    if aws_ro lambda-web get-web-function --function-name "$P-wf" >/dev/null 2>&1; then left "web function" "$P-wf"; else aws_gone || gap "web function $P-wf" "$(aws_code)"; fi
+    if aws_ro lambda-web get-web-function --function-name "$P-wf" >/dev/null 2>&1; then left "web function" "$P-wf"; elif ! aws_gone; then gap "web function $P-wf" "$(aws_code)"; fi
   else gap "web functions" "this CLI has no 'lambda-web get-web-function' (UNVERIFIED name); stack deletion status above is the evidence"; fi
-  names="$(aws_ro cloudfront list-distributions --query "DistributionList.Items[?contains(Comment,'$P ')].Id" --output text 2>/dev/null)" || { gap "cloudfront distributions" "$(aws_code)"; names=""; }
+  names="$(aws_names cloudfront list-distributions --query "DistributionList.Items[?contains(Comment,'$P ')].Id")" || { gap "cloudfront distributions" "$(aws_code)"; names=""; }
   for x in $names; do left "cloudfront distribution" "$x"; done
-  names="$(aws_ro cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?starts_with(Name,'$P')].Id" --output text 2>/dev/null)" || { gap "origin access controls" "$(aws_code)"; names=""; }
+  names="$(aws_names cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?starts_with(Name,'$P')].Id")" || { gap "origin access controls" "$(aws_code)"; names=""; }
   for x in $names; do left "origin access control" "$x"; done
-  names="$(aws_ro cloudfront list-cache-policies --type custom --query "CachePolicyList.Items[?starts_with(CachePolicy.CachePolicyConfig.Name,'$P')].CachePolicy.Id" --output text 2>/dev/null)" || { gap "cache policies" "$(aws_code)"; names=""; }
+  names="$(aws_names cloudfront list-cache-policies --type custom --query "CachePolicyList.Items[?starts_with(CachePolicy.CachePolicyConfig.Name,'$P')].CachePolicy.Id")" || { gap "cache policies" "$(aws_code)"; names=""; }
   for x in $names; do left "cache policy" "$x"; done
-  names="$(aws_ro cloudfront list-response-headers-policies --type custom --query "ResponseHeadersPolicyList.Items[?starts_with(ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name,'$P')].ResponseHeadersPolicy.Id" --output text 2>/dev/null)" || { gap "response headers policies" "$(aws_code)"; names=""; }
+  names="$(aws_names cloudfront list-response-headers-policies --type custom --query "ResponseHeadersPolicyList.Items[?starts_with(ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name,'$P')].ResponseHeadersPolicy.Id")" || { gap "response headers policies" "$(aws_code)"; names=""; }
   for x in $names; do left "response headers policy" "$x"; done
-  names="$(aws_ro s3api list-buckets --query "Buckets[?starts_with(Name,'$P')].Name" --output text 2>/dev/null)" || { gap "s3 buckets" "$(aws_code)"; names=""; }
+  names="$(aws_names s3api list-buckets --query "Buckets[?starts_with(Name,'$P')].Name")" || { gap "s3 buckets" "$(aws_code)"; names=""; }
   for x in $names; do left "s3 bucket" "$x"; done
-  names="$(aws_ro iam list-roles --query "Roles[?starts_with(RoleName,'$P')].RoleName" --output text 2>/dev/null)" || { gap "iam roles" "$(aws_code)"; names=""; }
+  names="$(aws_names iam list-roles --query "Roles[?starts_with(RoleName,'$P')].RoleName")" || { gap "iam roles" "$(aws_code)"; names=""; }
   for x in $names; do left "iam role" "$x"; done
-  names="$(aws_ro iam list-users --query "Users[?starts_with(UserName,'$P')].UserName" --output text 2>/dev/null)" || { gap "iam users" "$(aws_code)"; names=""; }
+  names="$(aws_names iam list-users --query "Users[?starts_with(UserName,'$P')].UserName")" || { gap "iam users" "$(aws_code)"; names=""; }
   for x in $names; do left "iam user" "$x"; done
-  names="$(aws_ro scheduler list-schedules --name-prefix "$P" --query 'Schedules[].Name' --output text 2>/dev/null)" || { gap "scheduler" "$(aws_code)"; names=""; }
+  names="$(aws_names scheduler list-schedules --name-prefix "$P" --query 'Schedules[].Name')" || { gap "scheduler" "$(aws_code)"; names=""; }
   for x in $names; do left "schedule" "$x"; done
+  names="$(aws_names cloudwatch describe-alarms --alarm-name-prefix "$P" --query 'MetricAlarms[].AlarmName')" || { gap "cloudwatch alarms" "$(aws_code)"; names=""; }
+  for x in $names; do left "cloudwatch alarm" "$x"; done
+  names="$(aws_names sns list-topics --query "Topics[?contains(TopicArn,':$P-')].TopicArn")" || { gap "sns topics" "$(aws_code)"; names=""; }
+  for x in $names; do left "sns topic" "$x"; done
   # shellcheck disable=SC2086  # ACM_STATUSES is a list of words on purpose
-  names="$(aws_ro acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn" --output text 2>/dev/null)" || { gap "acm certificates" "$(aws_code)"; names=""; }
+  names="$(aws_names acm list-certificates --certificate-statuses $ACM_STATUSES --query "CertificateSummaryList[?DomainName=='$H_G'].CertificateArn")" || { gap "acm certificates" "$(aws_code)"; names=""; }
   for x in $names; do
     if [ "$(aws_ro acm list-tags-for-certificate --certificate-arn "$x" --query "Tags[?Key=='RunId'].Value | [0]" --output text 2>/dev/null)" = "$RUN" ]; then left "acm certificate" "$x"; fi
   done
@@ -865,10 +1094,15 @@ scan_leftovers() {
     for x in $names; do left "cloudflare dns record" "$x"; done
     names="$(cf_list "/accounts/$ACC_CF/workers/domains" | jq -r --arg s "$WORKER" 'select(.service == $s) | .hostname' 2>/dev/null)" || { gap "cloudflare workers domains" "HTTP $CF_HTTP"; names=""; }
     for x in $names; do left "cloudflare workers custom domain" "$x"; done
-    if cf GET "/accounts/$ACC_CF/workers/scripts/$WORKER/settings" ; then left "cloudflare worker" "$WORKER"; else cf_gone || gap "cloudflare worker" "HTTP $CF_HTTP"; fi
-    names="$(cf_list "/zones/$ZID/ssl/certificate_packs?status=all" | jq -r --arg a "$H_W" --arg b "$H_G" --arg c "$H_O" --arg d "$H_X" \
-      'select((.hosts // []) | length > 0 and all(.[]; . == $a or . == $b or . == $c or . == $d)) | .id' 2>/dev/null)" || { gap "cloudflare certificate packs" "HTTP $CF_HTTP"; names=""; }
-    for x in $names; do left "cloudflare certificate pack" "$x"; done
+    if cf GET "/accounts/$ACC_CF/workers/scripts/$WORKER/settings"; then left "cloudflare worker" "$WORKER"; elif ! cf_gone; then gap "cloudflare worker" "HTTP $CF_HTTP"; fi
+    # any pack that covers only this run's names: reported, but deleted by the teardown only if this run recorded it
+    names="$(packs_for_our_names 2>/dev/null)" || { gap "cloudflare certificate packs" "HTTP $CF_HTTP"; names=""; }
+    for x in $names; do
+      case " $(state_get CF_PACKS) " in
+        *" $x "*) left "cloudflare certificate pack" "$x" ;;
+        *) left "cloudflare certificate pack" "$x (not recorded by this run, so the teardown did not delete it; delete it in the dashboard if it is not someone else's)" ;;
+      esac
+    done
   else
     gap "cloudflare" "no token or zone: records, Worker, custom domain and certificates were NOT scanned"
   fi
@@ -879,17 +1113,22 @@ scan_leftovers() {
 
 # ---------------------------------------------------------------------------------------------------- restore trap
 TEARDOWN_RC=0
+exec 3>&1 4>&2   # the real stdout and stderr, for on_exit (a signal can arrive while a command's output goes to /dev/null)
+# shellcheck disable=SC2317,SC2329  # runs from the EXIT trap
 on_exit() {
   local rc=$?
-  trap '' INT TERM HUP
   trap - EXIT
+  exec 1>&3 2>&4
   set +e
-  if [ "$rc" -ne 0 ] && [ "$CREATE_STARTED" = 1 ] && [ "$MODE" = run ] && [ "$TEARDOWN_DONE" = 0 ]; then
-    say "RESTORE: the run failed or was interrupted (exit $rc); removing what this run created (do not interrupt again)"
+  if [ "$rc" -ne 0 ] && [ "$CREATE_STARTED" = 1 ] && [ "$MODE" = run ] && [ "$TD_STATE" != 2 ] && [ "$TD_ABANDONED" = 0 ]; then
+    td_traps   # a further Ctrl-C is reported, never a silent stop
+    say "RESTORE: the run failed or was interrupted (exit $rc); removing what this run created"
     do_teardown
     say "RESTORE: finished (leftover scan result $TEARDOWN_RC). State file: $STATE_FILE"
+  else
+    trap '' INT TERM HUP
   fi
-  rm -rf "$TMP"
+  rm -rf "$TMP"   # with it the mode-600 Cloudflare header file
   exit "$rc"
 }
 trap on_exit EXIT
@@ -900,7 +1139,7 @@ trap 'exit 129' HUP
 # ---------------------------------------------------------------------------------------------------- main
 main_teardown_or_status() {
   preflight_tools
-  ACCOUNT="$(aws_ro sts get-caller-identity --query Account --output text)" || die "AWS credentials do not work"
+  aws_identity || die "AWS credentials do not work"
   [ -z "$ZONE" ] || [ -z "$(state_get_run ZONE)" ] || [ "$ZONE" = "$(state_get_run ZONE)" ] || die "run $RUN was created for another Cloudflare zone than --zone; refusing (a teardown for the wrong zone would report 'nothing left' without having looked at the right records)"
   [ -n "$ZONE" ] || ZONE="$(state_get_run ZONE)"
   if [ -z "$ZONE" ]; then
@@ -917,12 +1156,24 @@ main_teardown_or_status() {
     scan_leftovers; exit $?
   fi
   do_teardown
-  [ "$TEARDOWN_RC" = 0 ] && say "teardown complete, nothing left" || say "teardown finished with leftovers (exit 3): see LEFTOVER / SCAN-GAP / TEARDOWN lines above"
-  exit "$TEARDOWN_RC"
+  if [ "$TEARDOWN_RC" = 0 ]; then say "teardown complete, nothing left"
+  else say "teardown finished with leftovers (exit 3): see LEFTOVER / SCAN-GAP / TEARDOWN lines above"; fi
+  exit "$(teardown_exit_code)"
 }
 guard_state() { # the run's resources are named after the account; another account would look empty and "clean"
   local a4; a4="$(state_get_run ACCOUNT_LAST4)"
   [ -z "$a4" ] || [ "$a4" = "${ACCOUNT: -4}" ] || die "run $RUN was created in the AWS account ending $a4, but these credentials are for the account ending ${ACCOUNT: -4}; refusing"
+}
+check_resume_kill_at() { # a resumed run must have at least an hour before its kill switch cuts it off
+  local k e now
+  k="$(state_get_run KILL_AT)"
+  [ -n "$k" ] || die "the state file of run $RUN has no KILL_AT; remove the run with --teardown $RUN and start a fresh run"
+  e="$(utc_epoch "$k")" || die "cannot read KILL_AT ($k) of run $RUN; remove it with --teardown $RUN and start a fresh run"
+  now="$(date +%s)"
+  if [ $((e - now)) -lt 3600 ]; then
+    if [ "$e" -le "$now" ]; then die "the kill switch of run $RUN fired at $k UTC; resuming would test a braked run. Remove it with --teardown $RUN and start a fresh run"; fi
+    die "the kill switch of run $RUN fires at $k UTC, less than an hour from now, which would cut the tests off. Remove it with --teardown $RUN and start a fresh run"
+  fi
 }
 state_get_run() { # key from the state file of --run (before set_names has run)
   [ -f "$STATE_DIR/$RUN.env" ] || return 0
@@ -936,10 +1187,18 @@ main() {
   preflight_tools
   if [ "$RESUME" = 1 ]; then
     [ -f "$STATE_DIR/$RUN.env" ] || die "no state file for run $RUN in $STATE_DIR"
+    [ -z "$(state_get_run TORN_DOWN)" ] || die "run $RUN was torn down at $(state_get_run TORN_DOWN); there is nothing to resume. Start a fresh run"
+    check_resume_kill_at
+    [ -z "${LWF_KILL_HOURS:-}" ] || warn "LWF_KILL_HOURS is ignored on --resume: the kill switch time was fixed when run $RUN started"
     [ -n "$ZONE" ] || ZONE="$(state_get_run ZONE)"
     [ -z "$(state_get_run O1)" ] || { O1="$(state_get_run O1)"; O2="$(state_get_run O2)"; O3="$(state_get_run O3)"; }
   else
     RUN="${LWF_RUN_ID:-$(date -u +%y%m%d%H%M)-$(openssl rand -hex 2)}"
+    printf '%s' "$RUN" | grep -Eq '^[0-9]{10}-[0-9a-f]{4}$' || die "LWF_RUN_ID must look like 2610181230-ab12"
+  fi
+  if [ -n "${LWF_ALERT_EMAIL:-}" ]; then
+    printf '%s' "$LWF_ALERT_EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' || die "LWF_ALERT_EMAIL is not an email address"
+    redact_add "$LWF_ALERT_EMAIL" "<alert-email>"
   fi
   if [ -z "$ZONE" ]; then
     [ -t 0 ] || die "--zone <your Cloudflare zone> is required"
@@ -968,12 +1227,17 @@ main() {
     exit 0
   fi
 
+  say ""
   if [ "$RESUME" = 0 ]; then
-    say ""
     say "This creates REAL resources in AWS account ...${ACCOUNT: -4} and in the Cloudflare zone $ZONE (CloudFront, Lambda, IAM, S3, ACM,"
     say "a Worker, DNS records) and removes them at the end. To continue type exactly: $PHRASE"
-    printf '> ' >&2; IFS= read -r typed || typed=""
-    [ "$typed" = "$PHRASE" ] || die "confirmation phrase did not match; nothing was changed"
+  else
+    say "This RESUMES run $RUN in AWS account ...${ACCOUNT: -4} and the Cloudflare zone $ZONE: it creates the steps that are not done yet"
+    say "(REAL resources), runs the tests and removes everything at the end. The kill switch fires at $(state_get_run KILL_AT) UTC. To continue type exactly: $PHRASE"
+  fi
+  printf '> ' >&2; IFS= read -r typed || typed=""
+  [ "$typed" = "$PHRASE" ] || die "confirmation phrase did not match; nothing was changed"
+  if [ "$RESUME" = 0 ]; then
     state_set RUN "$RUN"; state_set ZONE "$ZONE"; state_set ACCOUNT_LAST4 "${ACCOUNT: -4}"; state_set O1 "$O1"; state_set O2 "$O2"; state_set O3 "$O3"
     state_set KILL_AT "$(future_utc "$KILL_HOURS")"
   fi
@@ -997,6 +1261,6 @@ main() {
     exit 0
   fi
   do_teardown
-  exit "$TEARDOWN_RC"
+  exit "$(teardown_exit_code)"
 }
 main

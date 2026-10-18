@@ -32,10 +32,12 @@ count()  { grep -c -- "$2" "$1" 2>/dev/null || true; }
 reset_env() {
   local v
   for v in $(env | sed -n 's/^\(STUB_[A-Z_0-9]*\)=.*/\1/p'); do unset "$v"; done
-  unset ACK_BUDGET LWF_KILL_HOURS
+  unset ACK_BUDGET LWF_KILL_HOURS LWF_ALERT_EMAIL
   export STUB_TOKEN="$TOKEN" CF_API_TOKEN="$TOKEN" LWF_RUN_ID="$RUN_A" STUB_ZONE="$ZONE"
   export AWS_PROFILE=testprof NODE_NO_WARNINGS=1
-  export READY_TRIES=2 CERT_RECORD_TRIES=2 CERT_ISSUE_TRIES=2 CERT_DELETE_TRIES=5 A4_GAP=1 METRIC_WAIT=1 A8_SETTLE=1 A8_TRIES=2 LAT_N=5
+  # fake AWS credentials in the environment: the script must not hand them to curl or node (stubs log it to awsleak.log)
+  export AWS_ACCESS_KEY_ID=testkeyid AWS_SECRET_ACCESS_KEY=testsecretvalue AWS_SESSION_TOKEN=testsessionvalue
+  export READY_TRIES=2 CERT_RECORD_TRIES=2 CERT_ISSUE_TRIES=2 CERT_DELETE_TRIES=5 A4_GAP=1 METRIC_WAIT=1 A8_SETTLE=1 A8_TRIES=2 A8_CF_TRIES=2 A7_TRIES=2 LAT_N=5
 }
 # newdir NAME -> STUB_DIR, state and results dirs for that scenario
 newdir() {
@@ -74,6 +76,9 @@ seed_foreign() { # resources of ANOTHER run that must never be touched
 foreign_intact() { [ -e "$STUB_DIR/res/cfn__lwf-$RUN_OTHER-app" ] && [ -e "$STUB_DIR/res/user__lwf-$RUN_OTHER-worker" ] && [ -e "$STUB_DIR/res/s3__lwf-$RUN_OTHER-art-1" ] \
   && [ -e "$STUB_DIR/res/fn__lwf-$RUN_OTHER-fu" ] && [ -e "$STUB_DIR/res/lg__%aws%lambda%lwf-$RUN_OTHER-fu" ] && [ -e "$STUB_DIR/cf/records/foreign1.json" ]; }
 result_of() { jq -r --arg i "$2" '.results[] | select(.id == $i) | .status' "$LWF_RESULTS_DIR/$RUN_A/results.json"; }
+detail_of() { jq -r --arg i "$1" '.results[] | select(.id == $i) | .detail' "$LWF_RESULTS_DIR/$RUN_A/results.json"; }
+torn_down() { grep -q '^TORN_DOWN=' "$LWF_STATE_DIR/$RUN_A.env"; }
+no_tmp_left() { [ -z "$(ls "$TMPDIR")" ]; }
 SECRET_VALUES() { STUB_DIR="$TMP" bash -c '. "$1/bin/stub-lib.sh"; fake_key' _ "$here"; }
 
 echo "== node tests (worker, signer, probe, app)"
@@ -81,6 +86,10 @@ if [ -n "$REAL_NODE" ]; then
   ( cd "$root" && "$REAL_NODE" --test test/*.test.mjs >/dev/null 2>&1 ); rc=$?
   check "node --test test/*.test.mjs" is "$rc" 0
 fi
+echo "== kill switch code (the Python inlined in cfn/app.yaml, against a fake boto3)"
+if command -v python3 >/dev/null 2>&1; then
+  check "python3 tests/py/test_kill_switch.py" python3 -I "$here/py/test_kill_switch.py"
+else echo "  skip kill switch unit test (no python3)"; fi
 echo "== templates"
 if command -v cfn-lint >/dev/null 2>&1; then
   check "cfn-lint cfn/*.yaml" cfn-lint "$root"/cfn/*.yaml
@@ -105,7 +114,7 @@ check "dry run without token and terminal skips Cloudflare and says so" bash -c 
 check "...and still exits 0 and makes no Cloudflare call" bash -c "[ $RC = 0 ] && ! grep -q '^curl' '$STUB_DIR/calls.log'"
 
 echo "== preflight blockers (dry run lists them and exits 1)"
-for scen in "STUB_NO_BUDGET=1|no AWS Budget" "STUB_NO_LAMBDA_WEB=1|has no .lambda-web. command" "STUB_SCHEMA_DRIFT=ThrottleConfig|no longer has the properties" \
+for scen in "STUB_NO_BUDGET=1|no AWS Budget" "STUB_NO_NOTIFICATION=1|none has a notification" "STUB_NO_LAMBDA_WEB=1|has no .lambda-web. command" "STUB_SCHEMA_DRIFT=ThrottleConfig|no longer has the properties" \
             "STUB_SCHEMA_DRIFT=NewRequired|requires properties the template does not set" "STUB_MISSING_CMDS=put-resource-policy|does not exist in this CLI version"; do
   reset_env; newdir pf; export "${scen%%|*}"
   lwf "" --dry-run --zone "$ZONE"
@@ -118,12 +127,18 @@ lwf "" --dry-run --zone nosuchzone.test; check "unknown zone is a blocker" bash 
 reset_env; newdir pf-record
 mkdir -p "$STUB_DIR/cf/records"; jq -nc '{id:"r1",type:"CNAME",name:"lwf-w.example.test",content:"x.example.test",comment:"someone else"}' > "$STUB_DIR/cf/records/r1.json"
 lwf "" --dry-run --zone "$ZONE"; check "an existing lwf-* record is a blocker (never overwritten)" bash -c "[ $RC = 1 ] && grep -q 'already exist' '$OUT'"
+reset_env; newdir pf-pack
+mkdir -p "$STUB_DIR/cf/packs"; jq -nc '{id:"pkold",type:"advanced",hosts:["lwf-w.example.test"]}' > "$STUB_DIR/cf/packs/pkold.json"
+lwf "" --dry-run --zone "$ZONE"; check "a certificate pack that already covers an lwf-* name is a blocker" bash -c "[ $RC = 1 ] && grep -q 'certificate pack already covers' '$OUT'"
 reset_env; newdir pf-badtoken; export CF_API_TOKEN="wrong_token_wrong_token_wrong_token_00000"
 lwf "" --dry-run --zone "$ZONE"; check "a token the API rejects is a blocker" bash -c "[ $RC = 1 ]"
 reset_env; newdir pf-usage
 lwf "" --zone "Bad_Zone"; check "bad zone name refused" is "$RC" 2
 lwf "" --teardown not-a-run-id; check "bad run id refused" is "$RC" 2
 lwf "" --dry-run --resume "$RUN_A"; check "--dry-run with --resume refused" is "$RC" 2
+reset_env; newdir pf-runid; export LWF_RUN_ID="2610181200-ab12; rm -rf x"
+lwf "$PHRASE" --zone "$ZONE"
+m="$(mutating_calls)"; check "an LWF_RUN_ID that is not yymmddhhmm-xxxx is refused before anything is created" bash -c "[ $RC = 2 ] && grep -q 'LWF_RUN_ID must look like' '$OUT' && [ $m = 0 ]"
 reset_env; newdir xtrace
 printf '' | bash -x "$SCRIPT" --dry-run --zone "$ZONE" > "$OUT" 2>&1; RC=$?
 check "refuses to run under bash -x (xtrace would print the token)" bash -c "[ $RC = 2 ] && grep -q 'refusing to run with xtrace' '$OUT'"
@@ -165,15 +180,23 @@ check "account id, ARNs and the access key id do not appear in the output or res
 check "the zone name is masked in output and results" bash -c "! grep -rq 'example.test' '$OUT' '$LWF_RESULTS_DIR'"
 check "state file is mode 600 and the dir 700" bash -c "[ \"\$(ls -ld '$LWF_STATE_DIR/$RUN_A.env' | cut -c1-10)\" = -rw------- ] && [ \"\$(ls -ld '$LWF_STATE_DIR' | cut -c1-10)\" = drwx------ ]"
 check "no temp dir (with the token header file) left behind" bash -c "[ -z \"\$(ls '$TMPDIR')\" ]"
-check "teardown order: schedule and Worker go before the app stack, certificate and bucket after" bash -c "
+check "teardown order: Worker before the app stack; the kill switch schedule goes WITH the app stack (never first); certificate and bucket after" bash -c "
   d='$STUB_DIR/deleted.log'
   s=\$(grep -n 'DELETE sched' \$d | head -1 | cut -d: -f1); w=\$(grep -n 'cf DELETE worker' \$d | head -1 | cut -d: -f1)
   a=\$(grep -n 'DELETE dist' \$d | head -1 | cut -d: -f1); c=\$(grep -n 'DELETE cert' \$d | head -1 | cut -d: -f1); b=\$(grep -n 'DELETE s3 ' \$d | head -1 | cut -d: -f1)
-  [ \$s -lt \$a ] && [ \$w -lt \$a ] && [ \$a -lt \$c ] && [ \$a -lt \$b ]"
+  [ \$w -lt \$a ] && [ \$s -gt \$a ] && [ \$a -lt \$c ] && [ \$a -lt \$b ] && ! grep -q 'scheduler delete-schedule' '$STUB_DIR/calls.log'"
 check "object versions were deleted before the artifacts stack" bash -c "grep -n 'DELETE s3obj' '$STUB_DIR/deleted.log' | head -1 | cut -d: -f1 | xargs -I{} sh -c '[ {} -lt \$(grep -n \"DELETE s3 \" \"$STUB_DIR/deleted.log\" | head -1 | cut -d: -f1) ]'"
 check "never an ApplicationManaged call (no public endpoint exists)" hasnot "$STUB_DIR/calls.log" "ApplicationManaged"
 check "the Cloudflare token was never in the environment of aws, curl or node" bash -c "[ ! -e '$STUB_DIR/leak.log' ]"
-check "A1 recorded the negative control (lwf-x) and it did not answer 200" has "$LWF_RESULTS_DIR/$RUN_A/report.md" "negative control"
+check "the AWS secrets of the environment were never in the environment of curl or node" bash -c "[ ! -e '$STUB_DIR/awsleak.log' ]"
+check "A1 records the O3 record as an observation (who refused), not as a control" bash -c "grep -q 'O3 observation, not a control' '$LWF_RESULTS_DIR/$RUN_A/report.md' && grep -q 'status=526' '$LWF_RESULTS_DIR/$RUN_A/report.md'"
+check "the Function URL function got reserved concurrency 130 and the endpoint MaxEnvironments 2" bash -c "grep -q 'FuReservedConcurrency=130' '$STUB_DIR/params-lwf-$RUN_A-app' && grep -q 'MaxEnvironments=2' '$STUB_DIR/params-lwf-$RUN_A-app'"
+check "A4 passes on what it measures: in-flight per environment (wf 64, fu 1), environments reported against the cap" bash -c "d=\"\$(jq -r '.results[] | select(.id == \"A4\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json')\"; case \"\$d\" in *'up to 64 requests in flight'*'never more than 1'*'bounded by MaxEnvironments=2'*) ;; *) exit 1 ;; esac"
+check "A7 uses a dedicated /fu/ping batch (not the /slow requests) and the arm64 rate: 16 ms at 512 MB -> \$3.07 per 10M" bash -c "grep -q 'node probe latency https://[^ ]*/fu/ping --n 50 --warm 0' '$STUB_DIR/calls.log' && d=\"\$(jq -r '.results[] | select(.id == \"A7\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json')\" && case \"\$d\" in *'50 of 50 REPORT lines'*'about \$3.07 per 10M'*'Arm rate'*) ;; *) exit 1 ;; esac"
+check "A7 computes a web function figure too and labels it skewed" bash -c "jq -r '.results[] | select(.id == \"A7\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json' | grep -Eq 'Web function: active CPU .* -> about \\\$[0-9.]+ per 10M .*SKEWED HIGH'"
+check "A8 checks every outcome: distribution, key, Function URL throttled, web function unreachable" bash -c "jq -r '.results[] | select(.id == \"A8\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json' | grep -q 'function_url: reserved concurrency 0 (want 0 = throttled); web_function: throttled (rate limit 0), reachable through CloudFront=403, through the Worker=403'"
+check "the state file never held the Worker token, and the run is marked torn down" bash -c "! grep -q WTOKEN '$LWF_STATE_DIR/$RUN_A.env' && grep -q '^TORN_DOWN=' '$LWF_STATE_DIR/$RUN_A.env'"
+check "the resource policy was removed with the partition from the caller ARN" bash -c "grep -q 'DELETE policy arn:aws:lambda:us-east-1:' '$STUB_DIR/deleted.log'"
 
 echo "== flags turn the extras off"
 reset_env; newdir noextras
@@ -223,6 +246,38 @@ for sig in INT TERM; do
   check "$sig: foreign resources untouched" foreign_intact
 done
 
+echo "== interrupts during the teardown (normal path, restore path, --teardown)"
+for sig in INT TERM; do
+  reset_env; newdir "tdsig-$sig"; seed_foreign; export STUB_SIG="$sig" STUB_SIG_AT="cloudformation delete-stack"
+  lwfsig "$PHRASE" --zone "$ZONE"
+  check "$sig during the normal teardown: reported, the teardown carries on, exit 130/143, scan clean" bash -c "{ [ $RC = 130 ] || [ $RC = 143 ]; } && grep -q 'teardown interrupted ($sig)' '$OUT' && grep -q 'scan: nothing left' '$OUT' && grep -q 'completed despite the interrupt' '$OUT'"
+  check "$sig during the normal teardown: no AWS resource of the run is left" aws_clean
+  check "$sig during the normal teardown: run_clean" run_clean
+  check "$sig during the normal teardown: foreign resources untouched" foreign_intact
+  check "$sig during the normal teardown: marked torn down only now, temp dir removed" bash -c "grep -q '^TORN_DOWN=' '$LWF_STATE_DIR/$RUN_A.env' && [ -z \"\$(ls '$TMPDIR')\" ]"
+done
+reset_env; newdir tdsig-child; seed_foreign; export STUB_SIG=INT STUB_SIG_AT="cloudformation delete-stack" STUB_SIG_DIE=1
+lwfsig "$PHRASE" --zone "$ZONE"
+check "Ctrl-C that also kills the aws child: the step is tried once more and the run is clean" bash -c "[ $RC = 130 ] && grep -q 'trying .* once more' '$OUT' && grep -q 'scan: nothing left' '$OUT'"
+check "...nothing of the run remains" run_clean
+reset_env; newdir tdsig-restore; seed_foreign; export STUB_FAIL="lambda-web put-resource-policy" STUB_SIG=TERM STUB_SIG_AT="cloudformation delete-stack"
+lwfsig "$PHRASE" --zone "$ZONE"
+check "TERM during the restore teardown (after a failure): reported, carries on, clean" bash -c "[ $RC != 0 ] && grep -q 'RESTORE: the run failed' '$OUT' && grep -q 'teardown interrupted (TERM)' '$OUT' && grep -q 'scan: nothing left' '$OUT'"
+check "...nothing of the run remains" run_clean
+reset_env; newdir tdsig-manual; seed_foreign
+lwf "$PHRASE" --zone "$ZONE" --keep
+export STUB_SIG=INT STUB_SIG_AT="cloudformation delete-stack"
+lwfsig "" --teardown "$RUN_A" --zone "$ZONE"
+check "INT during --teardown: reported, carries on, exit 130, clean" bash -c "[ $RC = 130 ] && grep -q 'teardown interrupted (INT)' '$OUT' && grep -q 'scan: nothing left' '$OUT'"
+check "...nothing of the run remains" run_clean
+reset_env; newdir tdsig-three; seed_foreign; export STUB_SIG=INT STUB_SIG_AT="cloudformation delete-stack" STUB_SIG_TIMES=3
+lwfsig "$PHRASE" --zone "$ZONE"
+check "a third INT during the teardown stops it: exit 130, says re-run --teardown, temp dir (token header) removed, not marked torn down" bash -c "[ $RC = 130 ] && grep -q 'third time' '$OUT' && grep -q 're-run --teardown' '$OUT' && [ -z \"\$(ls '$TMPDIR')\" ] && ! grep -q '^TORN_DOWN=' '$LWF_STATE_DIR/$RUN_A.env'"
+unset STUB_SIG
+lwf "" --teardown "$RUN_A" --zone "$ZONE"
+check "...and --teardown afterwards finishes the job" bash -c "[ $RC = 0 ] && grep -q 'teardown complete, nothing left' '$OUT'"
+check "...nothing of the run remains" run_clean
+
 echo "== leftovers and awkward teardowns"
 reset_env; newdir left-dist; export STUB_NODELETE=dist
 lwf "$PHRASE" --zone "$ZONE"
@@ -230,6 +285,11 @@ check "a distribution that will not delete: exit 3 and LEFTOVER named" bash -c "
 reset_env; newdir left-stack; export STUB_NODELETE=stack
 lwf "$PHRASE" --zone "$ZONE"
 check "an app stack that will not delete is reported as a leftover (exit 3)" bash -c "[ $RC = 3 ] && grep -q 'LEFTOVER cloudformation stack' '$OUT'"
+check "...the kill switch is fired again by the teardown before the problem is reported, and its schedule stays" bash -c "grep -q 'invoking the kill switch now' '$OUT' && [ \$(grep -c . '$STUB_DIR/kill.log') = 2 ] && grep -q 'TEARDOWN problem: app stack' '$OUT' && [ -e '$STUB_DIR/res/sched__lwf-$RUN_A-kill' ]"
+check "...and the run is not marked torn down" bash -c "! grep -q '^TORN_DOWN=' '$LWF_STATE_DIR/$RUN_A.env'"
+reset_env; newdir policy-fail; export STUB_POLICY_DELETE_FAIL=1
+lwf "$PHRASE" --zone "$ZONE"
+check "a resource policy delete that fails is reported (not swallowed): exit 3" bash -c "[ $RC = 3 ] && grep -q 'TEARDOWN problem: web function resource policy' '$OUT' && grep -q 'delete-resource-policy failed (AccessDeniedException)' '$OUT'"
 reset_env; newdir logs-again; export STUB_RECREATE_ONCE=1 STUB_RECREATE_LOGS=1
 lwf "$PHRASE" --zone "$ZONE"
 check "log groups Lambda re-creates are removed in a second pass: exit 0" bash -c "[ $RC = 0 ] && grep -q 'second pass' '$OUT' && grep -q 'scan: nothing left' '$OUT'"
@@ -243,26 +303,67 @@ check "the Advanced Certificate pack of the custom domain is deleted" bash -c "[
 reset_env; newdir cf-down; export STUB_CF_FAIL="DELETE /workers/scripts"
 lwf "$PHRASE" --zone "$ZONE"
 check "a Cloudflare delete that fails is reported and the exit is non-zero" bash -c "[ $RC = 3 ] && grep -q 'TEARDOWN problem: Worker delete failed' '$OUT'"
+reset_env; newdir foreign-pack; seed_foreign
+lwf "$PHRASE" --zone "$ZONE" --keep
+jq -nc '{id:"pkforeign",type:"advanced",hosts:["lwf-w.example.test"]}' > "$STUB_DIR/cf/packs/pkforeign.json"
+lwf "" --teardown "$RUN_A" --zone "$ZONE"
+check "a certificate pack this run did not record is not deleted, but the scan names it (exit 3)" bash -c "[ $RC = 3 ] && [ -e '$STUB_DIR/cf/packs/pkforeign.json' ] && grep -q 'LEFTOVER cloudflare certificate pack: pkforeign (not recorded by this run' '$OUT'"
 
 echo "== test failures are reported, not hidden (exit stays 0, the run is still torn down)"
-for scen in "STUB_UNLOCKED=1|A1|FAIL" "STUB_AUTH_DROPPED=1|A2|FAIL" "STUB_BUFFERED=1|A5|FAIL" "STUB_NO_CACHE_HIT=1|A6|FAIL" "STUB_THROTTLED=1|A4|INCONCLUSIVE" "STUB_WF_MANY_ENVS=1|A4|FAIL"; do
+for scen in "STUB_UNLOCKED=1|A1|FAIL" "STUB_AUTH_DROPPED=1|A2|FAIL" "STUB_BUFFERED=1|A5|FAIL" "STUB_NO_CACHE_HIT=1|A6|FAIL" "STUB_THROTTLED=1|A4|INCONCLUSIVE" "STUB_WF_MANY_ENVS=1|A4|FAIL" \
+            "STUB_WF_SINGLE=1|A4|FAIL" "STUB_COLD_ONCE=1|A5|PASS" "STUB_KILL_FAIL=1|A8|FAIL" "STUB_CF_STILL_SERVING=1|A8|INCONCLUSIVE" "STUB_WF_KILL=not-throttled:no-lambda-web-client|A8|PASS"; do
   reset_env; newdir "t-${scen%%=*}"; export "${scen%%|*}"; rest="${scen#*|}"
   lwf "$PHRASE" --zone "$ZONE"
   check "${scen%%|*} gives ${rest%%|*} ${rest#*|}" bash -c "[ $RC = 0 ] && [ \"\$(jq -r --arg i '${rest%%|*}' '.results[] | select(.id == \$i) | .status' '$LWF_RESULTS_DIR/$RUN_A/results.json')\" = '${rest#*|}' ]"
 done
 reset_env; newdir t-unlocked-text; export STUB_UNLOCKED=1
 lwf "$PHRASE" --zone "$ZONE"; check "an answering unsigned endpoint says LOCK-DOWN BROKEN" has "$OUT" "LOCK-DOWN BROKEN"
+reset_env; newdir t-kill-text; export STUB_KILL_FAIL=1
+lwf "$PHRASE" --zone "$ZONE"
+check "a kill switch that raises: A8 says so and names the Function URL as not throttled" bash -c "d=\"\$(jq -r '.results[] | select(.id == \"A8\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json')\"; case \"\$d\" in *'kill switch raised (Unhandled)'*'Function URL function is not throttled'*'error:AccessDeniedException'*) ;; *) exit 1 ;; esac"
+reset_env; newdir t-nolwclient; export STUB_WF_KILL=not-throttled:no-lambda-web-client
+lwf "$PHRASE" --zone "$ZONE"
+check "no lambda-web client in the kill switch: A8 does not claim a throttle, it shows the web function unreachable" bash -c "jq -r '.results[] | select(.id == \"A8\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json' | grep -q 'web_function: NOT throttled by the kill switch (not-throttled:no-lambda-web-client; known limitation, see README), reachable through CloudFront=403, through the Worker=403'"
+reset_env; newdir t-cold; export STUB_COLD_ONCE=1
+lwf "$PHRASE" --zone "$ZONE"
+check "A5: a cold first stream is retried once and the retry is labelled" bash -c "jq -r '.results[] | select(.id == \"A5\") | .detail' '$LWF_RESULTS_DIR/$RUN_A/results.json' | grep -q 'cf_wf:progressive,second-try'"
+reset_env; newdir conc-low; export STUB_CONC=150
+lwf "$PHRASE" --zone "$ZONE" --no-alias --no-probe --no-negative
+check "account concurrency 150: the Function URL cap is 50 and the script warns A4 will throttle" bash -c "[ $RC = 0 ] && grep -q 'FuReservedConcurrency=50' '$STUB_DIR/params-lwf-$RUN_A-app' && grep -q 'cap is below 128' '$OUT'"
+reset_env; newdir conc-tiny; export STUB_CONC=10
+lwf "$PHRASE" --zone "$ZONE" --no-alias --no-probe --no-negative
+check "account concurrency 10: no reserved cap (-1) with a warning" bash -c "[ $RC = 0 ] && grep -q 'FuReservedConcurrency=-1' '$STUB_DIR/params-lwf-$RUN_A-app' && grep -q 'cannot get a reserved cap' '$OUT'"
+reset_env; newdir alert-email; export LWF_ALERT_EMAIL=alerts@example.test
+lwf "$PHRASE" --zone "$ZONE" --no-alias --no-probe --no-negative
+check "LWF_ALERT_EMAIL goes to the stack, is redacted in the output, and its topic is removed" bash -c "[ $RC = 0 ] && grep -q 'AlertEmail=alerts@example.test' '$STUB_DIR/params-lwf-$RUN_A-app' && ! grep -rq 'alerts@example.test' '$OUT' '$LWF_RESULTS_DIR' && grep -q 'DELETE topic' '$STUB_DIR/deleted.log'"
+reset_env; newdir alert-bad; export LWF_ALERT_EMAIL="not an address"
+lwf "$PHRASE" --zone "$ZONE"; check "an LWF_ALERT_EMAIL that is not an address is refused" bash -c "[ $RC = 2 ] && grep -q 'not an email address' '$OUT'"
 
 echo "== --keep, --status, --teardown, --resume"
 reset_env; newdir keep; seed_foreign
 lwf "$PHRASE" --zone "$ZONE" --keep
 check "--keep exits 0 and leaves the resources" bash -c "[ $RC = 0 ] && [ -e '$STUB_DIR/res/dist__lwf-$RUN_A' ] && grep -q 'kill switch fires at' '$OUT'"
+check "the report header lists SKIPPED (A8 with --keep)" bash -c "grep -q 'INCONCLUSIVE / SKIPPED' '$LWF_RESULTS_DIR/$RUN_A/report.md' && grep -q '| A8 | SKIPPED |' '$LWF_RESULTS_DIR/$RUN_A/report.md'"
 n_deploy="$(count "$STUB_DIR/calls.log" 'cloudformation deploy')"
 lwf "" --status "$RUN_A" --zone "$ZONE"
 check "--status lists what is still there (exit 3) and hides the Worker token" bash -c "[ $RC = 3 ] && grep -q 'LEFTOVER cloudfront distribution' '$OUT' && ! grep -q WTOKEN '$OUT'"
 lwf "" --resume "$RUN_A"
+check "--resume asks for the typed phrase (empty input: refused, nothing changed)" bash -c "[ $RC = 2 ] && grep -q 'phrase did not match' '$OUT' && [ \$(grep -c 'cloudformation deploy' '$STUB_DIR/calls.log') = $n_deploy ]"
+cp "$LWF_STATE_DIR/$RUN_A.env" "$TMP/keep-state.env"
+echo "KILL_AT=$(date -u -r $(( $(date +%s) + 1800 )) +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d @$(( $(date +%s) + 1800 )) +%Y-%m-%dT%H:%M:%S)" >> "$LWF_STATE_DIR/$RUN_A.env"
+lwf "$PHRASE" --resume "$RUN_A"
+check "--resume is refused when the kill switch fires within the hour (says: --teardown and start fresh)" bash -c "[ $RC = 2 ] && grep -q 'less than an hour from now' '$OUT' && grep -q 'teardown' '$OUT'"
+echo "KILL_AT=2020-01-01T00:00:00" >> "$LWF_STATE_DIR/$RUN_A.env"
+lwf "$PHRASE" --resume "$RUN_A"
+check "--resume is refused when the kill switch has already fired" bash -c "[ $RC = 2 ] && grep -q 'fired at 2020-01-01' '$OUT'"
+cp "$TMP/keep-state.env" "$LWF_STATE_DIR/$RUN_A.env"
+n_tok="$(grep -c LWF_TOKEN "$STUB_DIR/stdin.log")"
+lwf "$PHRASE" --resume "$RUN_A"
 check "--resume skips finished steps, creates nothing twice, signed tests become INCONCLUSIVE, then tears down" bash -c "[ $RC = 0 ] && grep -q 'skip: artifacts' '$OUT' && grep -q 'skip: app stack' '$OUT' && [ \$(grep -c 'cloudformation deploy' '$STUB_DIR/calls.log') = $n_deploy ] && [ '$(result_of x A1)' = INCONCLUSIVE ]"
+check "--resume gave the Worker a new run token through stdin (the old one was never stored)" bash -c "[ \$(grep -c LWF_TOKEN '$STUB_DIR/stdin.log') = \$(( $n_tok + 1 )) ]"
 check "after the resumed run everything of the run is gone" run_clean
+lwf "$PHRASE" --resume "$RUN_A"
+check "--resume of a run that was torn down is refused" bash -c "[ $RC = 2 ] && grep -q 'was torn down at' '$OUT'"
 reset_env; newdir teardown-sub; seed_foreign
 lwf "$PHRASE" --zone "$ZONE" --keep
 lwf "" --teardown "$RUN_A" --zone "$ZONE"

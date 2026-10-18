@@ -7,6 +7,8 @@ put() { printf '%s' "$2" > "$S/$1"; }
 acct() { if [ -n "${STUB_OTHER_ACCOUNT:-}" ]; then printf '%s%s' 9876 54321098; else printf '%s%s' 1234 56789012; fi; }
 # the Cloudflare token must never be in a child's environment (the script un-exports it)
 [ -z "${CF_API_TOKEN:-}" ] || echo "$0" >> "$S/leak.log"
+# children that need no AWS access (curl, node) must not get the AWS secrets of the environment
+case "$(basename "$0")" in curl|node) [ -z "${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}${AWS_ACCESS_KEY_ID:-}" ] || echo "$0" >> "$S/awsleak.log" ;; esac
 fake_akid() { printf '%s%s%s' AK IA ABCDEFGHIJKLMNOP; }
 fake_key() { printf '%s%s%s' abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMN 0123; }
 fake_cfd() { printf 'd%s.cloudfront.net' faketest12345; }
@@ -22,6 +24,9 @@ arg() { local k="$1"; shift; while [ $# -gt 0 ]; do if [ "$1" = "$k" ]; then ech
 reg() { mkdir -p "$S/res"; printf '%s' "${3:-}" > "$S/res/$1__$(printf '%s' "$2" | tr '/' '%')"; }
 unreg() { rm -f "$S/res/$1__$(printf '%s' "$2" | tr '/' '%')"; echo "DELETE $1 $2" >> "$S/deleted.log"; }
 has() { [ -e "$S/res/$1__$(printf '%s' "$2" | tr '/' '%')" ]; }
+# textlist KIND PREFIX [REGION]: like names, but prints "None" for an empty result, as the real CLI's text output does for a
+# null query result (for example DistributionList.Items in an account without distributions)
+textlist() { local r; r="$(names "$@")"; if [ -n "$r" ]; then printf '%s\n' "$r"; else echo None; fi; }
 names() { # KIND PREFIX [REGION] -> names (space separated) of registered resources whose name starts with PREFIX (and whose content is REGION)
   local f n
   for f in "$S"/res/"$1"__*; do

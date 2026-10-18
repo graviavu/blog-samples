@@ -20,14 +20,21 @@ export AWS_PAGER=""
 
 # list prices used by A7 (extrapolation only). As read 2026-10-18 on https://aws.amazon.com/lambda/pricing/ - check before quoting.
 PRICE_WF_PER_M_REQ="0.30"; PRICE_WF_VCPU_S="0.0000276944"; PRICE_WF_GB_S="0.0000036667"
-PRICE_FU_PER_M_REQ="0.20"; PRICE_FU_GB_S_X86="0.0000166667"   # Arm rate not read: the x86 rate is used and labelled an upper bound
+PRICE_FU_PER_M_REQ="0.20"; PRICE_FU_GB_S_ARM="0.0000133334"   # the Event Function is arm64 (Arm duration rate, first tier, us-east-1)
+WF_GB=2                            # memory of one web function environment (2 vCPU, 2 GB per the documentation as read 2026-10-18)
+WF_MAX_ENVS=2                      # MaxEnvironments of the endpoint (passed to the stack; A4 reports environments against it)
+FU_CAP_DEFAULT=130                 # reserved concurrency of the Function URL function (A4 needs 128); lowered to fit the account
+SLOW_MAX_MS=3000                   # app/core.mjs caps /slow at this; A4 uses 2000
 
 DRY=0; MODE=run; KEEP=0; O1=1; O2=1; O3=1; ZONE=""; RUN=""; RESUME=0
 ACCOUNT=""; ACC_CF=""; ZID=""; CF_API_TOKEN="${CF_API_TOKEN:-}"; export -n CF_API_TOKEN
-AK_ID=""; AK_SECRET=""; WTOKEN=""
-CREATE_STARTED=0; TEARDOWN_DONE=0; TD_FAIL=0; BLOCKED=0
+AK_ID=""; AK_SECRET=""; WTOKEN=""; PARTITION="aws"; FU_CAP=-1
+# TD_STATE: 0 teardown not started, 1 running, 2 finished (with or without leftovers). TD_SIGS counts signals during teardown.
+CREATE_STARTED=0; TD_STATE=0; TD_FAIL=0; TD_SIGS=0; TD_SIGNAME=""; TD_ABANDONED=0; BLOCKED=0
 TMP=""; HDR=""; STATE_FILE=""; RES_TSV=""; RAWDIR=""; OUTDIR=""
-CF_HTTP=""; REQ_TOTAL=0
+CF_HTTP=""; REQ_TOTAL=0; REQ_WF=0
+# children that never need AWS credentials (curl to Cloudflare, node for the probes) run without the AWS_* secrets of the environment
+NOAWS=(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_SECURITY_TOKEN)
 REDACT_FROM=(); REDACT_TO=()
 
 # ---------------------------------------------------------------------------------------------------- output, redaction
@@ -88,6 +95,15 @@ aws_do() {
 # did the last aws call fail because the resource does not exist? (error codes and phrases only)
 aws_gone() { grep -Eqi 'NoSuchEntity|ResourceNotFound|NoSuchBucket|NoSuchDistribution|NoSuchOriginAccessControl|NoSuchCachePolicy|NoSuchResponseHeadersPolicy|does not exist|NotFoundException|\(404\)|Not Found|NoSuchKey|InvalidParameterValueException.*not found' "$TMP/aws.err"; }
 aws_code() { sed -n 's/.*An error occurred (\([A-Za-z0-9.]*\)).*/\1/p' "$TMP/aws.err" | head -n 1; }
+# words: one name per line. The CLI's text output prints "None" for a null query result (for example
+# DistributionList.Items when an account has no distribution); that is not a name.
+words() { tr -s '[:blank:]' '\n' | grep -v -x -e None -e null -e '' || true; }
+# aws_names ARGS... : a read-only list query with --output text, as one name per line ("None" removed). 1 if the call failed.
+aws_names() {
+  local out
+  out="$(aws_ro "$@" --output text 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | words
+}
 
 # ---------------------------------------------------------------------------------------------------- Cloudflare API
 # The token is a shell variable and a mode-600 header file only. curl reads the header with -H @file, so it is never in argv.
@@ -102,7 +118,7 @@ cf() {
   [ "$method" = GET ] || [ "$DRY" = 0 ] || { echo "internal error: cf $method in --dry-run: $path" >&2; exit 99; }
   args=(-sS --max-time 90 -H "@$HDR" -X "$method" -o "$TMP/cf.out" -w '%{http_code}')
   if [ -n "$body" ]; then args+=(-H 'Content-Type: application/json' --data "@${body}"); fi
-  CF_HTTP="$(curl "${args[@]}" "$CF_API$path" 2>"$TMP/cf.err")" || { CF_HTTP=000; redact < "$TMP/cf.err" >&2; return 1; }
+  CF_HTTP="$("${NOAWS[@]}" curl "${args[@]}" "$CF_API$path" 2>"$TMP/cf.err")" || { CF_HTTP=000; redact < "$TMP/cf.err" >&2; return 1; }
   case "$CF_HTTP" in 2??) ;; *) return 1 ;; esac
   jq -e '.success == true' "$TMP/cf.out" >/dev/null 2>&1
 }
@@ -112,7 +128,7 @@ cf_upload_worker() {
   local args f
   args=(-sS --max-time 120 -H "@$HDR" -X PUT -o "$TMP/cf.out" -w '%{http_code}' -F "metadata=@${meta};type=application/json")
   for f in "$@"; do args+=(-F "$(basename "$f")=@${f};type=application/javascript+module"); done
-  CF_HTTP="$(curl "${args[@]}" "$CF_API$path" 2>"$TMP/cf.err")" || { CF_HTTP=000; redact < "$TMP/cf.err" >&2; return 1; }
+  CF_HTTP="$("${NOAWS[@]}" curl "${args[@]}" "$CF_API$path" 2>"$TMP/cf.err")" || { CF_HTTP=000; redact < "$TMP/cf.err" >&2; return 1; }
   case "$CF_HTTP" in 2??) ;; *) return 1 ;; esac
   jq -e '.success == true' "$TMP/cf.out" >/dev/null 2>&1
 }
@@ -157,6 +173,9 @@ sha256_of() { # string -> hex (no trailing newline hashed)
   if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
   elif command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
   else printf '%s' "$1" | openssl dgst -sha256 | sed 's/^.* //'; fi
+}
+utc_epoch() { # yyyy-mm-ddThh:mm:ss (UTC) -> seconds since the epoch (GNU or BSD date); 1 if it cannot be parsed
+  date -u -d "$1" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%S' "$1" +%s 2>/dev/null
 }
 future_utc() { # hours -> yyyy-mm-ddThh:mm:ss in UTC (GNU or BSD date)
   local e

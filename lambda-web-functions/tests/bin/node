@@ -28,7 +28,7 @@ killed=0; [ -e "$S/killed" ] && killed=1
 status=200
 case "$cls" in
   wf|fu) [ "$signed" = 1 ] && [ "$killed" = 0 ] || status=403 ;;
-  cf) [ "$killed" = 1 ] && status=403 ;;
+  cf) [ "$killed" = 1 ] && [ -z "${STUB_CF_STILL_SERVING:-}" ] && status=403 ;;
   worker)
     if [ "$path" != /health ]; then
       { [ "$worker" = 1 ] && [ -n "${LWF_TOKEN:-}" ]; } || status=403
@@ -68,12 +68,16 @@ case "$cmd" in
   latency)
     jq -nc --argjson n "${n:-30}" --argjson s "$status" '{n:$n,ok:(if $s==200 then $n else 0 end),errors:0,status:{($s|tostring):$n},p50:12.5,p90:20.1,min:9,max:31,firstHeaders:{"x-amz-cf-pop":"DUB56-P1","server-timing":"cdn-upstream-fbl;dur=10"}}' ;;
   parallel)
-    e=2; case "$url" in */fu/*) e="${n:-64}" ;; esac
+    # web function: 2 environments, about N/2 requests in flight in each; function URL: N environments, one request each
+    e=2; inf=$(( ${n:-64} / 2 )); case "$url" in */fu/*) e="${n:-64}"; inf=1 ;; esac
     [ "${STUB_WF_MANY_ENVS:-}" = 1 ] && e="${n:-64}"
-    if [ "${STUB_THROTTLED:-}" = 1 ]; then jq -nc --argjson n "${n:-64}" '{n:$n,status:{"200":2,"503":($n-2)},errors:0,distinctEnvironments:1,distinctLogStreams:1,wallMs:900}'
-    else jq -nc --argjson n "${n:-64}" --argjson e "$e" '{n:$n,status:{"200":$n},errors:0,distinctEnvironments:$e,distinctLogStreams:$e,wallMs:2300,p50:2100,p90:2200}'; fi ;;
+    case "$url" in */wf/*) [ "${STUB_WF_SINGLE:-}" = 1 ] && inf=1 ;; esac
+    if [ "${STUB_THROTTLED:-}" = 1 ]; then jq -nc --argjson n "${n:-64}" '{n:$n,status:{"200":2,"503":($n-2)},errors:0,distinctEnvironments:1,distinctLogStreams:1,maxInflight:1,wallMs:900}'
+    else jq -nc --argjson n "${n:-64}" --argjson e "$e" --argjson i "$inf" '{n:$n,status:{"200":$n},errors:0,distinctEnvironments:$e,distinctLogStreams:$e,maxInflight:$i,wallMs:2300,p50:2100,p90:2200}'; fi ;;
   stream)
     fb=120; [ "${STUB_BUFFERED:-}" = 1 ] && [ "$cls" = cf ] && fb=3050
+    # STUB_COLD_ONCE=1: the first stream request through CloudFront is a cold start (first byte late)
+    if [ "${STUB_COLD_ONCE:-}" = 1 ] && [ "$cls" = cf ] && [ ! -e "$S/cold_done" ]; then : > "$S/cold_done"; fb=1800; fi
     jq -nc --argjson s "$status" --argjson fb "$fb" '{status:$s,headers:{},error:null,firstByteMs:$fb,totalMs:3100,dataEvents:10,chunkArrivalMs:[120,420,720],lines:10}' ;;
   *) echo '{"error":"stub: unknown command"}'; exit 2 ;;
 esac

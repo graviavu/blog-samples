@@ -30,8 +30,11 @@ if [ -n "${STUB_FAIL:-}" ] && [ "$svc $cmd" = "$STUB_FAIL" ]; then
     exit 254
   fi
 fi
-if [ -n "${STUB_SIG:-}" ] && [ "$svc $cmd" = "${STUB_SIG_AT:-}" ] && [ ! -e "$S/sig_done" ]; then
-  : > "$S/sig_done"; kill -"$STUB_SIG" "$(cat "${STUB_PIDFILE:?}")"; sleep 0.3
+# STUB_SIG=INT|TERM at the first STUB_SIG_TIMES (default 1) calls of STUB_SIG_AT="svc cmd". STUB_SIG_DIE=1: this call then dies
+# too, as a child does when Ctrl-C reaches the whole process group.
+if [ -n "${STUB_SIG:-}" ] && [ "$svc $cmd" = "${STUB_SIG_AT:-}" ] && [ "$(get sig_n 0)" -lt "${STUB_SIG_TIMES:-1}" ]; then
+  put sig_n $(( $(get sig_n 0) + 1 )); kill -"$STUB_SIG" "$(cat "${STUB_PIDFILE:?}")"; sleep 0.3
+  [ -z "${STUB_SIG_DIE:-}" ] || exit 130
 fi
 
 notfound() { echo "An error occurred ($1) when calling the $cmd operation: $2 does not exist (arn:aws:x::$acct12:y)" >&2; exit 254; }
@@ -39,8 +42,13 @@ prefix_of_query() { printf '%s' "$q" | sed -n "s/.*'\\(lwf-[^' ]*\\).*/\\1/p" | 
 killed() { [ -e "$S/killed" ]; }
 
 case "$svc $cmd" in
-  "sts get-caller-identity") echo "$acct12" ;;
-  "budgets describe-budgets") if [ -n "${STUB_NO_BUDGET:-}" ]; then echo 0; else echo 1; fi ;;
+  "sts get-caller-identity") case "$q" in *Arn*) printf '%s\tarn:aws:iam::%s:user/tester\n' "$acct12" "$acct12" ;; *) echo "$acct12" ;; esac ;;
+  "budgets describe-budgets") if [ -n "${STUB_NO_BUDGET:-}" ]; then echo '[]'; else echo '["monthly test budget"]'; fi ;;
+  "budgets describe-notifications-for-budget")
+    [ "$(arg --budget-name "$@")" = "monthly test budget" ] || notfound NotFoundException budget
+    if [ -n "${STUB_NO_NOTIFICATION:-}" ]; then echo 0; else echo 1; fi ;;
+  "lambda get-account-settings") echo "${STUB_CONC:-1000}" ;;
+  "lambda get-function-concurrency") get "fuconc" None; echo ;;
 
   # ---------------------------------------------------------------- CloudFormation
   "cloudformation describe-type")
@@ -72,6 +80,10 @@ case "$svc $cmd" in
         for k in wf-role fu-role kill-role sched-role; do reg role "$P-$k" "$REG"; done
         reg user "$P-worker" "$REG"; reg fn "$P-fu" "$REG"; reg fn "$P-kill" "$REG"; reg wfn "$P-wf" "$REG"; reg sched "$P-kill" "$REG"
         reg lg "/aws/lambda/web/$P-wf" "$REG"; reg lg "/aws/lambda/web/$P-wf.local" "$REG"; reg lg "/aws/lambda/$P-fu" "$REG"; reg lg "/aws/lambda/$P-kill" "$REG"
+        reg alarm "$P-kill-failed" "$REG"
+        printf '%s' "$*" | grep -q 'AlertEmail=' && reg topic "arn:aws:sns:us-east-1:$acct12:$P-kill-alerts" "$REG"
+        c="$(printf '%s' "$*" | sed -n 's/.*FuReservedConcurrency=\([-0-9]*\).*/\1/p')"
+        if [ "$c" = -1 ]; then put fuconc None; else put fuconc "$c"; fi
         put distenabled true ;;
       *-probe) reg fn "$P-probe" "$REG"; reg role "$P-probe-role" "$REG"; reg lg "/aws/lambda/$P-probe" "$REG" ;;
     esac ;;
@@ -108,6 +120,7 @@ case "$svc $cmd" in
         [ "${STUB_NODELETE:-}" = dist ] || unreg dist "$P"
         for k in wf-role fu-role kill-role sched-role; do unreg role "$P-$k"; done
         unreg user "$P-worker"; unreg fn "$P-fu"; unreg fn "$P-kill"; unreg wfn "$P-wf"; unreg sched "$P-kill"; rm -f "$S/res/key__$P-worker"
+        unreg alarm "$P-kill-failed"; [ -z "$(names topic "")" ] || unreg topic "arn:aws:sns:us-east-1:$acct12:$P-kill-alerts"
         for g in "/aws/lambda/web/$P-wf" "/aws/lambda/web/$P-wf.local" "/aws/lambda/$P-fu" "/aws/lambda/$P-kill"; do unreg lg "$g"; done
         [ -z "${STUB_RECREATE_LOGS:-}" ] || reg lg "/aws/lambda/web/$P-wf" "$REG"   # Lambda re-creates its web log group
         unreg cfn "$stack" ;;
@@ -129,7 +142,7 @@ case "$svc $cmd" in
     b="$(arg --bucket "$@")"; f="$(arg --delete "$@")"; f="${f#file://}"
     jq -r '.Objects[].Key' "$f" | while read -r k; do unreg s3obj "$b/$k"; done
     : > "$S/markers_deleted"; echo '{}' ;;
-  "s3api list-buckets") names s3 "$(prefix_of_query)" ;;
+  "s3api list-buckets") textlist s3 "$(prefix_of_query)" ;;
 
   # ---------------------------------------------------------------- ACM
   "acm request-certificate")
@@ -140,7 +153,10 @@ case "$svc $cmd" in
       *ResourceRecord*) jq -n '[{Name:"_a1.lwf-g.example.test.",Type:"CNAME",Value:"_v1.acm-validations.example."},{Name:"_a2.lwf-o.example.test.",Type:"CNAME",Value:"_v2.acm-validations.example."}]' ;;
       *Status*) echo "${STUB_CERT_STATUS:-ISSUED}" ;;
     esac ;;
-  "acm list-certificates") for c in $(names cert ""); do [ "$(cat "$S/res/cert__$(printf '%s' "$c" | tr '/' '%')")" = "$(printf '%s' "$q" | sed -n "s/.*=='\\([^']*\\)'.*/\\1/p")" ] && echo "$c"; done ;;
+  "acm list-certificates")
+    found=""
+    for c in $(names cert ""); do [ "$(cat "$S/res/cert__$(printf '%s' "$c" | tr '/' '%')")" = "$(printf '%s' "$q" | sed -n "s/.*=='\\([^']*\\)'.*/\\1/p")" ] && { echo "$c"; found=1; }; done
+    [ -n "$found" ] || echo None ;;
   "acm list-tags-for-certificate") get certrun ;;
   "acm delete-certificate")
     if [ -n "$(names dist "")" ] && [ -z "${STUB_CERT_FREE:-}" ] && [ "$(get cert_tries 0)" -lt "${STUB_CERT_BUSY:-0}" ]; then
@@ -157,46 +173,60 @@ case "$svc $cmd" in
     u="$(arg --user-name "$@")"; has user "$u" || notfound NoSuchEntity "user"
     if has key "$u"; then
       case "$q" in *Status*) if killed; then echo Inactive; else echo Active; fi ;; *) fake_akid; echo ;; esac
+    else echo None   # not what the real CLI prints for an empty list, but a filter that copes with None copes with both
     fi ;;
   "iam delete-access-key") unreg key "$(arg --user-name "$@")" ;;
-  "iam list-roles") names role "$(prefix_of_query)" ;;
-  "iam list-users") names user "$(prefix_of_query)" ;;
+  "iam list-roles") textlist role "$(prefix_of_query)" ;;
+  "iam list-users") textlist user "$(prefix_of_query)" ;;
 
   # ---------------------------------------------------------------- Lambda, Lambda Web
   "lambda invoke")
     fn="$(arg --function-name "$@")"; out="${*: -1}"
     case "$fn" in
       *-kill)
+        echo "$*" >> "$S/kill.log"
         : > "$S/killed"; put distenabled false
+        if [ -n "${STUB_KILL_FAIL:-}" ]; then   # the function URL step failed: the function raises with the results as message
+          jq -nc --arg w "${STUB_WF_KILL:-rate-limit-0}" '{errorMessage: ({cloudfront:"disabled",worker_keys:"deactivated:1",function_url:"error:AccessDeniedException",web_function:$w} | tojson), errorType:"RuntimeError"}' > "$out"
+          echo '{"StatusCode":200,"FunctionError":"Unhandled"}'; exit 0
+        fi
+        put fuconc 0
         printf '{"cloudfront":"disabled","worker_keys":"deactivated:1","function_url":"reserved-concurrency-0","web_function":"%s"}' "${STUB_WF_KILL:-rate-limit-0}" > "$out" ;;
       *-probe) jq -n '{"https://x/wf/ping":{status:{"200":30},p50:20,p90:30,pop:"DUB"}}' > "$out" ;;
       *) echo "{}" > "$out" ;;
     esac
     echo '{"StatusCode":200}' ;;
-  "lambda list-functions") names fn "$(prefix_of_query)" "$REG" ;;
+  "lambda list-functions") textlist fn "$(prefix_of_query)" "$REG" ;;
   "lambda-web get-web-function") has wfn "$(arg --function-name "$@")" || notfound ResourceNotFoundException "web function"; echo '{}' ;;
   "lambda-web put-resource-policy")
     f="$(arg --policy "$@")"; f="${f#file://}"
     jq -e '.Statement[0].Condition.StringEquals["aws:SourceArn"] | test("distribution/")' "$f" >/dev/null 2>&1 || { echo "stub: bad resource policy" >&2; exit 254; }
     cp "$f" "$S/policy.json"; echo '{}' ;;
-  "lambda-web delete-resource-policy") rm -f "$S/policy.json" ;;
-  "scheduler delete-schedule") n="$(arg --name "$@")"; has sched "$n" || notfound ResourceNotFoundException schedule; [ "${STUB_NODELETE:-}" = sched ] || unreg sched "$n" ;;
-  "scheduler list-schedules") names sched "$(arg --name-prefix "$@")" ;;
+  "lambda-web delete-resource-policy")
+    a="$(arg --resource-arn "$@")"
+    case "$a" in "arn:aws:lambda:us-east-1:$acct12:web-function/lwf-"*) ;; *) echo "stub: bad resource arn" >&2; exit 254 ;; esac
+    has wfn "${a##*/}" || notfound ResourceNotFoundException "web function"
+    [ -z "${STUB_POLICY_DELETE_FAIL:-}" ] || { echo "An error occurred (AccessDeniedException) when calling the DeleteResourcePolicy operation: no" >&2; exit 254; }
+    rm -f "$S/policy.json"; echo "DELETE policy $a" >> "$S/deleted.log" ;;
+  "scheduler list-schedules") textlist sched "$(arg --name-prefix "$@")" ;;
+  "cloudwatch describe-alarms") textlist alarm "$(arg --alarm-name-prefix "$@")" ;;
+  "sns list-topics") p="$(printf '%s' "$q" | sed -n "s/.*':\\(lwf-[^']*\\)'.*/\\1/p")"; r=""; for t in $(names topic ""); do case "$t" in *":$p"*) r="$r$t " ;; esac; done; if [ -n "$r" ]; then echo "$r"; else echo None; fi ;;
 
   # ---------------------------------------------------------------- CloudFront
   "cloudfront get-distribution") if [ "$(get distenabled true)" = true ]; then echo True; else echo False; fi ;;
-  "cloudfront list-distributions") names dist "$(prefix_of_query)" | sed 's/ \{0,\}$//' | sed "s/^lwf-.*/$(fake_dist)/" ;;
-  "cloudfront list-origin-access-controls") names oac "$(prefix_of_query)" ;;
-  "cloudfront list-cache-policies") names cp "$(prefix_of_query)" ;;
-  "cloudfront list-response-headers-policies") names rhp "$(prefix_of_query)" ;;
+  "cloudfront list-distributions") textlist dist "$(prefix_of_query)" | sed 's/ \{0,\}$//' | sed "s/^lwf-.*/$(fake_dist)/" ;;
+  "cloudfront list-origin-access-controls") textlist oac "$(prefix_of_query)" ;;
+  "cloudfront list-cache-policies") textlist cp "$(prefix_of_query)" ;;
+  "cloudfront list-response-headers-policies") textlist rhp "$(prefix_of_query)" ;;
 
   # ---------------------------------------------------------------- CloudWatch, Logs
   "cloudwatch list-metrics")
     jq -n --arg fn "$(names wfn lwf- | awk '{print $1}')" \
-      '{Metrics:[{Namespace:"AWS/Lambda/Web",MetricName:"EnvironmentActiveTime",Dimensions:[{Name:"FunctionName",Value:$fn}]},{Namespace:"AWS/Lambda/Web",MetricName:"EndpointActiveEnvironments",Dimensions:[{Name:"FunctionName",Value:$fn}]}]}' ;;
+      '{Metrics:[{Namespace:"AWS/Lambda/Web",MetricName:"EnvironmentActiveTime",Dimensions:[{Name:"FunctionName",Value:$fn}]},{Namespace:"AWS/Lambda/Web",MetricName:"EnvironmentCPUTime",Dimensions:[{Name:"FunctionName",Value:$fn}]},{Namespace:"AWS/Lambda/Web",MetricName:"EndpointActiveEnvironments",Dimensions:[{Name:"FunctionName",Value:$fn}]}]}' ;;
   "cloudwatch get-metric-statistics") jq -n '{Datapoints:[{Maximum:2,Sum:120,Unit:"Seconds"}]}' ;;
-  "logs filter-log-events") jq -n '{events:[{message:"REPORT RequestId: x Duration: 10.00 ms Billed Duration: 11 ms Memory Size: 512 MB Max Memory Used: 80 MB"},{message:"REPORT RequestId: y Duration: 20.00 ms Billed Duration: 21 ms Memory Size: 512 MB"}]}' ;;
-  "logs describe-log-groups") names lg "$(arg --log-group-name-prefix "$@")" "$REG" ;;
+  "logs filter-log-events")   # STUB_REPORTS REPORT lines (default 50), billed 11 or 21 ms
+    jq -n --argjson n "${STUB_REPORTS:-50}" '{events:[range(0; $n) | {message:("REPORT RequestId: r\(.) Duration: 10.00 ms Billed Duration: \(if . % 2 == 0 then 11 else 21 end) ms Memory Size: 512 MB Max Memory Used: 80 MB")}]}' ;;
+  "logs describe-log-groups") textlist lg "$(arg --log-group-name-prefix "$@")" "$REG" ;;
   "logs delete-log-group")
     n="$(arg --log-group-name "$@")"; has lg "$n" || notfound ResourceNotFoundException "log group"
     unreg lg "$n"
