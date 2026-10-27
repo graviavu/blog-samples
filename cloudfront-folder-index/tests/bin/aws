@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/run.sh. Understands only the calls run-test.sh makes; anything else exits 99.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = --version ]; then echo "aws-cli/2.99.0 Python/3.13 Stub/x"; exit 0; fi
+if [ "${1:-}" = "--region" ]; then shift 2; fi
+svc="$1"; cmd="$2"; shift 2
+echo "$svc $cmd $*" >> "$S/calls.log"
+mkdir -p "$S/bucket"
+q="$(arg --query "$@")"
+a12="$(acct)"
+
+# STUB_FAIL=<cmd>[:<n>]  the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
+if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
+  n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
+  want="${STUB_FAIL#*:}"; [ "$want" = "$STUB_FAIL" ] && want=1
+  if [ "$n" = "$want" ]; then
+    echo "An error occurred (AccessDenied) when calling $cmd: denied arn:aws:iam::$a12:role/x, account $a12, key AKIA$(printf 'ABCDEFGHIJKLMNOP'), $(plain_domain)" >&2
+    exit 254
+  fi
+fi
+
+missing() { echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id $(arg --stack-name "$@") does not exist" >&2; exit 254; }
+have_stack() { [ -e "$S/stack" ]; }
+stack_tag() { if [ -n "${STUB_FOREIGN_TAG:-}" ]; then echo "$STUB_FOREIGN_TAG"; else get stack; fi; }
+
+case "$svc $cmd" in
+  "sts get-caller-identity") echo "$a12" ;;
+  "cloudformation create-stack")
+    [ -e "$S/stack" ] && { echo "An error occurred (AlreadyExistsException)" >&2; exit 254; }
+    id="$(printf '%s' "$*" | sed -n 's/.*ParameterKey=RunId,ParameterValue=\([0-9a-f-]*\).*/\1/p')"
+    printf '%s' "$*" | grep -q 'Key=Purpose,Value=sample' || { echo "stub: Purpose tag missing" >&2; exit 254; }
+    printf '%s' "$*" | grep -q "Key=RunId,Value=$id" || { echo "stub: RunId tag missing" >&2; exit 254; }
+    [ -f "$(arg --template-body "$@" | sed 's#^file://##')" ] || { echo "stub: template not found" >&2; exit 254; }
+    put stack "$id"; put stack_status CREATE_COMPLETE; echo '{}' ;;
+  "cloudformation wait") if [ "$1" = stack-delete-complete ] && [ -n "${STUB_DELETE_STUCK:-}" ]; then exit 255; fi; exit 0 ;;
+  "cloudformation describe-stacks")
+    have_stack || missing "$@"
+    case "$q" in
+      *StackStatus*) get stack_status ;;
+      *RunId*) stack_tag ;;
+      *Purpose*) echo sample ;;
+      *Outputs*) printf '[{"OutputKey":"BucketName","OutputValue":"cfi-%s-site"},{"OutputKey":"PlainDomain","OutputValue":"%s"},{"OutputKey":"FixedDomain","OutputValue":"%s"}]\n' "$(get stack)" "$(plain_domain)" "$(fixed_domain)" ;;
+      *) echo '{}' ;;
+    esac ;;
+  "cloudformation describe-stack-resources") have_stack || missing "$@"; echo "cfi-$(get stack)-site" ;;
+  "cloudformation delete-stack") have_stack || missing "$@"; echo "DELETE stack" >> "$S/deleted.log"; [ -n "${STUB_DELETE_STUCK:-}" ] || { rm -f "$S/stack"; rm -rf "$S/bucket"; }; echo '{}' ;;
+  "s3api put-object")
+    have_stack || { echo "An error occurred (NoSuchBucket)" >&2; exit 254; }
+    k="$(arg --key "$@")"; f="$(objfile "$k")"
+    cp "$(arg --body "$@")" "$f"; arg --content-type "$@" > "$f.ct"; printf '%s' "$k" > "$f.key"; echo '{}' ;;
+  "s3api list-objects-v2")
+    have_stack || { echo "An error occurred (NoSuchBucket) when calling the ListObjectsV2 operation" >&2; exit 254; }
+    keys=""; for f in "$S"/bucket/*.key; do [ -e "$f" ] && keys="$keys\"$(cat "$f")\"," ; done
+    if [ -z "$keys" ]; then echo '{}'; else printf '{"Contents":[%s]}\n' "$(jq -c -n --argjson k "[${keys%,}]" '$k[] | {Key: .}' | paste -sd, -)"; fi ;;
+  "s3api delete-object") k="$(arg --key "$@")"; f="$(objfile "$k")"; rm -f "$f" "$f.ct" "$f.key"; echo "DELETE key $k" >> "$S/deleted.log"; echo '{}' ;;
+  "s3api get-public-access-block") have_stack || exit 254; if [ -n "${STUB_PAB_OFF:-}" ]; then printf 'True\tFalse\tTrue\tTrue\n'; else printf 'True\tTrue\tTrue\tTrue\n'; fi ;;
+  *) echo "stub aws: unexpected call: $svc $cmd $*" >&2; exit 99 ;;
+esac
