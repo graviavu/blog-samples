@@ -448,9 +448,9 @@ else
   RUNID="$(new_id)"
 fi
 for v in ERR_WAIT_SECS ERR_MID_SECS; do
-  eval "val=\$$v"; printf '%s' "$val" | grep -Eq '^[0-9]+$' || die "$v must be a whole number of seconds"
+  printf '%s' "${!v}" | grep -Eq '^[0-9]+$' || die "$v must be a whole number of seconds"
 done
-[ "$ERR_MID_SECS" -ge 5 ] && [ "$ERR_MID_SECS" -lt "$ERR_WAIT_SECS" ] || die "ERR_MID_SECS must be at least 5 and below ERR_WAIT_SECS"
+if [ "$ERR_MID_SECS" -lt 5 ] || [ "$ERR_MID_SECS" -ge "$ERR_WAIT_SECS" ]; then die "ERR_MID_SECS must be at least 5 and below ERR_WAIT_SECS"; fi
 valid_id "$RUNID" || die "bad run id $RUNID"
 set_names
 if [ "$DRY_RUN" = 1 ]; then
