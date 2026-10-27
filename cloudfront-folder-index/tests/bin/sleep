@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake sleep: advances the fake clock and returns at once.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+put slept $(( $(get slept 0) + ${1%.*} ))
+echo "sleep $1" >> "$S/sleeps.log"
+exit 0

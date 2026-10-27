@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake date: "+%s" answers with the fake clock (advanced by the fake sleep); everything else goes to the real date.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+if [ "${1:-}" = "+%s" ]; then now_s; exit 0; fi
+exec /bin/date "$@"
