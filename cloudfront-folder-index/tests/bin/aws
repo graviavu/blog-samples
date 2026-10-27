@@ -11,6 +11,8 @@ mkdir -p "$S/bucket"
 q="$(arg --query "$@")"
 a12="$(acct)"
 
+# Other knobs: STUB_CREATE_ROLLBACK=1 (create ends in ROLLBACK_COMPLETE), STUB_DELETE_FAILED_ONCE=1 (first delete-stack ends in DELETE_FAILED),
+# STUB_STATUS_IN_PROGRESS=1 (the stack never leaves *_IN_PROGRESS), STUB_DELETE_STUCK=1, STUB_FOREIGN_TAG=<id>, STUB_PAB_OFF=1.
 # STUB_FAIL=<cmd>[:<n>]  the n-th (default 1st) call of that command fails, with a message full of ids to prove redaction.
 if [ -n "${STUB_FAIL:-}" ] && [ "$cmd" = "${STUB_FAIL%%:*}" ]; then
   n=$(( $(get "n_$cmd" 0) + 1 )); put "n_$cmd" "$n"
@@ -33,19 +35,29 @@ case "$svc $cmd" in
     printf '%s' "$*" | grep -q 'Key=Purpose,Value=sample' || { echo "stub: Purpose tag missing" >&2; exit 254; }
     printf '%s' "$*" | grep -q "Key=RunId,Value=$id" || { echo "stub: RunId tag missing" >&2; exit 254; }
     [ -f "$(arg --template-body "$@" | sed 's#^file://##')" ] || { echo "stub: template not found" >&2; exit 254; }
-    put stack "$id"; put stack_status CREATE_COMPLETE; echo '{}' ;;
-  "cloudformation wait") if [ "$1" = stack-delete-complete ] && [ -n "${STUB_DELETE_STUCK:-}" ]; then exit 255; fi; exit 0 ;;
+    put stack "$id"; put stack_status CREATE_COMPLETE; [ -z "${STUB_CREATE_ROLLBACK:-}" ] || put stack_status ROLLBACK_COMPLETE; echo '{}' ;;
+  "cloudformation wait")
+    if [ "$1" = stack-delete-complete ]; then
+      [ -z "${STUB_DELETE_STUCK:-}" ] || exit 255
+      [ "$(get stack_status)" != DELETE_FAILED ] || exit 255
+    fi
+    if [ "$1" = stack-create-complete ] && [ -n "${STUB_CREATE_ROLLBACK:-}" ]; then echo "Waiter StackCreateComplete failed: Waiter encountered a terminal failure state" >&2; exit 255; fi
+    exit 0 ;;
   "cloudformation describe-stacks")
     have_stack || missing "$@"
     case "$q" in
-      *StackStatus*) get stack_status ;;
+      *StackStatus*) if [ -n "${STUB_STATUS_IN_PROGRESS:-}" ]; then echo UPDATE_IN_PROGRESS; else get stack_status; fi ;;
       *RunId*) stack_tag ;;
       *Purpose*) echo sample ;;
       *Outputs*) printf '[{"OutputKey":"BucketName","OutputValue":"cfi-%s-site"},{"OutputKey":"PlainDomain","OutputValue":"%s"},{"OutputKey":"FixedDomain","OutputValue":"%s"}]\n' "$(get stack)" "$(plain_domain)" "$(fixed_domain)" ;;
       *) echo '{}' ;;
     esac ;;
   "cloudformation describe-stack-resources") have_stack || missing "$@"; echo "cfi-$(get stack)-site" ;;
-  "cloudformation delete-stack") have_stack || missing "$@"; echo "DELETE stack" >> "$S/deleted.log"; [ -n "${STUB_DELETE_STUCK:-}" ] || { rm -f "$S/stack"; rm -rf "$S/bucket"; }; echo '{}' ;;
+  "cloudformation delete-stack")
+    have_stack || missing "$@"; echo "DELETE stack" >> "$S/deleted.log"
+    if [ -n "${STUB_DELETE_FAILED_ONCE:-}" ] && [ "$(get n_delete_stack 0)" = 0 ]; then put n_delete_stack 1; put stack_status DELETE_FAILED
+    elif [ -z "${STUB_DELETE_STUCK:-}" ]; then rm -f "$S/stack" "$S/stack_status"; rm -rf "$S/bucket"; fi
+    echo '{}' ;;
   "s3api put-object")
     have_stack || { echo "An error occurred (NoSuchBucket)" >&2; exit 254; }
     k="$(arg --key "$@")"; f="$(objfile "$k")"

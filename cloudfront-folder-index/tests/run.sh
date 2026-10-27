@@ -22,8 +22,8 @@ hasnot() { ! grep -q -- "$2" "$1"; }
 is()     { [ "$1" = "$2" ]; }
 
 reset_env() {
-  unset STUB_APPEND_INDEX STUB_NO_REWRITE STUB_NO_ERRCACHE STUB_COLD STUB_SIG_AT_CURL STUB_FAIL STUB_FOREIGN_TAG STUB_PAB_OFF STUB_DELETE_STUCK EXPECT_ACCOUNT_LAST4
-  export AWS_PROFILE=testprof RT_RUNID="$ID" ERR_WAIT_SECS=75 WARMUP_TRIES=3 WARMUP_PAUSE=1 STACK_POLL_SECS=1 SETTLE_POLLS=3
+  unset STUB_APPEND_INDEX STUB_NO_REWRITE STUB_NO_ERRCACHE STUB_COLD STUB_SIG_AT_CURL STUB_FAIL STUB_FOREIGN_TAG STUB_PAB_OFF STUB_DELETE_STUCK STUB_ERR_TTL STUB_ERR_XC STUB_POP_SWITCH STUB_CREATE_ROLLBACK STUB_DELETE_FAILED_ONCE STUB_STATUS_IN_PROGRESS EXPECT_ACCOUNT_LAST4
+  export AWS_PROFILE=testprof RT_RUNID="$ID" RT_TEST_MODE=1 ERR_WAIT_SECS=75 ERR_MID_SECS=45 WARMUP_TRIES=3 WARMUP_PAUSE=1 STACK_POLL_SECS=1 SETTLE_POLLS=3
 }
 newdir() { STUB_DIR="$TMP/$1/state"; RESULTS_DIR="$TMP/$1/res"; mkdir -p "$STUB_DIR" "$RESULTS_DIR"; export STUB_DIR RESULTS_DIR; OUT="$TMP/$1/out.txt"; RES="$RESULTS_DIR/results-$ID.md"; }
 go() { local name="$1" input="$2"; shift 2; newdir "$name"; printf '%b' "$input" | "$RT" "$@" > "$OUT" 2>&1; RC=$?; }
@@ -63,7 +63,18 @@ check "keys were emptied before delete-stack" grep -q "DELETE key posts/y/" "$ST
 check "raw status, X-Cache and Age are in the results" has "$RES" "Error from cloudfront"
 check "Age header recorded" has "$RES" "| Hit from cloudfront | [0-9]"
 check "C1 control and folder are both listed" has "$RES" "C1-folder | GET /posts/x/ | 403"
-check "C4 waited for the error-caching time" grep -q "sleep 75" "$STUB_DIR/sleeps.log"
+check "C4 waited to the middle probe (45 s)" grep -qx "sleep 45" "$STUB_DIR/sleeps.log"
+check "C4 waited the rest to 75 s (30 s)" grep -qx "sleep 30" "$STUB_DIR/sleeps.log"
+check "C4 has a probe inside the window that was a 404" has "$RES" "C4-m-mid-window | GET /late.html | 404 | Error from cloudfront"
+check "C4 probe b is a 404 with Error from cloudfront" has "$RES" "C4-b-after-upload | GET /late.html | 404 | Error from cloudfront | [0-9]"
+check "C4 last probe is a 200" has "$RES" "C4-c-after-wait | GET /late.html | 200"
+check "C4 text says what was measured" has "$RES" "Not measured: the exact TTL"
+check "X-Amz-Cf-Pop is recorded" has "$RES" "FRA56-P1"
+check "C4 fetches to the fixed host are all pinned to one IP" test "$(grep -c 'late.html resolve=.*:443:192.0.2.10' "$STUB_DIR/curl.log")" = 4
+check "the plain host is not pinned" test "$(grep -c 'resolve=' "$STUB_DIR/curl.log")" = 4
+check "the rewrite-only path is warmed on the fixed host" grep -q "posts/w/$" "$STUB_DIR/curl.log"
+check "the warmup object is uploaded and deleted" grep -q "DELETE key posts/w/index.html" "$STUB_DIR/deleted.log"
+check "teardown warns once that Ctrl-C is ignored" test "$(grep -c 'Ctrl-C and kill signals are ignored' "$OUT")" = 1
 check "the no-slash redirect is reported as info" has "$RES" "answered 301"
 check "screen output is redacted" clean "$OUT"
 check "results file is redacted" clean "$RES"
@@ -88,6 +99,13 @@ reset_env; export STUB_NO_REWRITE=1
 go c3fail "$PH\n" --run; check "C3 FAIL without the rewrite" has "$OUT" "C3  FAIL"; check "cleaned up" gone
 reset_env; export STUB_NO_ERRCACHE=1
 go c4fail "$PH\n" --run; check "C4 FAIL when the error is not held" has "$OUT" "C4  FAIL"; check "C4 note explains the 200" has "$RES" "another edge location"; check "cleaned up" gone
+reset_env; export STUB_ERR_TTL=20
+go c4short "$PH\n" --run; check "C4 FAIL when the error is held only 20 s (mid probe returns 200)" has "$OUT" "C4  FAIL"; check "C4 short TTL: others PASS" has "$RES" "| C3 | PASS |"; check "cleaned up" gone
+reset_env; export STUB_ERR_XC="Hit from cloudfront"
+go c4xc "$PH\n" --run; check "C4 FAIL when a held 404 is not marked Error from cloudfront" has "$OUT" "C4  FAIL"; check "cleaned up" gone
+reset_env; export STUB_POP_SWITCH=1
+go c4pop "$PH\n" --run; check "different Pop values are noted" has "$RES" "same X-Amz-Cf-Pop"
+reset_env; ERR_MID_SECS=80 go c4cfg "$PH\n" --run; check "ERR_MID_SECS above ERR_WAIT_SECS: exit 2" is "$RC" 2; check "ERR_MID_SECS above ERR_WAIT_SECS: no AWS call" no_calls
 
 echo "== 5. warmup =="
 reset_env; export STUB_COLD=3
@@ -105,6 +123,23 @@ go sig "$PH\n" --run; check "Ctrl-C during the checks: exit 130" is "$RC" 130; c
 reset_env; export STUB_DELETE_STUCK=1
 go stuck "$PH\n" --run; check "delete does not finish: exit 4" is "$RC" 4; check "stuck: tells how to clean up" has "$OUT" "--cleanup $ID"
 check "stuck: results file says INCOMPLETE" has "$RES" "INCOMPLETE"
+reset_env; export STUB_CREATE_ROLLBACK=1
+go rollback "$PH\n" --run; check "create ends in ROLLBACK_COMPLETE: exit 1" is "$RC" 1; check "rollback: says the stack did not reach CREATE_COMPLETE" has "$OUT" "did not reach CREATE_COMPLETE"; check "rollback: the rolled-back stack is deleted" gone; check "rollback: no checks ran" test ! -s "$STUB_DIR/curl.log"; check "rollback: teardown complete" has "$OUT" "stack: deleted"
+reset_env; export STUB_DELETE_FAILED_ONCE=1
+go delfail "$PH\n" --run; check "first delete ends in DELETE_FAILED: retried, exit 0" is "$RC" 0; check "DELETE_FAILED: stack gone after the retry" gone; check "DELETE_FAILED: delete-stack was called twice" test "$(grep -c 'DELETE stack' "$STUB_DIR/deleted.log")" = 2; check "DELETE_FAILED: bucket was emptied again" test "$(calls | grep -c 'list-objects-v2')" -ge 2
+reset_env; export STUB_STATUS_IN_PROGRESS=1
+go settle "$PH\n" --run; check "stack never settles: exit 4" is "$RC" 4; check "settle timeout: nothing deleted" test -e "$STUB_DIR/stack"; check "settle timeout: delete-stack never called" test ! -e "$STUB_DIR/deleted.log"; check "settle timeout: tells how to clean up" has "$OUT" "--cleanup $ID"; check "settle timeout: results file says INCOMPLETE" has "$RES" "INCOMPLETE"
+reset_env; export STUB_FAIL=list-objects-v2
+go listfail "$PH\n" --run; check "listing the bucket fails (not NoSuchBucket): exit 4" is "$RC" 4; check "list failure: stack and bucket NOT deleted" test -e "$STUB_DIR/stack"; check "list failure: delete-stack never called" test ! -e "$STUB_DIR/deleted.log"; check "list failure: says it cannot list" has "$OUT" "cannot list it"; check "list failure: results file says INCOMPLETE" has "$RES" "INCOMPLETE"; check "list failure: output redacted" clean "$OUT"
+reset_env
+newdir exists; seed_stack; printf '%s\n' "$PH" | "$RT" --run > "$OUT" 2>&1; RC=$?
+check "create-stack says AlreadyExists: exit 1" is "$RC" 1; check "AlreadyExists: the earlier stack is NOT deleted" test -e "$STUB_DIR/stack"; check "AlreadyExists: no delete call, no teardown" test ! -e "$STUB_DIR/deleted.log"; check "AlreadyExists: seeded object still there" test -e "$STUB_DIR/bucket/posts%x%index.html"
+reset_env; unset RT_TEST_MODE
+go hook "" ; check "RT_RUNID without RT_TEST_MODE is ignored (dry run shows another id)" hasnot "$OUT" "run $ID"; check "RT_RUNID ignored: says so" has "$OUT" "RT_RUNID is ignored"
+reset_env
+newdir copy; cp -R "$root" "$TMP/copy/tool"; unset RESULTS_DIR; printf '%s\n' "$PH" | "$TMP/copy/tool/run-test.sh" --run > "$OUT" 2>&1; RC=$?
+check "default results folder is the script's own folder" test -f "$TMP/copy/tool/results-$ID.md"; check "default results: exit 0" is "$RC" 0
+check "root .gitignore ignores results-*.md" grep -qx 'results-\*.md' "$root/../.gitignore"
 
 echo "== 7. --cleanup =="
 reset_env
@@ -119,6 +154,9 @@ check "cleanup of a stack with another run id: NOT deleted, exit 4" is "$RC" 4; 
 reset_env
 newdir cl4; printf '%s\n' "$CPH" | "$RT" --cleanup "$ID" > "$OUT" 2>&1; RC=$?
 check "cleanup of a run that no longer exists: exit 0" is "$RC" 0; check "cleanup: says already gone" has "$OUT" "already gone"
+reset_env; export STUB_STATUS_IN_PROGRESS=1
+newdir cl5; seed_stack; printf '%s\n' "$CPH" | "$RT" --cleanup "$ID" > "$OUT" 2>&1; RC=$?
+check "cleanup of a stack that stays in progress: exit 4, NOT deleted" is "$RC" 4; check "in-progress stack is still there" test -e "$STUB_DIR/stack"
 
 echo "== 8. the function code in the template (node) =="
 if command -v node >/dev/null 2>&1; then
