@@ -1,0 +1,3 @@
+# results and state files of a run (state files hold ids of a live stack; results are for you to read before sharing)
+results-*.md
+state-*.env
