@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Fake curl: behaves like the two distributions and like S3 for anonymous requests. Knobs (env):
+#   STUB_APPEND_INDEX=1  the plain distribution appends index.html (claim 1 must FAIL)
+#   STUB_NO_REWRITE=1    the fixed distribution has no working function (claim 3 must FAIL)
+#   STUB_NO_ERRCACHE=1   the fixed distribution does not hold errors (claim 4 must FAIL)
+#   STUB_COLD=n          the first n requests to CloudFront answer 503 (warmup)
+#   STUB_SIG_AT_CURL=n   send INT to run-test.sh during the n-th curl call
+#   STUB_ERR_TTL=n       the fixed distribution holds errors for n seconds (default 60)
+#   STUB_ERR_XC=text     X-Cache of a held error (default "Error from cloudfront")
+#   STUB_POP_SWITCH=1    the X-Amz-Cf-Pop header changes with every request to the fixed distribution
+# Every CloudFront answer carries x-amz-cf-pop. "-w %{remote_ip}" prints 192.0.2.10. --resolve is logged in curl.log.
+# shellcheck source=stub-lib.sh
+# shellcheck source-path=SCRIPTDIR
+. "$(dirname "$0")/stub-lib.sh"
+out="" dump="" url="" wfmt="" res=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; -D) dump="$2"; shift ;; -w) wfmt="$2"; shift ;; --resolve) res="$2"; shift ;; --max-time) shift ;; -sS|-s) ;; *) url="$1" ;; esac
+  shift
+done
+n=$(( $(get n_curl 0) + 1 )); put n_curl "$n"
+echo "curl $url${res:+ resolve=$res}" >> "$S/curl.log"
+if [ -n "${STUB_SIG_AT_CURL:-}" ] && [ "$n" = "$STUB_SIG_AT_CURL" ]; then kill -INT "${RT_MAIN_PID:?}"; sleep 0.3; fi
+host="${url#https://}"; host="${host%%/*}"; path="/${url#https://*/}"
+now="$(now_s)"
+hdrs=""; body=""; code=200; ct="text/html"
+reply() { # code content-type body [extra header lines]
+  code="$1"; ct="$2"; body="$3"; hdrs="HTTP/2 $code\r\ncontent-type: $ct\r\ncontent-length: ${#body}\r\nx-amz-cf-pop: ${pop:-FRA56-P1}\r\n$4"
+}
+lookup() { # key -> sets found, body, ct
+  local f; f="$(objfile "$1")"
+  if [ -e "$f" ]; then found=1; obody="$(cat "$f")"; oct="$(cat "$f.ct")"; else found=0; fi
+}
+cached() { # label: first request is a Miss, later ones a Hit with a growing Age
+  local f; f="$S/cache-$(printf '%s' "$host$path" | sed 's#[/.]#_#g')"
+  if [ -e "$f" ]; then xc="Hit from cloudfront"; age=$(( now - $(cat "$f") )); else put "cache-$(printf '%s' "$host$path" | sed 's#[/.]#_#g')" "$now"; xc="Miss from cloudfront"; age=0; fi
+}
+denied='<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>'
+case "$host" in
+  *.s3.*) reply 403 application/xml "$denied" ;;
+  *.cloudfront.net)
+    if [ "$n" -le "${STUB_COLD:-0}" ]; then reply 503 text/plain "warming" "x-cache: Error from cloudfront\r\n"
+    elif [ "$host" = "$(plain_domain)" ]; then
+      key="${path#/}"
+      if [ -n "${STUB_APPEND_INDEX:-}" ] && [ "${path: -1}" = "/" ]; then key="${key}index.html"; fi
+      lookup "$key"
+      if [ "$found" = 1 ]; then cached; reply 200 "$oct" "$obody" "x-cache: $xc\r\nage: $age\r\n"
+      else reply 403 application/xml "$denied" "x-cache: Error from cloudfront\r\n"; fi
+    elif [ "$host" = "$(fixed_domain)" ]; then
+      if [ -n "${STUB_POP_SWITCH:-}" ]; then pop="POP$n"; fi
+      key="${path#/}"; skip=0
+      if [ -z "${STUB_NO_REWRITE:-}" ]; then
+        if [ "${path: -1}" = "/" ]; then key="${key}index.html"
+        else case "${path##*/}" in *.*) ;; *) reply 301 text/plain "" "location: https://www.example.invalid${path}/\r\n"; skip=1 ;; esac; fi
+      fi
+      if [ "$skip" = 0 ]; then
+        errf="$S/err-$(printf '%s' "$path" | sed 's#[/.]#_#g')"
+        if [ -z "${STUB_NO_ERRCACHE:-}" ] && [ -e "$errf" ] && [ $(( now - $(cat "$errf") )) -lt "${STUB_ERR_TTL:-60}" ]; then
+          lookup "404.html"; reply 404 "$oct" "$obody" "x-cache: ${STUB_ERR_XC:-Error from cloudfront}\r\nage: $(( now - $(cat "$errf") ))\r\n"
+        else
+          lookup "$key"
+          if [ "$found" = 1 ]; then cached; reply 200 "$oct" "$obody" "x-cache: $xc\r\nage: $age\r\n"
+          else printf '%s' "$now" > "$errf"; lookup "404.html"; reply 404 "${oct:-text/html}" "$obody" "x-cache: Error from cloudfront\r\n"; fi
+        fi
+      fi
+    else reply 502 text/plain "unknown host"; fi ;;
+  *) reply 000 text/plain "" ;;
+esac
+[ -z "$dump" ] || printf '%b\r\n' "$hdrs" > "$dump"
+[ -z "$out" ] || printf '%s' "$body" > "$out"
+case "$wfmt" in *remote_ip*) printf '192.0.2.10' ;; *) printf '%s' "$code" ;; esac

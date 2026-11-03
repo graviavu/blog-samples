@@ -1,0 +1,3 @@
+# results of a run (read before sharing) and any local state
+results-*.md
+state-*.env
