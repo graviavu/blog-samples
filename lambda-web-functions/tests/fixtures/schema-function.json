@@ -1,0 +1,1 @@
+{"typeName":"AWS::Lambda::WebFunction","properties":{"FunctionName":{"type":"string"},"Tags":{"type":"array"},"FunctionArn":{"type":"string"},"State":{"type":"string"}},"readOnlyProperties":["/properties/FunctionArn","/properties/State"],"required":["FunctionName"]}

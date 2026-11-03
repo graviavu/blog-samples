@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  lambda-web-functions sample, optional O2 probe in eu-west-1: one tiny Event Function (no URL, nothing public) that
+  the script invokes to run the same GET loops from a second vantage point. It can only be invoked with IAM.
+Parameters:
+  RunId:
+    Type: String
+    AllowedPattern: '^[0-9]{10}-[0-9a-f]{4}$'
+Resources:
+  ProbeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/lwf-${RunId}-probe'
+      RetentionInDays: 1
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lwf-${RunId}-probe-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub '${ProbeLogGroup.Arn}:*'
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+  ProbeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'lwf-${RunId}-probe'
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt ProbeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProbeLogGroup
+      Tags:
+        - Key: sample
+          Value: lambda-web-functions
+        - Key: RunId
+          Value: !Ref RunId
+      Code:
+        ZipFile: |
+          // event: {"urls": [{"u": "https://...", "token": true}], "n": 30, "warm": 3, "token": "..."}. Unsigned GETs only; returns ttfb p50/p90 per URL.
+          const https = require('https');
+          const agent = new https.Agent({ keepAlive: true });
+          const one = (u, h) => new Promise((ok) => {
+            const t0 = process.hrtime.bigint();
+            const r = https.get(u, { agent, timeout: 20000, headers: h }, (res) => {
+              const ttfb = Number(process.hrtime.bigint() - t0) / 1e6;
+              res.resume(); res.on('end', () => ok({ s: res.statusCode, ttfb, pop: res.headers['x-amz-cf-pop'] || res.headers['cf-ray'] || null }));
+            });
+            r.on('error', () => ok({ s: 0, ttfb: 0 })); r.on('timeout', () => r.destroy());
+          });
+          const pct = (a, p) => (a.length ? [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(p * a.length / 100))] : null);
+          exports.handler = async (ev) => {
+            const out = {};
+            for (const item of (ev.urls || []).slice(0, 12)) {
+              const u = item.u; const h = item.token && ev.token ? { 'x-lwf-token': ev.token } : {};
+              const t = []; const st = {}; let pop = null;
+              for (let i = 0; i < (ev.warm || 3) + (ev.n || 30); i++) {
+                const r = await one(u, h);
+                if (i < (ev.warm || 3)) continue;
+                st[r.s] = (st[r.s] || 0) + 1; pop = pop || r.pop;
+                if (r.s === 200) t.push(r.ttfb);
+              }
+              out[u] = { status: st, p50: pct(t, 50), p90: pct(t, 90), pop };
+            }
+            console.log(JSON.stringify(out));
+            return out;
+          };
+Outputs:
+  ProbeFunctionName:
+    Value: !Ref ProbeFunction

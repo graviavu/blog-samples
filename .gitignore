@@ -11,3 +11,6 @@ venv/
 __pycache__/
 .DS_Store
 *.log
+lambda-web-functions/lwf-state/
+lambda-web-functions/results/
+lambda-web-functions/build/
