@@ -162,7 +162,7 @@ check "config bucket: public access block, encryption, and no bucket policy but 
 check "the edge function is Python: handler index.lambda_handler, runtime parameter default python3.12" bash -c "grep -q 'Handler: index.lambda_handler' '$TPL' && grep -q 'Default: python3.12' '$TPL'"
 check "the edge role S3 grants have no s3:ResourceAccount condition (not verified for GetObject/ListBucket); one object, one bucket" bash -c "! grep -q 'ResourceAccount' '$TPL' && grep -c 's3:GetObject' '$TPL' | grep -q '^1$'"
 check "edge function timeout is 10 s; the origin keeps 5" bash -c "grep -A1 'Role: !GetAtt EdgeRole.Arn' '$TPL' | grep -q 'Timeout: 10' && grep -A1 'Role: !GetAtt OriginRole.Arn' '$TPL' | grep -q 'Timeout: 5'"
-check "PermissionsBoundary has an AllowedPattern for an IAM policy ARN (or empty)" bash -c "grep -A3 '^  PermissionsBoundary:' '$TPL' | grep -q \"AllowedPattern: '\\^\\$|\\^arn:aws\""
+check "PermissionsBoundary has an AllowedPattern for an IAM policy ARN (or empty)" bash -c "grep -A3 '^  PermissionsBoundary:' '$TPL' | grep -qF \"AllowedPattern: '^\$|^arn:aws\""
 check "edge role log permissions name the exact edge log group" bash -c "grep -q 'log-group:/aws/lambda/us-east-1.bhc-\${RunId}-edge' '$TPL' && ! grep -q 'lambda/\*bhc' '$TPL'"
 check "edge role trusts edgelambda, origin role does not" bash -c "[ \$(grep -c edgelambda.amazonaws.com '$TPL') = 1 ]"
 check "edge role reads one object and lists the bucket; logs are scoped to this run" bash -c "grep -q 's3:GetObject' '$TPL' && grep -q 's3:ListBucket' '$TPL'"
