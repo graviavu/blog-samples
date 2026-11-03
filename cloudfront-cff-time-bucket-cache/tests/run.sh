@@ -29,7 +29,7 @@ reset_env() {
   export AWS_PROFILE=testprof
   export RT_RUNID="$RUNID_A" POLL_GAP=10 STACK_POLL_SECS=5
 }
-newdir() { rm -rf "$TMP/$1"; STUB_DIR="$TMP/$1/state"; RESULTS_DIR="$TMP/$1/res"; mkdir -p "$STUB_DIR/res" "$RESULTS_DIR"; export STUB_DIR RESULTS_DIR; OUT="$TMP/$1/out.txt"; }
+newdir() { rm -rf "${TMP:?}/$1"; STUB_DIR="$TMP/$1/state"; RESULTS_DIR="$TMP/$1/res"; mkdir -p "$STUB_DIR/res" "$RESULTS_DIR"; export STUB_DIR RESULTS_DIR; OUT="$TMP/$1/out.txt"; }
 seed_foreign() { echo OTHERRUN > "$STUB_DIR/res/s3__cftb-$OTHER-content"; printf 'CREATE_COMPLETE\n%s\n' "$OTHER" > "$STUB_DIR/res/cfn__cftb-$OTHER"; }
 # go NAME "stdin" args... -> RC, OUT   (RUN overrides the script, for the mutation checks)
 go() { local name="$1" input="$2"; shift 2; newdir "$name"; [ "${SEED:-0}" = 1 ] && seed_foreign; printf '%b' "$input" | "${RUN:-$RS}" "$@" > "$OUT" 2>&1; RC=$?; }
@@ -190,7 +190,9 @@ echo "mutation checks: a broken script or function must be caught by these tests
 mut="$TMP/mut"
 copy_sample() { rm -rf "$mut"; mkdir -p "$mut"; cp -R "$root"/. "$mut"/; }
 # 1. phrase gate removed
-copy_sample; sed -i.bak 's/\[ "\$answer" = "\$PHRASE" \]/true/' "$mut/run-sample.sh"; rm -f "$mut"/run-sample.sh.bak
+copy_sample
+# shellcheck disable=SC2016  # the sed pattern is literal text on purpose
+sed -i.bak 's/\[ "\$answer" = "\$PHRASE" \]/true/' "$mut/run-sample.sh"; rm -f "$mut"/run-sample.sh.bak
 check "mutation 1 really changed the gate" bash -c "! grep -q '\"\$answer\" = \"\$PHRASE\"' '$mut/run-sample.sh'"
 reset_env; STUB_TEMPLATE_ROOT="$mut" RUN="$mut/run-sample.sh" go mut_gate "wrong\n"; RUN=""
 check "mutation 1 (gate always true): the phrase test would FAIL, so it is caught" bash -c "[ $RC != 3 ]"

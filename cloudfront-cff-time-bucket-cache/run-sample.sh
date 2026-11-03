@@ -8,6 +8,7 @@
 #
 # Needs: aws CLI v2, jq, curl, bash 3.2+. No credentials are stored or printed. Everything it creates is in ONE stack named cftb-<RunId>.
 # Knobs (environment): BUCKET_SECONDS (default 60, 20..600), PROP_WAIT (seconds to wait for a function update to show, default 300).
+# shellcheck disable=SC2317,SC2034  # 0.9 (CI) flags functions that only run from the EXIT trap as unreachable; STACK_GONE is set but never read
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE="$SCRIPT_DIR/cfn/stack.yaml"
@@ -165,13 +166,13 @@ preflight() {
 check_inputs() {
   printf '%s' "$BUCKET_SECONDS" | grep -Eq '^[0-9]{1,3}$' || die "BUCKET_SECONDS must be a whole number of seconds, 20 to 600 (got '$BUCKET_SECONDS')"
   BUCKET_SECONDS=$((10#$BUCKET_SECONDS))
-  [ "$BUCKET_SECONDS" -ge 20 ] && [ "$BUCKET_SECONDS" -le 600 ] || die "BUCKET_SECONDS must be 20 to 600 (got '$BUCKET_SECONDS')"
-  printf '%s' "$PROP_WAIT" | grep -Eq '^[0-9]{1,4}$' && [ "$PROP_WAIT" -ge 30 ] || die "PROP_WAIT must be a whole number of seconds, at least 30"
-  printf '%s' "$POLL_GAP" | grep -Eq '^[0-9]{1,3}$' && [ "$POLL_GAP" -ge 1 ] || die "POLL_GAP must be a whole number of seconds, at least 1"
-  printf '%s' "$HIT_GAP" | grep -Eq '^[0-9]{1,2}$' && [ "$HIT_GAP" -ge 1 ] || die "HIT_GAP must be a whole number of seconds, 1 to 99"
-  printf '%s' "$WARMUP_TRIES" | grep -Eq '^[0-9]{1,3}$' && [ "$WARMUP_TRIES" -ge 1 ] || die "WARMUP_TRIES must be a whole number, at least 1"
-  printf '%s' "$SETTLE_POLLS" | grep -Eq '^[0-9]{1,4}$' && [ "$SETTLE_POLLS" -ge 1 ] || die "SETTLE_POLLS must be a whole number, at least 1"
-  printf '%s' "$STACK_POLL_SECS" | grep -Eq '^[0-9]{1,3}$' && [ "$STACK_POLL_SECS" -ge 5 ] || die "STACK_POLL_SECS must be a whole number of seconds, at least 5"
+  if ! [ "$BUCKET_SECONDS" -ge 20 ] || ! [ "$BUCKET_SECONDS" -le 600 ]; then die "BUCKET_SECONDS must be 20 to 600 (got '$BUCKET_SECONDS')"; fi
+  if ! printf '%s' "$PROP_WAIT" | grep -Eq '^[0-9]{1,4}$' || ! [ "$PROP_WAIT" -ge 30 ]; then die "PROP_WAIT must be a whole number of seconds, at least 30"; fi
+  if ! printf '%s' "$POLL_GAP" | grep -Eq '^[0-9]{1,3}$' || ! [ "$POLL_GAP" -ge 1 ]; then die "POLL_GAP must be a whole number of seconds, at least 1"; fi
+  if ! printf '%s' "$HIT_GAP" | grep -Eq '^[0-9]{1,2}$' || ! [ "$HIT_GAP" -ge 1 ]; then die "HIT_GAP must be a whole number of seconds, 1 to 99"; fi
+  if ! printf '%s' "$WARMUP_TRIES" | grep -Eq '^[0-9]{1,3}$' || ! [ "$WARMUP_TRIES" -ge 1 ]; then die "WARMUP_TRIES must be a whole number, at least 1"; fi
+  if ! printf '%s' "$SETTLE_POLLS" | grep -Eq '^[0-9]{1,4}$' || ! [ "$SETTLE_POLLS" -ge 1 ]; then die "SETTLE_POLLS must be a whole number, at least 1"; fi
+  if ! printf '%s' "$STACK_POLL_SECS" | grep -Eq '^[0-9]{1,3}$' || ! [ "$STACK_POLL_SECS" -ge 5 ]; then die "STACK_POLL_SECS must be a whole number of seconds, at least 5"; fi
   case "$REGION" in *[!a-z0-9-]*|'') die "SAMPLE_REGION looks wrong" ;; esac
 }
 compute_windows() {
@@ -222,7 +223,7 @@ create_stack() {
   out="$(aws_ro cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Outputs' --output json)" || fail "cannot read the stack outputs"
   DIST_ID="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="DistributionId") | .OutputValue')"
   CF_DOMAIN="$(printf '%s' "$out" | jq -r '.[] | select(.OutputKey=="DistributionDomain") | .OutputValue')"
-  [ -n "$DIST_ID" ] && [ "$DIST_ID" != null ] && [ -n "$CF_DOMAIN" ] && [ "$CF_DOMAIN" != null ] || fail "the stack outputs have no distribution"
+  if [ -z "$DIST_ID" ] || [ "$DIST_ID" = null ] || [ -z "$CF_DOMAIN" ] || [ "$CF_DOMAIN" = null ]; then fail "the stack outputs have no distribution"; fi
   printf '%s' "$CF_DOMAIN" | grep -Eq '^[a-z0-9]+\.cloudfront\.net$' || fail "the distribution domain does not look like <id>.cloudfront.net; not sending requests to it"
 }
 

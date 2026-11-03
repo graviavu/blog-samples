@@ -19,5 +19,6 @@ done
 echo "curl $url ${hdrs[*]:-}" >> "$S/calls.log"
 host="${url#https://}"; host="${host%%/*}"
 [ "$host" = "$(fake_domain)" ] || { echo "curl: (6) Could not resolve host" >&2; exit 6; }
-export STUB_NOW="$(now_epoch)"
+STUB_NOW="$(now_epoch)"
+export STUB_NOW
 exec node "$(dirname "$0")/fake-cloudfront.mjs" "$url" "$out" "$dump" ${hdrs[@]+"${hdrs[@]}"}

@@ -29,7 +29,7 @@ fi
 fileof() { local f; f="$(arg "$1" "${@:2}")"; echo "${f#file://}"; }
 param() { jq -r --arg k "$1" '.[] | select(.ParameterKey==$k) | .ParameterValue' "$2"; }
 nostack() { echo "An error occurred (ValidationError) when calling the $cmd operation: Stack with id $STACKNAME does not exist" >&2; exit 254; }
-status_of() { cat "$S/res/cfn__$STACKNAME" 2>/dev/null | sed -n 1p; }
+status_of() { sed -n 1p "$S/res/cfn__$STACKNAME" 2>/dev/null; }
 tag_of() { sed -n 2p "$S/res/cfn__$STACKNAME"; }
 write_stack() { printf '%s\n%s\n' "$1" "$2" > "$S/res/cfn__$STACKNAME"; }   # status, tag
 
@@ -43,7 +43,7 @@ case "$svc $cmd" in
     tag="$(printf '%s' "$*" | sed -n 's/.*Key=RunId,Value=\([A-Za-z0-9-]*\).*/\1/p')"
     if [ -n "${STUB_FOREIGN_TAG:-}" ]; then tag=OTHERRUN; fi
     write_stack CREATE_COMPLETE "$tag"
-    echo "$(param RunId "$pf")" > "$S/runid"
+    param RunId "$pf" > "$S/runid"
     : > "$S/res/s3__cftb-$(param RunId "$pf")-content"
     cp "$(fileof --template-body "$@")" "$S/template.yaml"
     echo '{}' ;;
