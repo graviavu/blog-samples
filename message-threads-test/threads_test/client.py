@@ -56,34 +56,43 @@ class Client:
         self.scheme, self.host, self.port = parse_base(base_url)
         self.key = key
         self.timeout = timeout
-        self.conn = None
         R.add_secret(key)
 
     def _connect(self):
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        self.conn = cls(self.host, self.port, timeout=self.timeout)
+        return cls(self.host, self.port, timeout=self.timeout)
 
     def close(self):
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = None
+        """Nothing is kept open between requests: every request uses its own connection."""
+
+    def count_tokens(self, body):
+        """POST /v1/messages/count_tokens (documented as free). Returns input_tokens or raises ValueError."""
+        conn = self._connect()
+        try:
+            conn.request("POST", "/v1/messages/count_tokens", body=json.dumps(body).encode(),
+                         headers={"content-type": "application/json", "x-api-key": self.key, "anthropic-version": API_VERSION})
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", "replace")
+            if resp.status != 200:
+                raise ValueError("count_tokens returned %s: %s" % (resp.status, R.redact(raw[:300])))
+            return int(json.loads(raw)["input_tokens"])
+        except (OSError, http.client.HTTPException, KeyError, TypeError) as e:
+            raise ValueError("count_tokens failed: %s" % R.redact("%s: %s" % (type(e).__name__, e)))
+        finally:
+            conn.close()
 
     def post(self, body, thread=False):
         res = Result()
         headers = {"content-type": "application/json", "accept": "text/event-stream", "x-api-key": self.key,
-                   "anthropic-version": API_VERSION}
+                   "anthropic-version": API_VERSION, "connection": "close"}
         if thread:
             headers["anthropic-beta"] = BETA
         data = json.dumps(body).encode()
-        t0 = time.perf_counter()
+        t0 = time.perf_counter()  # connection setup and the upload are inside TTFT, the same for every arm
+        conn = self._connect()
         try:
-            if self.conn is None:
-                self._connect()
-            self.conn.request("POST", "/v1/messages", body=data, headers=headers)
-            resp = self.conn.getresponse()
+            conn.request("POST", "/v1/messages", body=data, headers=headers)
+            resp = conn.getresponse()
             res.status = resp.status
             if resp.status != 200:
                 raw = resp.read().decode("utf-8", "replace")
@@ -97,12 +106,13 @@ class Client:
                     res.error = R.redact(raw[:500])
                 return res
             self._read_stream(resp, res, t0)
+            res.total = time.perf_counter() - t0
         except Exception as e:  # network, timeout, protocol
             res.exception = R.redact("%s: %s" % (type(e).__name__, e))
-            res.total = time.perf_counter() - t0
-            self.close()
-        else:
-            res.total = time.perf_counter() - t0
+        finally:
+            conn.close()
+            if res.total is None:
+                res.total = time.perf_counter() - t0
         return res
 
     def _read_stream(self, resp, res, t0):
@@ -145,4 +155,3 @@ class Client:
                 break
         if not res.complete and not res.error:
             res.exception = "stream ended before message_stop"
-            self.close()

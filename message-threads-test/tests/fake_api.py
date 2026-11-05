@@ -32,6 +32,7 @@ class State:
         self.actions = []       # failure injection queue: "500", "truncate"
         self.delay_per_token = 0.0   # seconds of "prefill" per uncached token
         self.base_delay = 0.0
+        self.count_scale = 1
         self.usage_scale = 1         # inflate reported tokens to blow past the estimate
         self.think = False           # emit a thinking_delta first
         self.expire_after = None     # seconds; threads older than this 404
@@ -39,7 +40,7 @@ class State:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"
+    protocol_version = "HTTP/1.1"   # keep-alive, chunked streaming, like the real service
 
     def log_message(self, *a):
         pass
@@ -51,6 +52,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+        self.wfile.flush()
 
     def do_POST(self):
         st = self.server.state
@@ -62,6 +64,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             idx = next(st.counter)
             action = st.actions.pop(0) if st.actions else None
         st.event.set()
+        if self.path == "/v1/messages/count_tokens":
+            st.count_calls = getattr(st, "count_calls", 0) + 1
+            return self.send_json(200, {"input_tokens": tok({"s": body.get("system"), "t": body.get("tools"), "m": body.get("messages")}) * st.count_scale})
         if self.path != "/v1/messages":
             return self.send_json(*err(404, "not_found_error", "no such route"))
         if not hdrs.get("x-api-key"):
@@ -135,11 +140,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         time.sleep(st.base_delay + st.delay_per_token * uncached)
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
+        self.send_header("transfer-encoding", "chunked")
         self.end_headers()
         w = self.wfile
 
         def ev(t, d):
-            w.write(("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(d, type=t)))).encode())
+            b = ("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(d, type=t)))).encode()
+            w.write(b"%x\r\n" % len(b) + b + b"\r\n")
             w.flush()
         ev("message_start", {"message": {"id": mid, "type": "message", "role": "assistant", "content": [], "model": conv["model"],
                                          "usage": dict(usage, output_tokens=1)}})
@@ -149,11 +156,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ev("content_block_delta", {"index": 0, "delta": {"type": "thinking_delta", "thinking": "hm"}})
         ev("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": text[:10]}})
         if action == "truncate":
-            return  # connection closes with no message_stop
+            self.close_connection = True
+            return  # connection closes with no message_stop and no final chunk
         ev("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": text[10:]}})
         ev("content_block_stop", {"index": 0})
         ev("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 12 * st.usage_scale}})
         ev("message_stop", {})
+        w.write(b"0\r\n\r\n")
+        w.flush()
         if prep["tid"] in ("new", "cont"):
             c2 = dict(conv)
             c2["messages"] = list(conv["messages"]) + [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
