@@ -64,13 +64,17 @@ The fetched text is treated as data. Anything not on those pages is marked UNKNO
 
 ## Default model choice
 
-`claude-haiku-5-5`: cheapest listed model, and the docs say threads are beta on every model. Note the 5x per-token step above 100,000 tokens: at `--tokens 100000` the prompt is slightly over the threshold, so the higher prices apply. Sonnet 5.5 costs 4x Haiku per input token below the threshold and about 4x above it (list prices, cache write 2.50 vs 0.625).
+`claude-haiku-5-5`: cheapest listed model, and the docs say threads are beta on every model. Note the 5x per-token step above 100,000 tokens: at `--tokens 100000` the prompt is slightly over the threshold, so the higher prices apply. Sonnet 5.5 (input 2.00, output 10.00, cache write 2.50) is 20x Haiku's price per token below 100,000 tokens (0.10, 0.50, 0.125) and 4x above it (0.50, 2.50, 0.625). Opus 5.5 is 2x Sonnet; Fable 5.1 is 5x Sonnet on input and output.
 
 ## Effort and thinking
 
 - Haiku 5.5 uses adaptive thinking; default effort is medium. The docs say telling it in the prompt to answer directly did not stop it thinking; lower effort does.
 - `output_config: {"effort": "low"}` is the documented shape. The effort page says the top-level effort parameter is available on all supported models. That `low` specifically is accepted on Haiku 5.5 is not stated in the text I read: UNKNOWN. The script sends it by default (`--effort none` omits it).
 - Because thinking tokens count toward `max_tokens` and output price, the script uses `--max-tokens 512` and uses the output cap in the worst-case estimate.
+
+## Token counting
+
+- `POST /v1/messages/count_tokens` accepts the same inputs as a message (system, tools, messages) and returns `{"input_tokens": N}`. Docs: free to use, with its own requests-per-minute rate limits, separate from message creation. It does not accept `thread`. The sample uses it only with `--count-tokens`, once, before the confirmation.
 
 ## Not verified
 
