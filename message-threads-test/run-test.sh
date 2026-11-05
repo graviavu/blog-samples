@@ -17,8 +17,6 @@ if [ "${1:-}" = "--self-test" ]; then
   exec "$ROOT/tests/run-tests.sh"
 fi
 
-# Interrupt: python catches the same signal, flushes results.json/results.md and prints the spend. We only add a note.
+# exec: Ctrl-C and SIGTERM go straight to python, which flushes results.json/results.md and prints the spend.
 # No cloud resources exist; message threads expire on Anthropic's side (5 minutes idle, 1 hour at most).
-trap 'echo "interrupted: partial results were flushed by the script; threads expire by themselves"' INT TERM
-"$PY" "$ROOT/threads_test/cli.py" "$@"
-exit $?
+exec "$PY" "$ROOT/threads_test/cli.py" "$@"

@@ -145,6 +145,10 @@ def render_md(doc):
         for key in ("detail", "status", "error_code", "body"):
             if ch.get(key) is not None:
                 L.append("  - %s: `%s`" % (key, json.dumps(ch[key])[:600] if not isinstance(ch[key], str) else ch[key][:600]))
+    L += ["", "## Reading this", "",
+          "- TTFT includes connection setup and the request upload (a fresh connection per request, the same for every arm). Arm 1 has few samples, so its p90 is its maximum.",
+          "- Thinking blocks are left out of the history the resend arms send. A thread may keep the thinking blocks of its own earlier turns. Read the token-usage comparison above before you trust a TTFT difference. `effort: low` is on to keep thinking short in every arm.",
+          "- Spend is the sum of the usage fields; the request on the wire at an interrupt is not in it (see in_flight_worst_case_usd in results.json)."]
     if doc.get("notes"):
         L += ["", "## Notes", ""] + ["- " + n for n in doc["notes"]]
     return "\n".join(L) + "\n"

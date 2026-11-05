@@ -45,6 +45,8 @@ class Runner:
         self.calibrated = False
         self.history = convo.build_history(cfg["seed"], cfg["tokens"], cfg["chars_per_token"])
         self.n_requests = 0
+        self.in_flight = 0.0
+        self.in_flight_at_stop = 0.0
 
     def log(self, msg):
         self._log(R.redact(msg))
@@ -77,7 +79,9 @@ class Runner:
             attempt += 1
             projected = self.ub(small)
             self.guard.check(projected)
+            self.in_flight = projected   # worst case of the request on the wire, known before it is sent
             res = self.client.post(body, thread=thread)
+            self.in_flight = 0.0
             self.n_requests += 1
             parts = pricing.cost(c["model"], res.usage) if res.usage else {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "total": 0.0}
             charged = parts["total"]
@@ -215,7 +219,7 @@ class Runner:
     # ----- output
     def doc(self):
         cfg = {k: v for k, v in self.cfg.items() if k not in ("salt_nonce",)}
-        return {"status": self.status, "started_utc": self.started, "spent_usd": round(self.guard.spent, 6), "requests": self.n_requests,
+        return {"status": self.status, "started_utc": self.started, "spent_usd": round(self.guard.spent, 6), "in_flight_worst_case_usd": round(self.in_flight_at_stop, 6), "requests": self.n_requests,
                 "config": cfg, "environment": {"python": platform.python_version(), "os": platform.system()},
                 "disclaimer": report.DISCLAIMER, "summary": report.summarize(self.records), "checks": self.checks,
                 "notes": self.notes, "records": self.records}
@@ -236,6 +240,7 @@ class Runner:
         except RunAbort as e:
             self.status, code = "aborted: %s" % e, 4
         except KeyboardInterrupt:
+            self.in_flight_at_stop = self.in_flight
             self.status, code = "interrupted", 130
         finally:
             self.status = R.redact(self.status)
@@ -244,6 +249,7 @@ class Runner:
             except Exception as e:  # keep going: report the spend even if the write fails
                 print("could not write results: %s" % R.redact(e), file=sys.stderr)
             self.client.close()
-        self.log("%s. Spent so far $%.4f of a $%.2f cap over %d requests. Threads expire on their own (5 minutes idle, 1 hour at most); nothing to clean up in your account." % (
-            self.status, self.guard.spent, self.guard.cap, self.n_requests))
+        extra = " The request on the wire when it stopped may add up to $%.4f." % self.in_flight_at_stop if self.in_flight_at_stop else ""
+        self.log("%s. Spent so far $%.4f of a $%.2f cap over %d requests.%s Threads expire on their own (5 minutes idle, 1 hour at most); nothing to clean up in your account." % (
+            self.status, self.guard.spent, self.guard.cap, self.n_requests, extra))
         return code
