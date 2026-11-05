@@ -71,7 +71,13 @@ class Pricing(unittest.TestCase):
              "margin": 1.25, "max_tokens": 512}
         e = pricing.estimate("claude-haiku-5-5", a)
         self.assertEqual(e["counts"]["sized"], 4 + 18 + 18 + 3 + 2)
+        self.assertEqual(e["counts"]["replays"], 15)
+        self.assertEqual(e["counts"]["attempts"], (45 + 15) * 2)   # retries default 1
+        self.assertAlmostEqual(e["total"], 120 * e["per_request_ub"])
         self.assertLess(e["total"], 10)
+        self.assertGreater(e["total"], 9)
+        e0 = pricing.estimate("claude-haiku-5-5", dict(a, retries=0, checks=False))
+        self.assertEqual(e0["counts"]["attempts"], 43 + 15)
         a["tokens"] = 500000
         self.assertGreater(pricing.estimate("claude-haiku-5-5", a)["total"], 10)
 
@@ -93,8 +99,8 @@ class Convo(unittest.TestCase):
         import json
         small = len(json.dumps(convo.build_history(1, 2000)))
         big = len(json.dumps(convo.build_history(1, 20000)))
-        self.assertAlmostEqual(small / 8000, 1.0, delta=0.15)
-        self.assertAlmostEqual(big / 80000, 1.0, delta=0.15)
+        self.assertAlmostEqual(small / 6400, 1.0, delta=0.35)   # one tool pair is about 2.5K characters   # default 3.2 characters per token
+        self.assertAlmostEqual(big / 64000, 1.0, delta=0.15)
 
     def test_prefix_identical_across_calls(self):
         self.assertEqual(convo.build_history(1, 5000)[:6], convo.build_history(1, 5000)[:6])

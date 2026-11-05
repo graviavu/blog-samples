@@ -16,7 +16,7 @@ class DryRun(StubCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(self.st.log), 0)
         self.assertEqual(os.listdir(self.res), [])
-        self.assertIn("ESTIMATED WORST-CASE COST", r.stdout)
+        self.assertIn("PLANNED UPPER BOUND", r.stdout)
         self.assertIn("no network call made", r.stdout)
 
     def test_no_flag_does_nothing(self):
@@ -32,7 +32,7 @@ class DryRun(StubCase):
     def test_dry_run_shows_500k_alongside_100k(self):
         r = run_cli(["--dry-run"], key="")
         self.assertIn("--tokens 500000", r.stdout)
-        self.assertIn("ESTIMATED WORST-CASE COST", r.stdout)
+        self.assertIn("PLANNED UPPER BOUND", r.stdout)
 
     def test_estimate_over_cap_refuses_real_run(self):
         r = run_cli(["--run"] + SMALL + ["--max-usd", "0.0001", "--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $0.0001\n")
@@ -287,7 +287,99 @@ class Interrupt(StubCase):
         self.assertGreaterEqual(len(doc["records"]), 2)
         self.assertEqual(sorted(os.listdir(d)), ["results.json", "results.md"])
         self.assertIn("Spent so far", out)
+        self.assertIn("on the wire", out)   # the request in flight is reported at its worst case
+        self.assertGreater(doc["in_flight_worst_case_usd"], 0)
         self.assertNotIn(FAKE_KEY, out + err + self.all_text())
+
+
+class BackToBack(StubCase):
+    """C1: the real client against an HTTP/1.1 chunked keep-alive server. One server request per client call."""
+
+    def body(self, i):
+        return {"model": "claude-haiku-5-5", "max_tokens": 16, "stream": True, "cache_control": {"type": "ephemeral"},
+                "system": "s", "tools": [], "messages": [{"role": "user", "content": "q%d" % i}]}
+
+    def test_ten_back_to_back_posts_no_response_not_ready(self):
+        from threads_test import client as C
+        c = C.Client(self.srv.url, FAKE_KEY)
+        for i in range(10):
+            r = c.post(self.body(i))
+            self.assertIsNone(r.exception, "call %d: %s" % (i, r.exception))
+            self.assertTrue(r.ok, i)
+            self.assertEqual(len(self.st.log), i + 1)   # exactly one server-side request per client call
+
+    def test_error_then_success_then_truncated_then_success(self):
+        from threads_test import client as C
+        c = C.Client(self.srv.url, FAKE_KEY)
+        self.st.actions[:] = ["500", None, "truncate", None]
+        got = [c.post(self.body(i)) for i in range(4)]
+        self.assertEqual([r.status for r in got], [500, 200, 200, 200])
+        self.assertTrue(got[1].ok)
+        self.assertFalse(got[2].complete)
+        self.assertTrue(got[3].ok)
+        self.assertEqual(len(self.st.log), 4)
+
+    def test_run_has_one_server_request_per_recorded_attempt_and_no_double_billing(self):
+        r = self.go()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        doc, _ = self.results()
+        self.assertEqual(len(self.st.log), doc["requests"])
+        self.assertEqual(len(doc["records"]), doc["requests"])
+        self.assertEqual(doc["summary"]["cache"]["retries"], 0)
+        self.assertEqual(doc["summary"]["cache"]["replays_in_thread_arm"], 0)
+        self.assertAlmostEqual(doc["spent_usd"], sum(x["charged_usd"] for x in doc["records"]), places=5)
+
+
+class CapValidation(unittest.TestCase):
+    def test_bad_caps_rejected(self):
+        for bad in ("nan", "inf", "-inf", "0", "-1", "10.01", "abc", "1e9"):
+            r = run_cli(["--dry-run", "--max-usd", bad], key="")
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertNotIn("PLANNED UPPER BOUND", r.stdout, bad)
+
+    def test_good_caps_accepted(self):
+        for ok in ("10", "9.99", "0.01"):
+            r = run_cli(["--dry-run", "--max-usd", ok], key="")
+            self.assertEqual(r.returncode, 0, ok)
+
+    def test_no_override_flag(self):
+        r = run_cli(["--dry-run", "--max-usd", "20", "--force"], key="")
+        self.assertEqual(r.returncode, 2)
+
+
+class CountTokens(StubCase):
+    def test_opt_in_counts_once_before_the_prompt(self):
+        r = self.go(["--count-tokens"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(getattr(self.st, "count_calls", 0), 1)
+        self.assertIn("count_tokens (free", r.stdout)
+        first_messages = [i for i, (p, _, _) in enumerate(self.st.log) if p == "/v1/messages"]
+        self.assertTrue(first_messages)
+        self.assertNotIn("thread", self.st.log[0][2])   # the count request carries no thread
+
+    def test_off_by_default_and_never_in_dry_run(self):
+        self.go()
+        self.assertEqual(getattr(self.st, "count_calls", 0), 0)
+        before = len(self.st.log)
+        run_cli(["--dry-run", "--count-tokens"] + SMALL, url=self.srv.url, key="")
+        self.assertEqual(len(self.st.log), before)
+
+    def test_over_margin_refuses_before_confirmation_prompt(self):
+        self.st.count_scale = 5
+        r = self.go(["--count-tokens"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("Refusing to start", r.stdout)
+        self.assertNotIn("type exactly", r.stdout)
+        self.assertTrue(all(p == "/v1/messages/count_tokens" for p, _, _ in self.st.log))
+
+
+class TopLevelHandler(StubCase):
+    def test_unexpected_exception_is_one_redacted_line_not_a_traceback(self):
+        r = self.go(extra=["--results-dir", "/dev/null/nope"])
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertIn("error:", r.stdout)
+        self.assertEqual(len(self.st.log), 0)
 
 
 class Wrapper(unittest.TestCase):

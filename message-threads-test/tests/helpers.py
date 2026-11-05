@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "threads_test", "cli.py")
 FAKE_KEY = "sk-ant-api03-FAKEKEYFORTESTS0123456789abcdef"
 SMALL = ["--tokens", "3000", "--turns", "2", "--reps", "2", "--nocache-turns", "2", "--nocache-reps", "1",
-         "--max-tokens", "64"]
+         "--max-tokens", "64", "--chars-per-token", "4.0"]
 
 
 def env_for(url, key=FAKE_KEY):
