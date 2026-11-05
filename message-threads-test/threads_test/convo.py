@@ -44,7 +44,7 @@ def _log_block(rng, lines=18):
     return "\n".join(out)
 
 
-def build_history(seed, tokens, chars_per_token=4.0):
+def build_history(seed, tokens, chars_per_token=3.2):
     """Messages ending with a user message (tool_result + the turn 0 question). Size is about tokens."""
     rng = random.Random(seed)
     target = int(tokens * chars_per_token)

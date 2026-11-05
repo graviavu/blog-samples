@@ -46,16 +46,21 @@ def request_upper_bound(model, prompt_tokens_ub, max_tokens):
 
 
 def plan_counts(a):
-    """Request counts for the plan. a: dict with turns, reps, nocache_turns, nocache_reps, reload_reps, expiry_test."""
+    """Request counts for the plan. a: dict with turns, reps, nocache_turns, nocache_reps, reload_reps, expiry_test,
+    optional checks (default True) and retries (default 1)."""
     c = {
         "arm1": a["nocache_reps"] * a["nocache_turns"],
         "arm2": a["reps"] * (1 + a["turns"]),
         "arm3": a["reps"] * (1 + a["turns"]),
         "arm4": a["reload_reps"],
-        "checks": 2,  # cold replay create after the 404, then one continue from it
+        "checks": 2 if a.get("checks", True) else 0,  # cold replay create after the 404, then one continue
         "small": 2 if a.get("expiry_test") else 0,
+        "replays": a["reps"] * a["turns"],            # worst case: every arm 3 continue falls back to a full create
+        "retries": a.get("retries", 1),
     }
     c["sized"] = c["arm1"] + c["arm2"] + c["arm3"] + c["arm4"] + c["checks"]
+    c["sized_with_replays"] = c["sized"] + c["replays"]
+    c["attempts"] = c["sized_with_replays"] * (1 + c["retries"])   # worst case: every request is attempted 1 + retries times
     return c
 
 
@@ -64,11 +69,12 @@ def prompt_upper_bound(tokens, margin, turns, max_tokens):
 
 
 def estimate(model, a):
-    """Worst-case total in USD for plan a (see plan_counts keys plus tokens, margin, max_tokens)."""
+    """Planned upper bound in USD: every planned request, plus one replay per arm 3 continue, each attempted
+    1 + retries times, each at the per-request bound (no cache-read credit)."""
     c = plan_counts(a)
     grow_turns = max(a["turns"], a["nocache_turns"])
     ub = prompt_upper_bound(a["tokens"], a["margin"], grow_turns, a["max_tokens"])
-    sized = c["sized"] * request_upper_bound(model, ub, a["max_tokens"])
+    per = request_upper_bound(model, ub, a["max_tokens"])
     small_ub = prompt_upper_bound(a.get("small_tokens", 2000), a["margin"], 1, a["max_tokens"])
-    small = c["small"] * request_upper_bound(model, small_ub, a["max_tokens"])
-    return {"total": sized + small, "counts": c, "prompt_tokens_ub": ub, "per_request_ub": request_upper_bound(model, ub, a["max_tokens"])}
+    small = c["small"] * (1 + c["retries"]) * request_upper_bound(model, small_ub, a["max_tokens"])
+    return {"total": c["attempts"] * per + small, "counts": c, "prompt_tokens_ub": ub, "per_request_ub": per}
