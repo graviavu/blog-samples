@@ -8,6 +8,9 @@ from . import redact as R
 
 THREADS_BETA = "message-threads-2026-08-12"
 TRANSIENT = (408, 429, 500, 502, 503, 504, 529)
+# Server errors that can arrive after the model has run (a gateway giving up on a long request): billing unknown, so charged.
+MAYBE_BILLED = (500, 502, 504)
+ALLOWED_HOST_SUFFIX = ".api.aws"
 
 
 def is_loopback(host):
@@ -23,6 +26,17 @@ def parse_endpoint(url):
     if u.query or u.fragment or u.username or u.password:
         raise ValueError("endpoint must be scheme://host[:port][/prefix] only")
     return u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80), u.path.rstrip("/")
+
+
+def check_host(host, allow=None):
+    """The key only goes to an AWS API host (*.api.aws), to loopback (the stub), or to the one host named with --allow-endpoint-host."""
+    h = (host or "").lower().rstrip(".")
+    if is_loopback(h) or (h.endswith(ALLOWED_HOST_SUFFIX) and len(h) > len(ALLOWED_HOST_SUFFIX)):
+        return
+    if allow and h == allow.lower().rstrip("."):
+        return
+    raise ValueError("refusing to send the key to %s: the host does not end in %s. If you mean it, add --allow-endpoint-host %s"
+                     % (h, ALLOWED_HOST_SUFFIX, h))
 
 
 def describe_error(status, raw, headers=None):
@@ -62,6 +76,7 @@ class Result:
         self.exception = None     # network-level failure, redacted text
         self.response_id = None   # kept in memory only, never written out
         self.stream_started = False
+        self.sent = True          # may it have been billed? Assumed yes; post() sets False only while connecting (nothing sent yet)
 
     @property
     def ok(self):
@@ -69,10 +84,11 @@ class Result:
 
     @property
     def transient(self):
-        """Clear transient failures only: network error before any response, or an overload-type status."""
-        if self.exception and self.status is None:
-            return True
-        return self.status in TRANSIENT
+        """Clear transient failures only: a network error before the body was sent (DNS failure, connection refused, TLS setup),
+        or a complete overload-type HTTP response. A read timeout or a reset after the upload is never retried: the model may have run."""
+        if self.exception:
+            return self.status is None and not self.sent
+        return self.status in TRANSIENT and not self.stream_started
 
 
 class Client:
@@ -104,6 +120,9 @@ class Client:
         t0 = time.perf_counter()  # connection setup and upload are inside TTFT, the same for every arm
         conn = self._conn()
         try:
+            res.sent = False
+            conn.connect()            # DNS, TCP and TLS: a failure here means no byte of the request was sent
+            res.sent = True           # from here on, any failure may come after the model ran
             conn.request("POST", self.prefix + "/v1/messages", body=data, headers=headers)
             resp = conn.getresponse()
             res.status = resp.status

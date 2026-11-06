@@ -13,6 +13,35 @@ class Stop(Exception):
         self.status, self.why = status, why
 
 
+CONTEXT_FLOOR = 0.9   # a thread continue must report at least this share of the primed prompt's tokens
+
+
+def prompt_tokens(usage):
+    return sum(usage.get(x, 0) or 0 for x in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+
+def usage_complete(usage):
+    return isinstance(usage.get("input_tokens"), int) and isinstance(usage.get("output_tokens"), int)
+
+
+def charge(res, model, bound, prices):
+    """Spend to count for one request, and whether the usage was missing. When in doubt, count the worst case:
+    - ok with input_tokens and output_tokens: the cost from usage;
+    - ok without them: the bound (the request ran, its size is unknown);
+    - nothing sent (DNS, connection refused, TLS setup): 0;
+    - a stream that started, or any exception after the upload began (read timeout, reset): the bound;
+    - a complete HTTP error response: 0 for 4xx/429/503/529 (refused before the model ran), the bound for 500/502/504."""
+    if res.ok:
+        if not usage_complete(res.usage):
+            return bound, True
+        return prices.cost(model, res.usage), False
+    if not getattr(res, "sent", True):
+        return 0.0, False
+    if res.stream_started or res.exception or res.status is None or res.status in C.MAYBE_BILLED:
+        return bound, False
+    return 0.0, False
+
+
 class Runner:
     def __init__(self, cfg, client, prices, outdir, log, sleep=time.sleep):
         self.cfg, self.client, self.prices, self.outdir, self.log, self.sleep = cfg, client, prices, outdir, log, sleep
@@ -35,12 +64,7 @@ class Runner:
                 raise Stop("stopped_cap", "next request could cross the cap (spent $%.4f + worst case $%.4f > $%.2f)" % (self.spent, bound, cap))
             res = self.client.post(body, beta)
             self.requests += 1
-            if res.ok:
-                c = self.prices.cost(model, res.usage)
-            elif res.stream_started:
-                c = bound            # a stream that was cut or errored mid-way: billing unknown, charge the bound
-            else:
-                c = 0.0              # refused before the model ran
+            c, usage_missing = charge(res, model, bound, self.prices)
             self.spent += c
             cost += c
             if not res.ok and res.transient and attempt <= self.cfg["retries"] and self.spent < cap:
@@ -54,6 +78,9 @@ class Runner:
             rec["error"] = res.error
         if res.exception:
             rec["exception"] = res.exception
+        if usage_missing:
+            rec["usage_missing"] = True
+            self.log("    the response had no input_tokens/output_tokens usage; charged its worst case $%.4f" % bound)
         rec.update(meta or {})
         self.records.append(rec)
         if self.spent >= cap:
@@ -129,12 +156,24 @@ class Runner:
             thread_id = res.response_id
             reply = res.text.strip() or "OK."
             transcript += [q, {"role": "assistant", "content": reply}]
+            real = prompt_tokens(res.usage)
             if k == 1:
-                real = sum(res.usage.get(x, 0) for x in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                if not usage_complete(res.usage):
+                    raise Stop("stopped_size", "the first request of the cell returned no input_tokens/output_tokens usage, so the prompt "
+                               "size and the spend cannot be checked; each such request was charged its worst case")
                 cell["real_prompt_tokens"] = real
                 if real > size * cfg["margin"] + plan.growth(mt):
                     raise Stop("stopped_size", "the prompt is %d tokens, over target %d x margin %.2f: the cost bound no longer holds"
                                % (real, size, cfg["margin"]))
+            elif name == "C" and self.records[-1].get("kind") == "turn":
+                # A continue that the endpoint silently ignored would answer from the new message alone and look fast.
+                # The prompt it was billed for must be at least the primed history.
+                floor = int(CONTEXT_FLOOR * (cell["real_prompt_tokens"] or size))
+                if real < floor:
+                    self.records[-1]["context_mismatch"] = True
+                    cell["context_mismatches"] = cell.get("context_mismatches", 0) + 1
+                    self.log("    CONTEXT MISMATCH: the continue reported %d prompt tokens, below %d (the primed history); "
+                             "the thread may have been ignored, so this turn is left out of the timings" % (real, floor))
 
     def run(self, thread_ok=False):
         t0 = time.time()

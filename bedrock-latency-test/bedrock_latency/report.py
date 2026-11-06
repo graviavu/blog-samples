@@ -13,13 +13,15 @@ def summarize(records, cells):
     for c in cells:
         sel = [r for r in records if r.get("model") == c["model"] and r.get("size_target") == c["size_target"] and r.get("arm") == c["arm"]]
         turns = [r for r in sel if r["kind"] == "turn"]
-        ok = [r for r in turns if r["ok"] and r["ttft_s"] is not None]
+        ok = [r for r in turns if r["ok"] and r["ttft_s"] is not None and not r.get("context_mismatch")]
         prime = [r for r in sel if r["kind"] == "prime" and r["ok"]]
         reads = sum(r["usage"].get("cache_read_input_tokens", 0) for r in ok)
         writes = sum(r["usage"].get("cache_creation_input_tokens", 0) for r in sel if r["ok"])
         rows.append({
             "model": c["model"], "size_target": c["size_target"], "arm": c["arm"], "real_prompt_tokens": c["real_prompt_tokens"],
             "measured": len(turns), "ok": len(ok), "replays": sum(1 for r in sel if r["kind"] == "replay"),
+            "context_mismatches": sum(1 for r in turns if r.get("context_mismatch")),
+            "usage_missing": sum(1 for r in sel if r.get("usage_missing")),
             "ttft_median_s": stats.median([r["ttft_s"] for r in ok]), "ttft_p90_s": stats.percentile([r["ttft_s"] for r in ok], 90),
             "total_median_s": stats.median([r["total_s"] for r in ok]), "total_p90_s": stats.percentile([r["total_s"] for r in ok], 90),
             "prime_ttft_s": prime[0]["ttft_s"] if prime else None, "prime_total_s": prime[0]["total_s"] if prime else None,
@@ -84,13 +86,20 @@ def markdown(doc):
                 notes.append("%s at %d, arm %s: no cache-read tokens appeared in the usage of the measured turns. Either caching did not take effect or the usage fields do not report it." % (r["model"], r["size_target"], r["arm"]))
             if r["replays"]:
                 notes.append("%s at %d, arm C: %d thread continue(s) failed and were replayed with a full create." % (r["model"], r["size_target"], r["replays"]))
+            if r["context_mismatches"]:
+                notes.append("%s at %d, arm %s: %d thread continue(s) reported fewer prompt tokens than the primed history, so the thread "
+                             "was probably ignored. Those turns are left out of the timings; a speed-up from them would be fake." % (
+                                 r["model"], r["size_target"], r["arm"], r["context_mismatches"]))
+            if r["usage_missing"]:
+                notes.append("%s at %d, arm %s: %d response(s) had no usage fields and were charged at their worst case." % (
+                    r["model"], r["size_target"], r["arm"], r["usage_missing"]))
             if "thinking_delta" in r["first_token_kinds"]:
                 notes.append("%s at %d, arm %s: some TTFT values are the first thinking token, not the first text token." % (r["model"], r["size_target"], r["arm"]))
         if notes:
             L += ["## Notes", ""] + ["- " + n for n in notes] + [""]
     L += ["## Limits", "",
           "- One machine, one network, one run. With 3 samples per cell, p90 is the slowest sample. Run it again on another day before quoting a number.",
-          "- Prices are the configured table (see results.json config), not a Bedrock invoice.", ""]
+          "- Prices are the configured table (see results.json config), not a Bedrock invoice. The cap applies to this estimated usage value, not to the bill.", ""]
     return "\n".join(L)
 
 

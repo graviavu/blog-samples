@@ -4,7 +4,9 @@ import os
 import tempfile
 import unittest
 
-from bedrock_latency import client, fill, plan, pricing, probe, redact, stats
+from bedrock_latency import client, fill, plan, pricing, probe, redact, runner, stats
+from tests.fake_bedrock import Server
+from tests.helpers import FAKE_TOKEN
 
 
 class R(object):
@@ -142,6 +144,16 @@ class Endpoint(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.parse_endpoint("http://example.com/anthropic")
 
+    def test_key_only_goes_to_api_aws_or_loopback_or_the_named_host(self):
+        for ok in ("bedrock-mantle.us-east-1.api.aws", "BEDROCK-MANTLE.EU-WEST-1.API.AWS", "127.0.0.1", "localhost", "::1"):
+            client.check_host(ok)
+        for bad in ("example.com", "api.aws", "evilapi.aws", "bedrock-mantle.us-east-1.api.aws.example.com", "api.aws.evil", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                client.check_host(bad)
+        client.check_host("proxy.example.com", allow="proxy.example.com")
+        with self.assertRaises(ValueError):
+            client.check_host("other.example.com", allow="proxy.example.com")
+
     def test_rejects_credentials_and_queries(self):
         for u in ("https://u:p@example.com/x", "https://example.com/x?a=b", "ftp://example.com"):
             with self.assertRaises(ValueError):
@@ -153,12 +165,112 @@ class Plan(unittest.TestCase):
         self.assertEqual(plan.counts(3), {"A": 3, "B": 4, "C": 4})
         self.assertEqual(plan.counts(3, False)["C"], 0)
 
-    def test_default_plan_is_over_five_dollars(self):
-        cfg = {"models": ["anthropic.claude-sonnet-5-5", "anthropic.claude-haiku-5-5"], "sizes": [20000, 100000, 200000], "reps": 3,
-               "max_tokens": 64, "margin": 1.1, "probe_model": "anthropic.claude-haiku-5-5", "thread_arm": True}
-        pl = plan.build(cfg, pricing.Prices())
-        self.assertGreater(pl["total"], 5.0)
-        self.assertLess(plan.typical(cfg, pricing.Prices()), pl["total"])
+    CFG = {"models": ["anthropic.claude-sonnet-5-5", "anthropic.claude-haiku-5-5"], "sizes": [20000, 100000], "reps": 3,
+           "max_tokens": 64, "margin": 1.1, "probe_model": "anthropic.claude-haiku-5-5", "thread_arm": True}
+
+    def test_default_plan_fits_the_default_cap_with_the_default_multiplier(self):
+        pl = plan.build(self.CFG, pricing.Prices(multiplier=1.1))
+        self.assertAlmostEqual(pl["total"], 4.92, delta=0.01)
+        self.assertLessEqual(pl["total"], 5.0)
+        self.assertLess(plan.typical(self.CFG, pricing.Prices(multiplier=1.1)), pl["total"])
+
+    def test_200k_is_over_five_dollars(self):
+        cfg = dict(self.CFG, sizes=[20000, 100000, 200000])
+        self.assertGreater(plan.build(cfg, pricing.Prices(multiplier=1.1))["total"], 5.0)
+
+
+def res(status=None, ok_stream=False, sent=True, stream_started=False, exception=None, usage=None):
+    r = client.Result()
+    r.status, r.sent, r.stream_started, r.exception = status, sent, stream_started, exception
+    if ok_stream:
+        r.status, r.complete, r.stream_started = 200, True, True
+    r.usage = usage if usage is not None else {}
+    return r
+
+
+class Charge(unittest.TestCase):
+    P = pricing.Prices()
+    M = "anthropic.claude-haiku-5-5"
+    B = 0.45
+
+    def c(self, r):
+        return runner.charge(r, self.M, self.B, self.P)
+
+    def test_ok_with_usage_is_the_usage_cost(self):
+        u = {"input_tokens": 1000, "output_tokens": 10}
+        self.assertEqual(self.c(res(ok_stream=True, usage=u)), (self.P.cost(self.M, u), False))
+
+    def test_ok_without_usage_is_the_bound(self):
+        for u in ({}, {"input_tokens": 1000}, {"output_tokens": 10}, {"cache_read_input_tokens": 5000, "output_tokens": 10}):
+            self.assertEqual(self.c(res(ok_stream=True, usage=u)), (self.B, True), u)
+
+    def test_failures_after_sending_are_the_bound(self):
+        self.assertEqual(self.c(res(exception="TimeoutError: timed out"))[0], self.B)
+        self.assertEqual(self.c(res(exception="ConnectionResetError: reset"))[0], self.B)
+        self.assertEqual(self.c(res(200, stream_started=True, exception="stream ended before message_stop"))[0], self.B)
+        self.assertEqual(self.c(res(503, exception="IncompleteRead"))[0], self.B)   # error body cut off
+        for st in (500, 502, 504):
+            self.assertEqual(self.c(res(st))[0], self.B, st)
+
+    def test_only_clean_refusals_and_unsent_requests_are_free(self):
+        self.assertEqual(self.c(res(exception="ConnectionRefusedError", sent=False))[0], 0.0)
+        self.assertEqual(self.c(res(exception="gaierror: DNS", sent=False))[0], 0.0)
+        for st in (400, 401, 403, 404, 408, 429, 503, 529):
+            self.assertEqual(self.c(res(st))[0], 0.0, st)
+
+    def test_retry_only_before_the_body_was_sent(self):
+        self.assertTrue(res(exception="ConnectionRefusedError", sent=False).transient)
+        self.assertFalse(res(exception="TimeoutError: timed out").transient)
+        self.assertFalse(res(exception="ConnectionResetError").transient)
+        self.assertFalse(res(503, exception="IncompleteRead").transient)
+        self.assertTrue(res(503).transient)
+        self.assertFalse(res(400).transient)
+
+
+class CapFiresOnTheStub(unittest.TestCase):
+    """The reviewer's case: a caller that keeps sending. With honest charging the cap must fire after cap/bound requests."""
+    CAP, BOUND = 1.0, 0.45
+
+    def setUp(self):
+        self.srv = Server(FAKE_TOKEN).start()
+        self.st = self.srv.state
+
+    def tearDown(self):
+        self.srv.stop()
+
+    def loop(self, timeout=10):
+        cl = client.Client(self.srv.url, FAKE_TOKEN, timeout=timeout)
+        r = runner.Runner({"max_usd": self.CAP, "retries": 1}, cl, pricing.Prices(), "/nonexistent", lambda m: None, sleep=lambda x: None)
+        body = {"model": "anthropic.claude-haiku-5-5", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        with self.assertRaises(runner.Stop) as cm:
+            for _ in range(50):
+                r.send(body, None, "turn", "anthropic.claude-haiku-5-5", self.BOUND)
+        return r, cm.exception
+
+    def check(self, r, stop):
+        self.assertEqual(stop.status, "stopped_cap")
+        self.assertEqual(r.requests, 2)                        # 0.45 + 0.45, then 0.90 + 0.45 > 1.0
+        self.assertEqual(len(self.st.log), 2)                  # no hidden retries
+        self.assertAlmostEqual(r.spent, 2 * self.BOUND)
+        self.assertLessEqual(r.spent, self.CAP)
+
+    def test_no_usage(self):
+        self.st.no_usage_after = 0
+        r, stop = self.loop()
+        self.check(r, stop)
+        self.assertTrue(all(x.get("usage_missing") for x in r.records))
+
+    def test_hang_then_reset(self):
+        self.st.hang_reset_after, self.st.hang_s = 0, 0.05
+        r, stop = self.loop()
+        self.check(r, stop)
+        self.assertTrue(all(x["attempts"] == 1 and x.get("exception") for x in r.records), r.records)
+
+    def test_read_timeout(self):
+        self.st.hang_reset_after, self.st.hang_s = 0, 1.5
+        r, stop = self.loop(timeout=1)
+        self.check(r, stop)
+        self.assertTrue(all("timed out" in x["exception"] for x in r.records), r.records)
 
 
 if __name__ == "__main__":

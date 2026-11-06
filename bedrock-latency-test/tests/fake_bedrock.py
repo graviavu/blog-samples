@@ -2,9 +2,12 @@
 Written from DOCS-NOTES.md, not from the real service. Listens on 127.0.0.1 only."""
 import hashlib
 import http.server
+import io
 import itertools
 import json
 import re
+import socket
+import struct
 import threading
 import time
 
@@ -42,6 +45,11 @@ class State:
         self.leak_token = False        # echo the token and an account id in error bodies
         self.think = False
         self.no_cache = False          # never report cache reads
+        self.no_usage_after = None     # "no usage": requests numbered above this stream 200 with no usage fields at all
+        self.hang_reset_after = None   # "hang then reset": requests numbered above this read the body, wait hang_s, then RST
+        self.hang_s = 0.3
+        self.reset_continues_after = None   # thread continues numbered above this hang then reset
+        self.ignore_continue_after = None   # thread continues numbered above this are silently treated as a fresh request
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -74,7 +82,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         hdrs = {k.lower(): v for k, v in self.headers.items()}
         with st.lock:
             st.log.append((self.path, hdrs, body))
+            n_req = len(st.log)
             action = st.actions.pop(0) if st.actions else None
+        is_cont = (body.get("thread") or {}).get("type") == "continue"
+        if action == "hang_reset" or (st.hang_reset_after is not None and n_req > st.hang_reset_after) \
+                or (is_cont and st.reset_continues_after is not None and n_req > st.reset_continues_after):
+            return self.hang_then_reset(st)
+        self.no_usage = (action == "no_usage") or (st.no_usage_after is not None and n_req > st.no_usage_after)
+        self.n_req = n_req
         if self.path != "/anthropic/v1/messages":
             return self.fail(st, 404, "not_found_error", "no such route")
         presented = hdrs.get("x-api-key") or hdrs.get("authorization", "").replace("Bearer ", "")
@@ -95,6 +110,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def hang_then_reset(self, st):
+        """The body has been read (the request is 'sent'); wait, then drop the connection with a TCP reset and no response."""
+        time.sleep(st.hang_s)
+        try:
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.rfile.close()
+            self.wfile.close()
+            self.connection.close()
+        except OSError:
+            pass
+        self.rfile, self.wfile = io.BytesIO(), io.BytesIO()   # the base handler flushes and closes these afterwards
+        self.close_connection = True
+
     def prepare(self, st, body, hdrs, th):
         conv = {k: body.get(k) for k in FIXED}
         if th is None:
@@ -110,7 +138,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             conv["messages"] = list(body["messages"])
             return 200, {"conv": conv, "tid": "new"}
         prev = th.get("previous_message_id")
-        if st.thread_mode == "ignore":
+        if st.thread_mode == "ignore" or (st.ignore_continue_after is not None and self.n_req > st.ignore_continue_after):
             conv["messages"] = list(body["messages"])
             return 200, {"conv": conv, "tid": None}
         with st.lock:
@@ -167,8 +195,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             b = ("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(d, type=t)))).encode()
             w.write(b"%x\r\n" % len(b) + b + b"\r\n")
             w.flush()
-        ev("message_start", {"message": {"id": mid, "type": "message", "role": "assistant", "content": [], "model": conv["model"],
-                                         "usage": dict(usage, output_tokens=1)}})
+        msg = {"id": mid, "type": "message", "role": "assistant", "content": [], "model": conv["model"]}
+        if not self.no_usage:
+            msg["usage"] = dict(usage, output_tokens=1)
+        ev("message_start", {"message": msg})
         ev("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}})
         ev("ping", {})
         if st.think:
@@ -179,7 +209,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         ev("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": text[3:]}})
         ev("content_block_stop", {"index": 0})
-        ev("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5 * st.usage_scale}})
+        md = {"delta": {"stop_reason": "end_turn"}}
+        if not self.no_usage:
+            md["usage"] = {"output_tokens": 5 * st.usage_scale}
+        ev("message_delta", md)
         ev("message_stop", {})
         w.write(b"0\r\n\r\n")
         w.flush()
