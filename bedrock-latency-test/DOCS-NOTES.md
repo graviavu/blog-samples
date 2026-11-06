@@ -15,7 +15,7 @@ blocked the fetch, and I did not work around it. Everything about Bedrock below 
 | Endpoint pattern | `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages` | Documented on the page. The script makes it the option `--endpoint` / `--region`. |
 | Request shape | "the same request body shape as the Claude API", "standard SSE streaming" | Documented. Exact event order and usage fields on Bedrock: UNKNOWN (assumed the same as the Claude API; the results show what arrives). |
 | Auth paths | Bedrock service role (recommended), IAM assumed roles (SigV4), bearer tokens ("12-hour maximum, least preferred") | Documented. |
-| Bearer token header | "Pass it in the `x-api-key` header on each request." | Documented. The script sends `x-api-key` by default; `--auth-header bearer` sends `Authorization: Bearer` instead (the Claude API beta-headers page shows that form). Which one this endpoint prefers when both could work: UNKNOWN. |
+| Bearer token header | "Pass it in the `x-api-key` header on each request." | Documented. The script sends `x-api-key` by default; `--auth-header bearer` sends it in the Authorization header with the Bearer scheme instead (the Claude API beta-headers page shows that form). Which one this endpoint prefers when both could work: UNKNOWN. |
 | Token env var | `AWS_BEARER_TOKEN_BEDROCK` "takes priority over the client's AWS credential chain" | Documented for the SDK client. This script reads only that variable. |
 | Long-term API keys | The page shows an admin policy that denies `bedrock:CallWithBearerToken` unless the token type is short-term, which implies long-term keys exist | Implied, not stated. Whether R's key is long-term or short-term: UNKNOWN. |
 | SigV4 | Supported by the page's SDK client `AnthropicBedrockMantle`; the plain client with `base_url` "supports bearer-token authentication only" | This script does not implement SigV4. Listed as a limit. |
@@ -57,7 +57,7 @@ The page lists a global endpoint for these models and regional endpoints with "a
 
 - Events: `message_start`, `content_block_start`, `ping`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, `error`.
 - `message_start.message.usage` carries `input_tokens` (and the cache fields on current models); `message_delta.usage` carries the final `output_tokens`. The script merges the usage keys of both and uses the last value seen.
-- Total prompt tokens = `cache_read_input_tokens + cache_creation_input_tokens + input_tokens`.
+- The total prompt size is the sum of `cache_read_input_tokens`, `cache_creation_input_tokens` and `input_tokens`.
 - TTFT here is the first `content_block_delta` of any type (a `thinking_delta` counts); the report says when that happened.
 
 ## Prompt caching details (Claude API docs, read 2026-11-05 and 2026-11-06)
@@ -70,7 +70,7 @@ The page lists a global endpoint for these models and regional endpoints with "a
 ## Prices (USD per million tokens)
 
 Anthropic list prices, read 2026-11-05. **Bedrock's own price for these models is UNKNOWN to this sample.** The pricing page sends Bedrock readers to AWS's pricing page, and says regional endpoints carry a 10 percent premium over global ones.
-Override with `--prices FILE` and `--price-multiplier` (for example 1.1).
+Override with `--prices FILE` and `--price-multiplier`. The multiplier defaults to 1.1 because the default endpoint `bedrock-mantle.{region}` looks regional; whether it is billed at the regional premium is UNKNOWN, so the script counts the dearer case. The cap applies to this estimated usage value, not to the AWS bill.
 
 | Model | Input | Output | 5m cache write | Cache read |
 |---|---|---|---|---|
