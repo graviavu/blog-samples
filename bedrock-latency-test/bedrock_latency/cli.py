@@ -27,10 +27,10 @@ def out(msg=""):
 
 
 def usd(text):
-    try:
-        v = float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError("not a number: %r" % text)
+    """A plain amount with at most 2 decimals (5, 2.5, 7.25), so the typed phrase is exactly the amount the cap enforces."""
+    if not re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,2})?", text or ""):
+        raise argparse.ArgumentTypeError("expected an amount in USD with at most 2 decimals, e.g. 5 or 7.25: %r" % text)
+    v = float(text)
     if not math.isfinite(v) or v <= 0:
         raise argparse.ArgumentTypeError("must be a finite number above 0")
     return v
@@ -54,17 +54,20 @@ def parser():
     m.add_argument("--run", action="store_true", help="probe, then the latency arms. Needs the typed phrase")
     p.add_argument("--models", default="sonnet-5-5,haiku-5-5", help="comma-separated; short names get the anthropic.claude- prefix (default sonnet-5-5,haiku-5-5)")
     p.add_argument("--probe-model", default="haiku-5-5", help="model for the probe (default haiku-5-5, the cheapest)")
-    p.add_argument("--sizes", type=int_list, default=[20000, 100000, 200000], help="context sizes in tokens (default 20000,100000,200000)")
+    p.add_argument("--sizes", type=int_list, default=[20000, 100000], help="context sizes in tokens (default 20000,100000; 200000 is opt-in and needs a higher --max-usd)")
     p.add_argument("--reps", type=int, default=3, help="measured turns per cell (default 3)")
     p.add_argument("--max-tokens", type=int, default=64, help="output cap per request, thinking included (default 64)")
     p.add_argument("--effort", default="low", choices=["none", "low", "medium", "high"], help="output_config.effort on every request; none leaves it out. The probe drops it if the endpoint refuses it (default low)")
     p.add_argument("--max-usd", type=usd, default=5.0, help="spend cap in USD (default 5). The run refuses to start if the planned worst case is above it")
     p.add_argument("--region", default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1", help="AWS region for the default endpoint (default: AWS_REGION, else us-east-1)")
-    p.add_argument("--endpoint", default=None, help="base URL up to and including /anthropic; default " + DEFAULT_ENDPOINT + ". /v1/messages is appended")
-    p.add_argument("--auth-header", choices=["x-api-key", "bearer"], default="x-api-key", help="how the bearer token is sent: x-api-key header (what the Bedrock page shows, default) or Authorization: Bearer")
+    p.add_argument("--endpoint", default=None, help="base URL up to and including /anthropic; default " + DEFAULT_ENDPOINT + ". /v1/messages is appended. "
+                   "The host must end in .api.aws (loopback is allowed for the stub) unless named with --allow-endpoint-host")
+    p.add_argument("--allow-endpoint-host", default=None, metavar="HOST", help="send the key to this one host even though it does not end in .api.aws")
+    p.add_argument("--auth-header", choices=["x-api-key", "bearer"], default="x-api-key", help="how the key is sent: the x-api-key header (what the Bedrock page shows, default) or the Authorization header with the Bearer scheme")
     p.add_argument("--anthropic-version", default="2026-10-21", help="anthropic-version header; empty string omits it (default 2026-10-21, taken from the Claude API docs)")
     p.add_argument("--prices", default=None, help="JSON file that overrides or adds per-model prices (see README)")
-    p.add_argument("--price-multiplier", type=float, default=1.0, help="multiply every price, e.g. 1.1 for a regional endpoint (default 1.0)")
+    p.add_argument("--price-multiplier", type=float, default=1.1, help="multiply every price (default 1.1: Bedrock prices are UNKNOWN here and the default "
+                   "endpoint looks regional, which the Bedrock page says carries a 10 percent premium)")
     p.add_argument("--margin", type=float, default=1.1, help="assumed worst-case tokens / size target (default 1.1)")
     p.add_argument("--chars-per-token", type=float, default=3.5, help="starting guess to size the filler; measured per model before the arms (default 3.5)")
     p.add_argument("--retries", type=int, default=1, help="retries on clear transient errors only (default 1)")
@@ -80,9 +83,10 @@ def phrase(cap):
 def print_plan(a, cfg, pl, endpoint, mode):
     out("PLAN (a dry run sends nothing)")
     out("  endpoint             %s/v1/messages" % endpoint)
-    out("  auth                 %s from the environment; header name: %s" % (TOKEN_ENV, "Authorization (Bearer scheme)" if a.auth_header == "bearer" else "x-api-key"))
+    out("  auth                 %s from the environment, sent in the %s" % (TOKEN_ENV, "Authorization header with the Bearer scheme" if a.auth_header == "bearer" else "x-api-key header"))
     out("  models               %s" % ", ".join(cfg["models"]))
-    out("  step 1 probe         %d tiny requests on %s (plain, thread create, thread continue); about $%.4f at most" % (plan.PROBE_REQUESTS, cfg["probe_model"], pl["probe_bound"]))
+    out("  step 1 probe         up to %d tiny requests on %s (plain, plain again without effort if refused, thread create, thread continue); about $%.4f at most"
+        % (plan.PROBE_REQUESTS, cfg["probe_model"], pl["probe_bound"]))
     if mode == "probe":
         out("  step 2 arms          not in this mode (use --run)")
     else:
@@ -97,7 +101,9 @@ def print_plan(a, cfg, pl, endpoint, mode):
         out("  typical cost         about $%.2f if cache reads work and replies are short (an estimate, not a bound)" % plan.typical(cfg, cfg["_prices"]))
     out("  prices (USD/MTok)    Anthropic list prices read 2026-11-05, multiplier %g. Bedrock's own prices are UNKNOWN here; override with --prices" % a.price_multiplier)
     out("  bound rule           every prompt token billed at the dearer of input and cache-write price, no cache-read credit, every reply at the output cap;")
-    out("                       failed requests are assumed unbilled unless a stream had started; the run also checks spend before and after every request")
+    out("                       a request is charged its worst case if it had no usage fields, timed out or was cut after it was sent, or got 500/502/504;")
+    out("                       only failures before sending and clean 4xx/429/503/529 refusals count as $0. Spend is checked before and after every request")
+    out("  cap                  applies to this estimated usage value, not to your AWS bill")
     total = pl["probe_bound"] if mode == "probe" else pl["total"]
     out("  PLANNED WORST CASE   $%.2f   (cap $%.2f)" % (total, a.max_usd))
     return total
@@ -115,6 +121,7 @@ def main(argv=None):
     endpoint = (a.endpoint or DEFAULT_ENDPOINT.format(region=a.region)).rstrip("/")
     try:
         scheme, host, port, prefix = C.parse_endpoint(endpoint)
+        C.check_host(host, a.allow_endpoint_host)
         overrides = pricing.load_overrides(a.prices) if a.prices else None
         prices = pricing.Prices(overrides, a.price_multiplier)
         models = [pricing.model_id(x.strip()) for x in a.models.split(",") if x.strip()]
@@ -152,6 +159,7 @@ def main(argv=None):
     if sys.stdin.readline().rstrip("\r\n") != phrase(a.max_usd):
         out("Not confirmed. No calls made.")
         return 2
+    os.umask(0o077)   # results readable by you only
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     outdir = os.path.join(a.results_dir, stamp)
     run_cfg = dict(cfg, nonce=stamp + secrets.token_hex(3), started_utc=stamp)

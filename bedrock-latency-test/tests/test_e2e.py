@@ -27,19 +27,35 @@ class DryRun(StubCase):
     def test_dry_run_prints_counts_and_tokens(self):
         r = run_cli(["--dry-run"], token="")
         self.assertIn("arm A", r.stdout)
-        self.assertIn("20000, 100000, 200000", r.stdout)
+        self.assertIn("20000, 100000 tokens", r.stdout)
+        self.assertIn("multiplier 1.1", r.stdout)
         self.assertIn("UNKNOWN", r.stdout)
+        self.assertIn("not to your AWS bill", r.stdout)
 
-    def test_default_plan_is_over_the_default_cap_and_refuses(self):
-        r = run_cli(["--run", "--endpoint", self.srv.url, "--results-dir", self.res], stdin="SPEND UP TO $5\n")
+    def test_default_plan_fits_the_default_cap(self):
+        r = run_cli(["--dry-run"], token="")
+        self.assertIn("PLANNED WORST CASE   $4.92   (cap $5.00)", r.stdout)
+        self.assertNotIn("EXCEEDS", r.stdout)
+        # a plain --run gets past the plan check to the typed phrase (and makes no call when the phrase is wrong)
+        r = run_cli(["--run", "--endpoint", self.srv.url, "--results-dir", self.res], stdin="no\n")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("type exactly: SPEND UP TO $5", r.stdout)
+        self.assertEqual(len(self.st.log), 0)
+
+    def test_200k_is_opt_in_and_refused_under_the_default_cap(self):
+        r = run_cli(["--run", "--endpoint", self.srv.url, "--results-dir", self.res, "--sizes", "20000,100000,200000"], stdin="SPEND UP TO $5\n")
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(self.st.log), 0)
         self.assertIn("Refusing to start", r.stdout)
 
     def test_there_is_no_yes_flag(self):
-        r = run_cli(["--run", "--yes"])
-        self.assertNotEqual(r.returncode, 0)
+        r = self.go(extra=["--yes"], confirm="")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unrecognized arguments: --yes", r.stderr)
         self.assertEqual(len(self.st.log), 0)
+        self.assertEqual(os.listdir(self.res), [])
+        r = self.go(confirm="")                 # control: the same call without --yes reaches the phrase prompt
+        self.assertIn("type exactly", r.stdout)
 
     def test_plain_http_to_remote_host_refused(self):
         r = run_cli(["--dry-run", "--endpoint", "http://example.com/anthropic"], token="")
@@ -49,8 +65,10 @@ class DryRun(StubCase):
         self.assertNotEqual(run_cli(["--run", "--probe"]).returncode, 0)
 
     def test_bad_cap_values(self):
-        for bad in ("0", "-1", "nan", "inf", "x"):
+        for bad in ("0", "-1", "nan", "inf", "x", "2.555", "1e1", "5.", ".5", " 5", "5.001", "0.00"):
             self.assertNotEqual(run_cli(["--dry-run", "--max-usd", bad], token="").returncode, 0, bad)
+        for good in ("5", "2.5", "7.25", "0.30"):
+            self.assertEqual(run_cli(["--dry-run", "--max-usd", good, "--sizes", "3000"], token="").returncode, 0, good)
 
 
 class Gate(StubCase):
@@ -233,9 +251,10 @@ class Arms(StubCase):
 class CapGuard(StubCase):
     def test_stops_when_measured_spend_reaches_the_cap(self):
         self.st.usage_scale = 30   # the stub reports 30x the tokens; the plan's bound does not know
-        r = self.go(cap="0.3")
+        r = self.go(cap="0.3", extra=["--price-multiplier", "1.0"])   # pinned: these numbers make the post-request check fire first
         doc, _ = self.results()
         self.assertEqual(doc["status"], "stopped_cap")
+        self.assertIn("measured spend", doc["why"])
         self.assertEqual(r.returncode, 3)
         self.assertIn("STOPPED", r.stdout)
         self.assertLess(doc["requests_sent"], 20)
@@ -268,7 +287,21 @@ class Leaks(StubCase):
         for secret in (FAKE_TOKEN, "123456789012", "arn:aws", "msg_0", "req_011", "7f1c2d3e"):
             self.assertNotIn(secret, everything, secret)
         self.assertIn("<key>", everything)    # the echoed token was redacted, not dropped silently
-        self.assertTrue(all(FAKE_TOKEN not in a for a in [CLI]))
+
+    def test_token_not_in_the_process_arguments(self):
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "AWS_BEARER_TOKEN_BEDROCK": FAKE_TOKEN}
+        p = subprocess.Popen([sys.executable, "-I", CLI, "--probe", "--endpoint", self.srv.url, "--results-dir", self.res],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        try:
+            time.sleep(1.0)                          # it is now waiting for the typed phrase, token loaded
+            self.assertIsNone(p.poll())
+            args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(p.pid)], capture_output=True, text=True).stdout
+            self.assertIn("cli.py", args)            # the check really looked at this process
+            self.assertNotIn(FAKE_TOKEN, args)
+            self.assertNotIn(FAKE_TOKEN[:12], args)
+        finally:
+            p.communicate("no\n", timeout=30)
+        self.assertEqual(len(self.st.log), 0)
 
     def test_bearer_auth_header_option(self):
         r = self.go("--probe", extra=["--auth-header", "bearer"])
@@ -328,6 +361,115 @@ class Results(StubCase):
                 json.dump({"haiku-5-5": [{"up_to_prompt_tokens": None, "input": 100, "output": 100, "cache_write": 100, "cache_read": 100}]}, fh)
             r = run_cli(["--dry-run", "--prices", f, "--models", "haiku-5-5", "--sizes", "20000"])
             self.assertIn("EXCEEDS THE CAP", r.stdout)
+
+
+class Billing(StubCase):
+    """H1: a billed request must never be counted as $0. (The cap firing on these modes is in test_units.CapFiresOnTheStub.)"""
+
+    def test_no_usage_is_charged_the_bound_and_stops_the_cell(self):
+        self.st.no_usage_after = 0
+        r = self.go()
+        doc, _ = self.results()
+        self.assertEqual(doc["status"], "stopped_size", r.stdout)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("no input_tokens/output_tokens usage", doc["why"])
+        reqs = doc["requests"]
+        self.assertEqual(len(reqs), len(self.st.log))
+        self.assertTrue(all(x["ok"] and x.get("usage_missing") and x["cost_usd"] > 0 for x in reqs), reqs)
+        self.assertEqual(reqs[-1]["kind"], "turn")                         # stopped at the first arm request
+        self.assertAlmostEqual(doc["spent_usd"], sum(x["cost_usd"] for x in reqs), places=5)
+
+    def test_hang_then_reset_is_charged_and_not_retried(self):
+        self.st.hang_reset_after, self.st.hang_s = 5, 0.05                 # after probe (3) and calibration (2)
+        self.go()
+        doc, _ = self.results()
+        arms = [x for x in doc["requests"] if x.get("arm")]
+        self.assertEqual(len(arms), 2 * 2 * 3)                             # one failed request per cell and arm, no retry
+        self.assertEqual(len(self.st.log), 5 + len(arms))
+        self.assertTrue(all(x.get("exception") and x["attempts"] == 1 and x["cost_usd"] > 0 for x in arms), arms)
+        self.assertGreaterEqual(doc["spent_usd"], sum(x["cost_usd"] for x in arms))
+
+    def test_read_timeout_on_the_baseline_is_charged_and_not_retried(self):
+        self.st.hang_reset_after, self.st.hang_s = 0, 2.5
+        self.go("--probe", extra=["--timeout", "1"])
+        doc, _ = self.results()
+        self.assertEqual(len(self.st.log), 1)
+        b = doc["requests"][0]
+        self.assertIn("timed out", b["exception"])
+        self.assertEqual(b["attempts"], 1)
+        self.assertGreater(doc["spent_usd"], 0)
+
+    def test_reset_on_a_thread_continue_is_charged_then_replayed(self):
+        self.st.reset_continues_after, self.st.hang_s = 3, 0.02            # the probe's continue works, the arms' do not
+        self.go()
+        doc, _ = self.results()
+        cont = [x for x in doc["requests"] if x.get("arm") == "C" and x["kind"] == "turn"]
+        self.assertTrue(cont)
+        self.assertTrue(all(x.get("exception") and x["cost_usd"] > 0 and x["attempts"] == 1 for x in cont), cont)
+        self.assertTrue(all(x["replays"] > 0 for x in doc["summary"] if x["arm"] == "C"))
+
+    def test_connection_refused_is_retried_and_free(self):
+        import socket
+        s_ = socket.socket()
+        s_.bind(("127.0.0.1", 0))
+        port = s_.getsockname()[1]
+        s_.close()                                                         # nothing listens here now
+        run_cli(["--probe", "--endpoint", "http://127.0.0.1:%d/anthropic" % port, "--max-usd", "5", "--results-dir", self.res],
+                stdin="SPEND UP TO $5\n")
+        doc, _ = self.results()
+        b = doc["requests"][0]
+        self.assertEqual(b["attempts"], 2)
+        self.assertEqual(doc["spent_usd"], 0)
+        self.assertIn("Refused", b["exception"])
+
+
+class ThreadContext(StubCase):
+    def test_ignored_continue_is_flagged_and_left_out(self):
+        self.st.ignore_continue_after = 5                                  # the probe sees a working thread; the arms do not
+        r = self.go()
+        doc, d = self.results()
+        c = [x for x in doc["summary"] if x["arm"] == "C"]
+        self.assertEqual(len(c), 4)
+        for row in c:
+            self.assertEqual(row["context_mismatches"], 2, row)
+            self.assertEqual(row["ok"], 0)
+            self.assertIsNone(row["ttft_median_s"])
+        self.assertIn("CONTEXT MISMATCH", r.stdout)
+        self.assertIn("thread was probably ignored", open(os.path.join(d, "results.md")).read())
+
+    def test_honoured_continue_is_not_flagged(self):
+        self.go()
+        doc, _ = self.results()
+        self.assertTrue(all(x["context_mismatches"] == 0 for x in doc["summary"]))
+
+
+class Endpoint(StubCase):
+    def test_host_must_end_in_api_aws(self):
+        for url in ("https://example.com/anthropic", "https://bedrock-mantle.us-east-1.api.aws.example.com/anthropic"):
+            r = run_cli(["--dry-run", "--endpoint", url], token="")
+            self.assertEqual(r.returncode, 2, url)
+            self.assertIn("refusing to send the key", r.stdout)
+        r = run_cli(["--probe", "--endpoint", "https://example.com/anthropic", "--results-dir", self.res], stdin="SPEND UP TO $5\n")
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("type exactly", r.stdout)
+
+    def test_allow_endpoint_host_names_one_host(self):
+        r = run_cli(["--dry-run", "--endpoint", "https://proxy.example.com/anthropic", "--allow-endpoint-host", "proxy.example.com"], token="")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        r = run_cli(["--dry-run", "--endpoint", "https://other.example.com/anthropic", "--allow-endpoint-host", "proxy.example.com"], token="")
+        self.assertEqual(r.returncode, 2)
+
+    def test_default_endpoint_passes(self):
+        self.assertEqual(run_cli(["--dry-run", "--region", "eu-west-1"], token="").returncode, 0)
+
+
+class Permissions(StubCase):
+    def test_results_are_private(self):
+        self.go("--probe")
+        _, d = self.results()
+        self.assertEqual(os.stat(d).st_mode & 0o077, 0)
+        for fn in os.listdir(d):
+            self.assertEqual(os.stat(os.path.join(d, fn)).st_mode & 0o077, 0, fn)
 
 
 class Interrupt(StubCase):
