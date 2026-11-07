@@ -32,10 +32,25 @@ def _int(x, lo=0, hi=10 ** 9):
     return isinstance(x, int) and not isinstance(x, bool) and lo <= x <= hi
 
 
+def _lstat_ok(path, what):
+    """lstat, never follow: a regular file, owned by you, with no group or other permission bits."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise ResumeError("%s is missing or a dangling link" % what)
+    if stat.S_ISLNK(st.st_mode):
+        raise ResumeError("%s is a symbolic link" % what)
+    if not stat.S_ISREG(st.st_mode):
+        raise ResumeError("%s is not a regular file" % what)
+    if st.st_uid != os.getuid():
+        raise ResumeError("%s is not owned by you" % what)
+    if st.st_mode & 0o077:
+        raise ResumeError("%s is not private (must be 0600)" % what)
+
+
 def _read(path, what):
     try:
-        if os.path.islink(path):
-            raise ResumeError("%s is a symbolic link" % what)
+        _lstat_ok(path, what)
         if os.path.getsize(path) > MAX_BYTES:
             raise ResumeError("%s is over %d MB" % (what, MAX_BYTES >> 20))
         with open(path, encoding="utf-8") as f:
@@ -150,17 +165,18 @@ def _size_state(doc, want, what):
         raise ResumeError("%s: notes is malformed" % what)
     return {"records": kept, "done": done, "checks": checks if checks_done else {}, "checks_done": checks_done, "requests": requests,
             "abandoned_usd": abandoned + dropped, "notes": notes, "chars_per_token": cpt,
-            "claimed_spent": spent, "in_flight": flight, "recorded": sum(r["charged_usd"] for r in recs) + abandoned}
+            "status": doc["status"], "claimed_spent": spent, "in_flight": flight, "recorded": sum(r["charged_usd"] for r in recs) + abandoned}
 
 
-def load(path, sizes, want_for, cap):
+def load(path, sizes, want_for, cap, req_bound=None):
     """Returns {"probe_ok", "effort_used", "spent", "sizes": {tokens: state or None}}. want_for(i, size, effort_used) gives the expected config of size i.
-    Raises ResumeError when anything is off. spent is the highest of the claimed and the recomputed spend, plus any in-flight allowance."""
+    req_bound(size) gives one request's worst case: a size whose status is neither complete nor PARTIAL (a crash or kill) may have a request on the
+    wire that was never recorded, so one bound per such size is added. Raises ResumeError when anything is off. spent is the highest of the claimed and the recomputed spend, plus any in-flight allowance."""
     check_dir(path)
     out = {"probe_ok": False, "effort_used": None, "sizes": {}}
     claimed, flight, recorded = [], 0.0, 0.0
     pp = os.path.join(path, "probe.json")
-    if os.path.exists(pp):
+    if os.path.lexists(pp):
         pr = _read(pp, "probe.json")
         if pr.get("verdict") not in PROBE_VERDICTS:
             raise ResumeError("probe.json: unknown verdict")
@@ -177,15 +193,19 @@ def load(path, sizes, want_for, cap):
     multi = len(sizes) > 1
     for i, size in enumerate(sizes):
         fp = os.path.join(path, str(size), "results.json") if multi else os.path.join(path, "results.json")
-        if not os.path.exists(fp):
+        if multi and os.path.lexists(os.path.dirname(fp)):
+            check_dir(os.path.dirname(fp))
+            if not os.path.lexists(fp):
+                raise ResumeError("%s exists but has no results.json; it cannot be trusted, move it away to run that size again" % os.path.relpath(os.path.dirname(fp), path))
+        elif not os.path.lexists(fp):
             out["sizes"][size] = None
             continue
-        if multi:
-            check_dir(os.path.dirname(fp))
         st = _size_state(_read(fp, "%s" % os.path.relpath(fp, path)), want_for(i, size, out["effort_used"]), os.path.relpath(fp, path))
         out["sizes"][size] = st
         claimed.append(st["claimed_spent"])
         flight += st["in_flight"]
+        if req_bound and not (st["status"] == "complete" or st["status"].startswith("PARTIAL")):
+            flight += req_bound(size)
         recorded += st["recorded"]
     spent = max(claimed + [recorded, 0.0]) + flight
     if not _num(spent, 0.0, cap) or spent >= cap:

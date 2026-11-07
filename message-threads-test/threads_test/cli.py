@@ -190,7 +190,7 @@ def stop_message(kind, reason, spent, outdir, stage=None):
     what = ("the API reported a credit, billing or quota problem" if kind == "billing"
             else "the API did not accept the key (or it may not use this model or beta)")
     L = ["", "STOPPED: %s." % what, "  %s" % reason,
-         "  Nothing more was sent and nothing was retried. Spent so far (counted from the usage fields): $%.5f. The refused request is charged nothing." % spent]
+         "  Nothing more was sent and nothing was retried. Spent so far (counted from the usage fields): $%.5f. The refused request is counted as $0 here (what the account is billed for it is UNKNOWN)." % spent]
     if stage:
         L.append("  Stage reached: size %s tokens, arm %s, repetition %s, turn %s (%s)." % (stage.get("tokens"), stage.get("arm"), stage.get("rep"), stage.get("turn"), stage.get("kind")))
     if outdir:
@@ -310,7 +310,10 @@ def main(argv=None):
                     "margin": a.margin, "retries": a.retries, "checks": a.checks and i == 0, "expiry_test": a.expiry_test and i == 0,
                     "effort": "none" if effort_used == "none" else a.effort, "sizes": sizes}
         try:
-            saved = RS.load(a.resume, sizes, want_for, a.max_usd)
+            def req_bound(size):
+                p = pricing.prompt_upper_bound(size, a.margin, max(a.turns, a.nocache_turns), a.max_tokens)
+                return pricing.request_upper_bound(a.model, p, a.max_tokens)
+            saved = RS.load(a.resume, sizes, want_for, a.max_usd, req_bound)
         except RS.ResumeError as e:
             out("Refusing to resume: %s" % e)
             return 2

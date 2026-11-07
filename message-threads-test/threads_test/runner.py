@@ -122,7 +122,10 @@ class Runner:
                 arm, rep, turn, kind, res.status if res.status else "ERR",
                 "%.0fms" % rec["ttft_ms"] if rec["ttft_ms"] is not None else "-",
                 "%.0fms" % rec["total_ms"] if rec["total_ms"] is not None else "-", charged, self.guard.spent + charged))
-            self.guard.add(charged)
+            try:
+                self.guard.add(charged)
+            finally:
+                self.flush()   # every request is on disk before the next is sent: a crash loses at most the one on the wire
             fatal = res.fatal()
             if fatal:   # credit, billing, quota or auth error: never retried, never replayed, never an "allowed" status
                 raise FatalApiError(*fatal)

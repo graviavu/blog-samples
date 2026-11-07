@@ -33,7 +33,7 @@ def classify(status, error_type, text, retry_after=None):
         return "billing"
     if status == 401 or error_type == "authentication_error":
         return "auth"
-    if status in (400, 403, 429) and _MONEY_WORDS.search(text or ""):
+    if status in (200, 400, 403, 429) and _MONEY_WORDS.search(text or ""):   # 200: an error event inside an open stream
         return "billing"
     if status == 429 and not retry_after:
         return "billing"   # docs: a tier spend-cap 429 has no retry-after header and keeps failing; a plain rate limit is expected to carry one
@@ -81,7 +81,7 @@ class Result:
             msg = str(e.get("message", "")) if isinstance(e, dict) else ""
         elif self.error:
             msg = str(self.error)
-        return kind, R.redact("HTTP %s %s%s" % (self.status, self.error_type or "no error type", (": " + msg[:160]) if msg else ""))
+        return kind, "HTTP %s %s%s" % (self.status, R.redact(self.error_type or "no error type"), (": " + R.redact(msg)[:160]) if msg else "")
 
     @property
     def ok(self):

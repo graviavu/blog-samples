@@ -149,6 +149,29 @@ class StopOnMoney(Base):
         self.assertTrue(doc["status"].startswith("PARTIAL"))
         self.assertGreater(doc["records"][-1]["charged_usd"], 0)   # billing of a cut stream is unknown: charged at its bound, never less
 
+    def test_in_stream_error_event_with_credit_words_but_another_type_stops(self):
+        self.st.actions[:] = [None, None, "stream_credit_words"]
+        r = self.go()
+        self.assertEqual(r.returncode, 5, r.stdout)
+        self.assertEqual(self.st.msg_requests, 3)     # no retry
+        doc, _ = self.results()
+        self.assertTrue(doc["status"].startswith("PARTIAL"))
+
+    def test_classify_money_words_under_http_200(self):
+        self.assertEqual(C.classify(200, "api_error", "Your credit balance is too low"), "billing")
+        self.assertEqual(C.classify(200, "api_error", "purchase more"), "billing")
+        self.assertIsNone(C.classify(200, "overloaded_error", "Overloaded"))
+
+    def test_reason_is_redacted_before_it_is_cut(self):
+        res = C.Result()
+        res.status, res.error_type = 400, "invalid_request_error"
+        res.error = {"error": {"message": "x" * 150 + " credit " + FAKE_KEY}}
+        res.retry_after = "1"
+        C.R.add_secret(FAKE_KEY)
+        kind, reason = res.fatal()
+        self.assertNotIn(FAKE_KEY[:12], reason)
+        self.assertNotIn("sk-ant", reason)
+
     def test_a_plain_rate_limit_with_retry_after_is_still_retried_once_then_aborts_as_before(self):
         self.st.error_after, self.st.error_shape = 2, (429, "rate_limit_error", "slow down", {"retry-after": "1"})
         r = self.go()
@@ -543,6 +566,103 @@ class ResumeRefusals(ResumeBase):
         os.rename(path, other)
         os.symlink(other, path)
         self.refuse(self.d, "symbolic link")
+
+
+class CrashSpend(StubCase):
+    """A kill between two requests must not lose what was already spent."""
+    class Crash(BaseException):
+        pass
+
+    def test_results_are_on_disk_after_every_request_and_resume_bounds_the_one_on_the_wire(self):
+        from threads_test import client as C2
+        from threads_test.runner import Runner
+        cfg = {"model": "claude-haiku-5-5", "tokens": 3000, "turns": 3, "reps": 1, "nocache_turns": 1, "nocache_reps": 1, "reload_reps": 1,
+               "checks": False, "expiry_test": False, "expiry_wait": 1, "max_usd": 10, "max_tokens": 64, "effort": "low", "seed": 1,
+               "margin": 1.25, "chars_per_token": 4.0, "retries": 0, "small_tokens": 2000, "salt_nonce": "t"}
+        real = C2.Client(self.srv.url, FAKE_KEY)
+        crash = self.Crash
+
+        class Dying:
+            n = 0
+
+            def post(self, *a, **k):
+                Dying.n += 1
+                if Dying.n == 3:
+                    raise crash()      # the process dies here; Runner.run()'s finally never gets to flush
+                return real.post(*a, **k)
+
+            def close(self):
+                real.close()
+        rn = Runner(cfg, Dying(), self.res, log=lambda m: None)
+        with self.assertRaises(crash):
+            rn.unit_cache(0)
+        real.close()
+        with open(os.path.join(self.res, "results.json")) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["requests"], 2)
+        self.assertEqual(len(doc["records"]), 2)
+        on_disk = sum(r["charged_usd"] for r in doc["records"])
+        self.assertGreater(on_disk, 0)
+        self.assertAlmostEqual(doc["spent_usd"], on_disk, places=5)
+        self.assertEqual(doc["status"], "running")
+        os.chmod(self.res, 0o700)
+        want = {k: doc["config"].get(k) for k in resume.SAME}
+        bound = 0.123
+        st = resume.load(self.res, [3000], lambda i, s, e: want, 10.0, lambda size: bound)
+        self.assertGreaterEqual(st["spent"], on_disk + bound - 1e-5)    # the request on the wire is not undercounted
+        st2 = resume.load(self.res, [3000], lambda i, s, e: want, 10.0)
+        self.assertAlmostEqual(st2["spent"], on_disk, places=5)
+
+
+class ResumeFileChecks(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.chmod(self.root, 0o700)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load(self):
+        return resume.load(self.root, [2000, 3000], lambda i, s, e: {}, 10.0)
+
+    def test_a_size_dir_without_results_json_is_refused(self):
+        os.mkdir(os.path.join(self.root, "3000"), 0o700)
+        with self.assertRaisesRegex(resume.ResumeError, "no results.json"):
+            self.load()
+
+    def test_a_dangling_symlink_for_results_json_is_refused(self):
+        d = os.path.join(self.root, "3000")
+        os.mkdir(d, 0o700)
+        os.symlink(os.path.join(self.root, "gone.json"), os.path.join(d, "results.json"))
+        with self.assertRaisesRegex(resume.ResumeError, "symbolic link|dangling"):
+            self.load()
+
+    def test_a_dangling_symlink_for_the_size_dir_is_refused(self):
+        os.symlink(os.path.join(self.root, "gone"), os.path.join(self.root, "3000"))
+        with self.assertRaises(resume.ResumeError):
+            self.load()
+
+    def test_a_file_readable_by_others_is_refused(self):
+        p = os.path.join(self.root, "probe.json")
+        with open(p, "w") as f:
+            f.write("{}")
+        os.chmod(p, 0o644)
+        with self.assertRaisesRegex(resume.ResumeError, "0600"):
+            self.load()
+
+    def test_a_symlinked_probe_is_refused(self):
+        other = os.path.join(self.root, "x.json")
+        with open(other, "w") as f:
+            f.write("{}")
+        os.chmod(other, 0o600)
+        os.symlink(other, os.path.join(self.root, "probe.json"))
+        with self.assertRaisesRegex(resume.ResumeError, "symbolic link"):
+            self.load()
+
+    def test_a_missing_size_dir_is_still_fine(self):
+        self.assertEqual(self.load()["sizes"], {2000: None, 3000: None})
 
 
 class ResumeUnits(unittest.TestCase):

@@ -178,8 +178,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             w.flush()
         ev("message_start", {"message": {"id": mid, "type": "message", "role": "assistant", "content": [], "model": conv["model"],
                                          "usage": dict(usage, output_tokens=1)}})
-        if action == "stream_billing":   # an error event inside a 200 stream
-            ev("error", {"error": {"type": "billing_error", "message": "credit balance is too low"}})
+        if action in ("stream_billing", "stream_credit_words"):   # an error event inside a 200 stream
+            ev("error", {"error": {"type": "billing_error" if action == "stream_billing" else "api_error", "message": "credit balance is too low"}})
             w.write(b"0\r\n\r\n")
             w.flush()
             return
