@@ -27,7 +27,13 @@ class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.threads = {}       # id -> {"conv": {...}, "continued": bool, "t": time}
+        self.clock = time.time  # tests can swap in a fake clock
         self.cache = set()
+        self.cache_info = {}    # hash -> [last_used, "5m"|"1h"]
+        self.cache_ttl5 = None  # seconds a 5m entry survives without use (None: forever)
+        self.cache_ttl1h = None
+        self.ignore_1h = False  # treat ttl "1h" as "5m" (a service that does not honour it)
+        self.no_refresh = False # a continue does not restart the thread's idle timer
         self.log = []           # (path, headers dict, body dict) of every request
         self.counter = itertools.count(1)
         self.actions = []       # failure injection queue: "500", "truncate"
@@ -108,6 +114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def prepare(self, st, body, hdrs):
         th = body.get("thread")
+        cc = body.get("cache_control")
+        if cc is not None and cc.get("ttl", "5m") not in ("5m", "1h"):
+            return err(400, "invalid_request_error", "cache_control.ttl must be 5m or 1h")
         if th and BETA not in hdrs.get("anthropic-beta", ""):
             return err(400, "invalid_request_error", "thread requires the beta header")
         if th is None:
@@ -125,7 +134,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return err(400, "invalid_request_error", "continue needs previous_message_id")
         with st.lock:
             t = st.threads.get(prev)
-            if t is None or (st.expire_after is not None and time.time() - t["t"] > st.expire_after):
+            if t is None or (st.expire_after is not None and st.clock() - t["t"] > st.expire_after):
                 return err(404, "not_found_error", "thread not found", "thread_not_found")
             if t["continued"]:
                 return err(400, "invalid_request_error", "already continued", "thread_already_continued")
@@ -135,7 +144,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             t["continued"] = True
             conv = dict(t["conv"])
             conv["messages"] = list(conv["messages"]) + list(body["messages"])
-        return 200, {"conv": conv, "tid": "cont"}
+            t_parent = t.get("t0", t["t"])
+        return 200, {"conv": conv, "tid": "cont", "t_parent": t_parent}
 
     def usage_for(self, st, conv):
         sysd = {"system": conv["system"], "tools": conv["tools"]}
@@ -145,17 +155,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             total += tok(m)
             cum.append(total)
             hashes.append(hashlib.sha256(json.dumps([sysd, msgs[:i + 1]], sort_keys=True).encode()).hexdigest())
-        read = 0
+        read, now = 0, st.clock()
+        ttl = (conv.get("cache_control") or {}).get("ttl", "5m")
+        kind = "1h" if (ttl == "1h" and not st.ignore_1h) else "5m"
         with st.lock:
+            hit = None
             for h, c in zip(hashes, cum):
-                if h in st.cache:
-                    read = c
+                if h in st.cache and self._alive(st, h, now):
+                    read, hit = c, h
+            if hit is not None and hit in st.cache_info:
+                st.cache_info[hit][0] = now   # a read restarts the lifetime
             if conv.get("cache_control"):
                 st.cache.add(hashes[-1])
+                st.cache_info[hashes[-1]] = [now, kind]
         create = (total - read) if conv.get("cache_control") else 0
         s = st.usage_scale
-        return {"input_tokens": (total - read - create) * s, "cache_creation_input_tokens": create * s,
-                "cache_read_input_tokens": read * s}, total - read
+        u = {"input_tokens": (total - read - create) * s, "cache_creation_input_tokens": create * s,
+             "cache_read_input_tokens": read * s}
+        if conv.get("cache_control"):
+            u["cache_creation"] = {"ephemeral_5m_input_tokens": create * s if kind == "5m" else 0,
+                                   "ephemeral_1h_input_tokens": create * s if kind == "1h" else 0}
+        return u, total - read
+
+    @staticmethod
+    def _alive(st, h, now):
+        info = st.cache_info.get(h)
+        if info is None:
+            return True
+        ttl = st.cache_ttl1h if info[1] == "1h" else st.cache_ttl5
+        return ttl is None or now - info[0] <= ttl
 
     def stream(self, st, prep, action):
         conv = prep["conv"]
@@ -201,7 +229,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c2 = dict(conv)
             c2["messages"] = list(conv["messages"]) + [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
             with st.lock:
-                st.threads[mid] = {"conv": c2, "continued": False, "t": time.time()}
+                now = st.clock()
+                t0 = prep.get("t_parent") if st.no_refresh and prep.get("t_parent") else now
+                st.threads[mid] = {"conv": c2, "continued": False, "t": t0 if st.no_refresh else now, "t0": t0}
 
 
 class Server(http.server.ThreadingHTTPServer):

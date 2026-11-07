@@ -48,6 +48,7 @@ class Result:
         self.ttft = None
         self.total = None
         self.usage = {}
+        self.cache_creation = {}  # usage.cache_creation split (ephemeral_5m_input_tokens, ephemeral_1h_input_tokens) when reported
         self.stop_reason = None
         self.text = ""
         self.first_kind = None
@@ -196,6 +197,12 @@ class Client:
                 res.total = time.perf_counter() - t0
         return res
 
+    @staticmethod
+    def _merge_cc(res, usage):
+        cc = (usage or {}).get("cache_creation")
+        if isinstance(cc, dict):
+            res.cache_creation.update({k: v for k, v in cc.items() if isinstance(v, int)})
+
     def _read_stream(self, resp, res, t0):
         ev = None
         while True:
@@ -217,6 +224,7 @@ class Client:
                 m = d.get("message", {})
                 res.response_id = m.get("id")
                 res.usage.update({k: v for k, v in (m.get("usage") or {}).items() if isinstance(v, int)})
+                self._merge_cc(res, m.get("usage"))
             elif t == "content_block_delta":
                 delta = d.get("delta", {})
                 if res.ttft is None:
@@ -226,6 +234,7 @@ class Client:
                     res.text += delta.get("text", "")
             elif t == "message_delta":
                 res.usage.update({k: v for k, v in (d.get("usage") or {}).items() if isinstance(v, int)})
+                self._merge_cc(res, d.get("usage"))
                 res.stop_reason = (d.get("delta") or {}).get("stop_reason", res.stop_reason)
             elif t == "message_stop":
                 res.complete = True
