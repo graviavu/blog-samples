@@ -154,6 +154,19 @@ def render_md(doc):
     return "\n".join(L) + "\n"
 
 
+def private_dir(path):
+    """Create a results directory readable by the owner only (0700)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _private_write(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(text)
+
+
 def write_outputs(outdir, doc):
     """Atomic write so an interrupt never leaves a half file; temp files are removed."""
     tmps = []
@@ -161,8 +174,7 @@ def write_outputs(outdir, doc):
         for name, text in (("results.json", json.dumps(doc, indent=2, sort_keys=True) + "\n"), ("results.md", render_md(doc))):
             tmp = os.path.join(outdir, name + ".tmp")
             tmps.append(tmp)
-            with open(tmp, "w") as f:
-                f.write(text)
+            _private_write(tmp, text)
             os.replace(tmp, os.path.join(outdir, name))
     finally:
         for t in tmps:
@@ -196,8 +208,7 @@ def render_sizes_md(entries, cfg, status, spent):
 def write_text(outdir, name, text):
     tmp = os.path.join(outdir, name + ".tmp")
     try:
-        with open(tmp, "w") as f:
-            f.write(text)
+        _private_write(tmp, text)
         os.replace(tmp, os.path.join(outdir, name))
     finally:
         if os.path.exists(tmp):

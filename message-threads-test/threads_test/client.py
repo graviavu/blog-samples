@@ -42,18 +42,30 @@ def is_loopback(host):
     return host in ("127.0.0.1", "localhost", "::1")
 
 
-def parse_base(url):
+OFFICIAL_HOST = "api.anthropic.com"
+
+
+def parse_base(url, allow_host=None):
+    """Only https://api.anthropic.com or a loopback stub is accepted. Any other host needs allow_host
+    (--base-url-host) to name it exactly: the API key goes to whatever host this names."""
     u = urllib.parse.urlparse(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("bad base URL")
+    if u.username is not None or u.password is not None:
+        raise ValueError("credentials inside the base URL are not accepted")
+    host = u.hostname.lower()
+    named = allow_host is not None and host == allow_host.strip().lower()
+    if not (is_loopback(host) or (host == OFFICIAL_HOST and u.scheme == "https") or named):
+        raise ValueError("host %r is not api.anthropic.com or a loopback stub; the API key would be sent there. "
+                         "If you mean it, pass --base-url-host %s" % (host, host))
     if u.scheme == "http" and not is_loopback(u.hostname):
         raise ValueError("refusing plain http to a non-loopback host: the key would travel unencrypted")
     return u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80)
 
 
 class Client:
-    def __init__(self, base_url, key, timeout=600):
-        self.scheme, self.host, self.port = parse_base(base_url)
+    def __init__(self, base_url, key, timeout=600, allow_host=None):
+        self.scheme, self.host, self.port = parse_base(base_url, allow_host)
         self.key = key
         self.timeout = timeout
         R.add_secret(key)

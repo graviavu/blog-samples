@@ -85,7 +85,7 @@ below all read the same. What the re-read corrected or added:
 
 ## Default model choice
 
-`claude-haiku-5-5`: cheapest listed model, and the docs say threads are beta on every model. Note the 5x per-token step above 100,000 tokens: at `--tokens 100000` the prompt is slightly over the threshold, so the higher prices apply. Sonnet 5.5 (input 2.00, output 10.00, cache write 2.50) is 20x Haiku's price per token below 100,000 tokens (0.10, 0.50, 0.125) and 4x above it (0.50, 2.50, 0.625). Opus 5.5 is 2x Sonnet; Fable 5.1 is 5x Sonnet on input and output.
+`claude-haiku-5-5`: cheapest listed model, and the docs say threads are beta on every model. Note the 5x per-token step above 100,000 tokens: at `--tokens 100000` it is UNKNOWN which side of the 100,000-token step the prompt lands on (the characters-per-token ratio is a guess; `--count-tokens` measures it). The cost bound assumes the dearer side, the over-100K prices. Sonnet 5.5 (input 2.00, output 10.00, cache write 2.50) is 20x Haiku's price per token below 100,000 tokens (0.10, 0.50, 0.125) and 4x above it (0.50, 2.50, 0.625). Opus 5.5 is 2x Sonnet; Fable 5.1 is 5x Sonnet on input and output.
 
 ## Effort and thinking
 
@@ -108,5 +108,7 @@ below all read the same. What the re-read corrected or added:
 
 - Everything above comes from the docs text (re-read 2026-11-07). No request was made to the API while writing or re-checking this sample.
 - UNKNOWN: whether `tool_choice: {"type": "none"}` together with `tools` on a thread create (what the history uses) is accepted on Haiku 5.5. The docs list `tool_choice` as a fixed field and do not discuss the `none` value. The stub accepts it; the real API has not been asked.
-- UNKNOWN: the real size of the synthetic history in tokens (the ratio of characters per token is a guess of 3.2). It decides whether a 100K history prices at Haiku's up-to-100K tier or the over-100K tier, a 5x difference per token. `--count-tokens` measures it for free before you confirm.
+- UNKNOWN: the real size of the synthetic history in tokens (the ratio of characters per token is UNKNOWN; 3.2 is a guess). It decides whether a 100K history prices at Haiku's up-to-100K tier or the over-100K tier, a 5x difference per token. `--count-tokens` measures it for free before you confirm.
 - The stub server in `tests/` is written from these notes; the real API can differ in details (event ordering, error bodies, usage in `message_start`).
+- UNKNOWN: which side of the 100K price step the 100K-token history lands on. The cost bound assumes the dearer side (over 100,000 tokens) for it.
+- UNKNOWN: whether the API would accept a second continue of the same message id. The check `check_double_continue` expects 400 `thread_already_continued`; if it were accepted it would cost one request outside the bound (about $0.004 at 20K tokens).

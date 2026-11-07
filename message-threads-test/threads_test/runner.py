@@ -1,4 +1,5 @@
 """The four arms, the behaviour checks, the spend guard. Sequential, interleaved by repetition."""
+import json
 import platform
 import sys
 import time
@@ -72,12 +73,17 @@ class Runner:
         p = pricing.prompt_upper_bound(tokens, c["margin"], max(c["turns"], c["nocache_turns"]), c["max_tokens"])
         return pricing.request_upper_bound(c["model"], p, c["max_tokens"])
 
+    def body_ub(self, body):
+        """Worst case taken from the request actually built: at most one token per 2 bytes of the JSON, plus 1000."""
+        c = self.cfg
+        return pricing.request_upper_bound(c["model"], len(json.dumps(body)) // 2 + 1000, c["max_tokens"])
+
     def send(self, arm, rep, turn, kind, body, thread=False, allow=(), small=False):
         c = self.cfg
         attempt = 0
         while True:
             attempt += 1
-            projected = self.ub(small)
+            projected = max(self.ub(small), self.body_ub(body))   # one request can never cross the cap
             self.guard.check(projected)
             self.in_flight = projected   # worst case of the request on the wire, known before it is sent
             res = self.client.post(body, thread=thread)
@@ -85,7 +91,7 @@ class Runner:
             self.n_requests += 1
             parts = pricing.cost(c["model"], res.usage) if res.usage else {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "total": 0.0}
             charged = parts["total"]
-            if (res.status == 200 and not res.complete) or (res.status is None and res.exception):
+            if (res.status == 200 and not res.usage) or (res.status == 200 and not res.complete) or (res.status is None and res.exception):
                 charged = max(charged, projected)  # unknown billing for a cut stream: charge the bound
             rec = {"arm": arm, "rep": rep, "turn": turn, "kind": kind, "attempt": attempt, "status": res.status,
                    "complete": res.complete, "error_code": res.error_code,

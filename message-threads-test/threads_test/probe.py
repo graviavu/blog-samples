@@ -73,16 +73,21 @@ def _body(model, text, effort, thread=None):
     return b
 
 
-def run(client, guard, model, effort, log):
-    """Returns the probe record (also what goes to probe.json). guard: a runner.Guard shared with the run."""
+def run(client, guard, model, effort, log, rec=None):
+    """Returns the probe record (also what goes to probe.json). guard: a runner.Guard shared with the run.
+    rec: optional dict filled in place, so the caller can write the partial record if this is interrupted."""
+    if rec is None:
+        rec = {}
     per_request = pricing.request_upper_bound(model, PROBE_PROMPT_UB, PROBE_MAX_TOKENS)
 
     def send(body, thread, label):
         guard.check(per_request)
+        rec["in_flight_worst_case_usd"] = round(per_request, 6)   # on the wire until the response is charged
         res = client.post(body, thread=thread)
+        rec["in_flight_worst_case_usd"] = 0.0
         parts = pricing.cost(model, res.usage) if res.usage else {"total": 0.0}
         charged = parts["total"]
-        if (res.status == 200 and not res.complete) or (res.status is None and res.exception):
+        if (res.status == 200 and not res.usage) or (res.status == 200 and not res.complete) or (res.status is None and res.exception):
             charged = max(charged, per_request)   # unknown billing for a cut stream: charge the bound
         guard.add(charged)
         log("  probe %-9s status %s%s cost $%.5f" % (label, res.status if res.status else "ERR",
@@ -90,7 +95,7 @@ def run(client, guard, model, effort, log):
         return res
 
     word = "PELICAN-%d" % random.SystemRandom().randint(1000, 9999)
-    rec = {"model": model, "effort_used": effort}
+    rec.update({"model": model, "effort_used": effort, "verdict": "INTERRUPTED", "reason": "stopped before the probe finished"})
     baseline = send(_body(model, "Reply with the single word OK.", effort), False, "plain")
     if not baseline.ok and effort != "none" and _client_error(baseline) and baseline.status not in (401, 403):
         rec["effort_rejected"] = _brief(baseline)

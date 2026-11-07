@@ -7,7 +7,7 @@ your own API key and shows the saving of each against the worst case, a full res
 
 The default run uses 20K and 100K tokens of history, which shows how latency grows with context but does not reach the 500K to 1M range of that claim; the reduced 500K command under Cost says how to get near it.
 
-It is a measurement only. It creates nothing in your account except short-lived threads that Anthropic deletes on its own.
+It is a measurement only. It creates nothing in your account except short-lived threads that Anthropic deletes on its own (best effort, within 1 hour of last use).
 
 ## The four arms
 
@@ -37,11 +37,11 @@ Exact status codes and redacted error bodies go in the results.
 
 3. `./run-test.sh --run` repeats the probe, stops there unless it says ACCEPTED, and then runs the arms at **20K and 100K tokens of history**, smallest first, so you can see latency against context size. `--skip-probe` leaves the repeat out if you have just seen ACCEPTED.
 
-The probe writes `probe.json` (no key, no ids). Paid modes ask you to type `SPEND UP TO $<cap>`. The probe asks for it too, like the Bedrock sample.
+The probe writes `probe.json` (no key; ids matching known patterns are redacted). Paid modes ask you to type `SPEND UP TO $<cap>`. The probe asks for it too, like the Bedrock sample.
 
 ## Cost and the spend guard
 
-You pay with your own key. The default model is `claude-haiku-5-5`, the cheapest priced model in `DOCS-NOTES.md`. **Haiku 5.5 charges 5x per token for prompts over 100,000 tokens.** The 100K history can land either side of that line (the characters-per-token ratio is a guess; `--count-tokens` measures it for free), and the bound assumes the dearer side. Sonnet 5.5 (`--model claude-sonnet-5-5`) lists at $2 per million input tokens and $10 output, against Haiku's $0.50 and $2.50 above 100K tokens; Opus 5.5 and Fable 5.1 cost more again. Check the pricing page before you run.
+You pay with your own key. The default model is `claude-haiku-5-5`, the cheapest priced model in `DOCS-NOTES.md`. **Haiku 5.5 charges 5x per token for prompts over 100,000 tokens.** The 100K history can land either side of that line (UNKNOWN: the characters-per-token ratio of 3.2 is a guess; `--count-tokens` measures it for free), and the bound assumes the dearer side. Run `--count-tokens` on your first `--run`. Sonnet 5.5 (`--model claude-sonnet-5-5`) lists at $2 per million input tokens and $10 output, against Haiku's $0.50 and $2.50 above 100K tokens; Opus 5.5 and Fable 5.1 cost more again. Check the pricing page before you run.
 
 **Default plan: planned upper bound $4.44, cap $5.** That is the worst case with every request retried once, one full-size replay for every thread continue, and the probe. Typical cost is about $0.58 (modelled, not measured: the cache works as documented, the 100K prompt prices at the over-100K tier, replies are short). If the 100K history lands under 100,000 tokens, the 100K part is roughly 5x cheaper. Per size: the 20K part is under $0.25 of the bound, the 100K part is $4.23.
 
@@ -49,9 +49,9 @@ Default flags: sizes 20000 and 100000; arms 2 to 4 use `--reps 2 --turns 3` (so 
 
 - A dry run prints the plan, the number of requests per arm and size, the **planned upper bound** in dollars and the modelled typical cost. No network call, no file.
 - The bound includes the retries and the replays. It assumes every planned request is attempted `1 + --retries` times (default 1 retry), adds one full-size replay for every arm 3 continue, bills every prompt token at the dearer of the input and cache-write price (no cache-read credit), assumes every reply hits `--max-tokens`, and adds the probe. Real spend is far lower: a cache read costs a fraction of a write.
-- `--max-usd` (default **5**) must be a finite number above 0 and at most 10: a larger value is rejected and there is no override flag. If the bound is over the cap, a paid run refuses to start. During the run the possible cost of the next request is checked before it is sent, the actual cost from the usage fields is added after each response, and the run stops cleanly when the total passes the cap. One cap covers the probe and all sizes together. A stream that is cut off is charged at its bound, because billing for it is unknown. The request on the wire at a Ctrl-C is reported at its worst case next to the spend.
-- The history is sized with `--chars-per-token` (default 3.2, on the low side). The first full-size answer of each size is checked: if the prompt is bigger than the size times `--token-margin` (1.25), the bound no longer holds and the run stops. With `--count-tokens` (opt-in; needs the key, free per the docs, once per size, never in a dry run or the self-test) the history is counted before the confirmation and the run refuses to start if it is too big.
-- Before any paid call you must type `SPEND UP TO $<cap>` exactly, for example `SPEND UP TO $5`. Anything else makes no call. There is no `--yes`.
+- `--max-usd` (default **5**) must be a finite number above 0 and at most 10: a larger value is rejected and there is no override flag. If the bound is over the cap, a paid run refuses to start. During the run the possible cost of the next request is checked before it is sent, the actual cost from the usage fields is added after each response, and the run stops cleanly when the total passes the cap. The request check uses the larger of the planned bound and a bound taken from the size of the request body actually built, so one request cannot cross the cap. **The cap holds only with `--token-margin` and `--chars-per-token` at their defaults** (they are validated: margin at least 1.0, chars per token 2.0 to 4.5; other values change the bound). A 200 reply with no usage block is charged at its worst case. One request is outside the bound: if the API accepted the second continue of the same id (`check_double_continue`), it could cost one more request, about $0.004 at 20K tokens. One cap covers the probe and all sizes together. A stream that is cut off is charged at its bound, because billing for it is unknown. The request on the wire at a Ctrl-C is reported at its worst case next to the spend.
+- The history is sized with `--chars-per-token` (default 3.2, UNKNOWN real ratio, a guess on the low side). The first full-size answer of each size is checked: if the prompt is bigger than the size times `--token-margin` (1.25), the bound no longer holds and the run stops. With `--count-tokens` (opt-in; needs the key, free per the docs, once per size, never in a dry run or the self-test) the history is counted before the confirmation and the run refuses to start if it is too big.
+- Before any paid call you must type `SPEND UP TO $<cap>` exactly, for example `SPEND UP TO $5`. Anything else makes no call. There is no `--yes`, and the phrase must be typed at a terminal: piped or redirected stdin is refused.
 - **Raising the size.** `--tokens N` runs one size instead of the two defaults. A bigger size costs about linearly more. The default 5-dollar cap refuses it, so you raise the cap on purpose (up to the ceiling of 10) and type the new phrase. To get near the vendor claim of 500K to 1M tokens under the ceiling, use this reduced run. Its planned upper bound is **$7.87**:
 
 ```bash
@@ -74,12 +74,12 @@ export ANTHROPIC_API_KEY=...                 # your own key
 ./run-test.sh --run --expiry-test            # adds the 5-minute idle check at 20K (slow, cheap)
 ```
 
-`ANTHROPIC_BASE_URL` overrides the endpoint (the tests point it at a local stub). Plain `http` is refused unless the host is loopback.
+`ANTHROPIC_BASE_URL` overrides the endpoint (the tests point it at a local stub). Only `https://api.anthropic.com` or a loopback stub is accepted; any other host is refused unless you name it exactly with `--base-url-host` (the key is sent there). Plain `http` is refused unless the host is loopback.
 Ctrl-C or an error flushes the partial results, prints the spend so far and removes its temp files. There are no cloud resources to tear down.
 
 ## What the output means
 
-`results/<timestamp>/` holds `probe.json`, then one folder per size (`20000/`, `100000/`) with `results.json` (every request: status, TTFT, total time, usage, cost split) and `results.md` (the summary), and a top-level `results.md` with TTFT and cost by context size side by side. `spent_usd` in each size's file is cumulative for the whole run. With `--tokens N` there is one size and its files sit directly in the timestamp folder. No key, no account or org id, no request ids and no message ids are written.
+`results/<timestamp>/` holds `probe.json`, then one folder per size (`20000/`, `100000/`) with `results.json` (every request: status, TTFT, total time, usage, cost split) and `results.md` (the summary), and a top-level `results.md` with TTFT and cost by context size side by side. `spent_usd` in each size's file is cumulative for the whole run. With `--tokens N` there is one size and its files sit directly in the timestamp folder. No key is written, and ids matching known patterns are redacted. The results folders are created 0700 and the files 0600.
 
 | Column | Meaning |
 |---|---|

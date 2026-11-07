@@ -9,7 +9,7 @@ import time
 import unittest
 
 from threads_test import pricing, probe
-from tests.helpers import CLI, FAKE_KEY, SMALL, StubCase, env_for, run_cli
+from tests.helpers import CLI, FAKE_KEY, SMALL, StubCase, env_for, run_cli, spawn_tty
 
 
 class DryRun(StubCase):
@@ -53,11 +53,27 @@ class DryRun(StubCase):
 
 class Confirmation(StubCase):
     def test_wrong_phrase_no_calls(self):
-        for bad in ("yes\n", "spend up to $10\n", "SPEND UP TO $5\n", "SPEND UP TO $10 \n", "\n", ""):
+        for bad in ("yes\n", "spend up to $10\n", "SPEND UP TO $5\n", "SPEND UP TO $10 \n", "\n"):
             r = self.go(confirm=bad)
             self.assertEqual(r.returncode, 2, bad)
             self.assertEqual(len(self.st.log), 0, bad)
             self.assertIn("Not confirmed", r.stdout)
+
+    def test_piped_stdin_is_refused_even_with_the_right_phrase(self):
+        r = run_cli(["--run", "--skip-probe"] + SMALL + ["--max-usd", "10", "--results-dir", self.res], url=self.srv.url,
+                    stdin="SPEND UP TO $10\n", pipe_stdin=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("Refusing: the phrase must be typed at a terminal.", r.stdout)
+        self.assertEqual(len(self.st.log), 0)
+        self.assertEqual(os.listdir(self.res), [])
+
+    def test_piped_stdin_is_refused_for_probe_and_before_count_tokens(self):
+        r = run_cli(["--probe", "--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n", pipe_stdin=True)
+        self.assertEqual(r.returncode, 2)
+        r = run_cli(["--run", "--count-tokens"] + SMALL + ["--max-usd", "10", "--results-dir", self.res], url=self.srv.url,
+                    stdin="SPEND UP TO $10\n", pipe_stdin=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(len(self.st.log), 0)
 
     def test_missing_key_stops_before_the_prompt(self):
         r = self.go(key="")
@@ -274,14 +290,130 @@ class SpendGuard(StubCase):
         self.assertEqual(len(self.st.log), 0)
 
 
+class Hardening(StubCase):
+    """Review fixes M1, M3, L1, L2, L5."""
+
+    def test_m1_margin_and_chars_per_token_are_validated(self):
+        for flag, bad in (("--token-margin", "0.99"), ("--token-margin", "0"), ("--token-margin", "nan"), ("--token-margin", "inf"),
+                          ("--chars-per-token", "1.9"), ("--chars-per-token", "4.6"), ("--chars-per-token", "9"), ("--chars-per-token", "nan")):
+            r = run_cli(["--dry-run", flag, bad], key="")
+            self.assertEqual(r.returncode, 2, (flag, bad, r.stdout))
+            self.assertIn("error:", r.stdout)
+        for flag, ok in (("--token-margin", "1.0"), ("--token-margin", "1.25"), ("--chars-per-token", "2.0"), ("--chars-per-token", "4.5")):
+            self.assertEqual(run_cli(["--dry-run", flag, ok], key="").returncode, 0, (flag, ok))
+
+    def runner(self, **over):
+        from threads_test import client as C
+        from threads_test.runner import Runner
+        cfg = {"model": "claude-haiku-5-5", "tokens": 3000, "turns": 1, "reps": 1, "nocache_turns": 1, "nocache_reps": 1, "reload_reps": 1,
+               "checks": False, "expiry_test": False, "expiry_wait": 1, "max_usd": 10, "max_tokens": 64, "effort": "low", "seed": 1,
+               "margin": 1.25, "chars_per_token": 4.0, "retries": 0, "small_tokens": 2000, "salt_nonce": "t"}
+        cfg.update(over)
+        return Runner(cfg, C.Client(self.srv.url, FAKE_KEY), self.res, log=lambda m: None)
+
+    def test_m1_guard_uses_the_size_of_the_request_actually_built(self):
+        from threads_test.runner import SpendCap
+        rn = self.runner(max_usd=0.05)
+        big = {"model": "claude-haiku-5-5", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "x" * 2_000_000}]}
+        self.assertLess(rn.ub(False), 0.05)          # the configured size alone would pass the guard
+        self.assertGreater(rn.body_ub(big), 0.05)    # the real body would not
+        with self.assertRaises(SpendCap):
+            rn.send(1, 0, 0, "turn", big)
+        self.assertEqual(len(self.st.log), 0)
+
+    def test_m3_only_the_official_host_or_loopback(self):
+        for url in ("https://example.com", "https://api.anthropic.com.evil.example", "https://api.anthropic.com@evil.example",
+                    "http://api.anthropic.com", "https://evil.example:8443"):
+            for extra in ([], ["--count-tokens"]):
+                r = run_cli(["--dry-run"] + extra, url=url, key="")
+                self.assertEqual(r.returncode, 2, (url, r.stdout))
+                self.assertIn("ANTHROPIC_BASE_URL", r.stdout)
+        r = run_cli(["--run", "--count-tokens"] + SMALL + ["--max-usd", "10", "--results-dir", self.res], url="https://example.com", stdin="SPEND UP TO $10\n")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(os.listdir(self.res), [])
+
+    def test_m3_allowed_hosts_and_the_explicit_flag(self):
+        for url in ("https://api.anthropic.com", "http://127.0.0.1:9", "http://localhost:9"):
+            self.assertEqual(run_cli(["--dry-run"], url=url, key="").returncode, 0, url)
+        self.assertEqual(run_cli(["--dry-run", "--base-url-host", "example.com"], url="https://example.com", key="").returncode, 0)
+        self.assertEqual(run_cli(["--dry-run", "--base-url-host", "other.example"], url="https://example.com", key="").returncode, 2)
+        self.assertEqual(run_cli(["--dry-run", "--base-url-host", "example.com"], url="http://example.com", key="").returncode, 2)  # still no plain http
+
+    def test_l1_a_complete_200_without_usage_is_charged_the_projected_worst_case(self):
+        from threads_test import client as C
+        rn = self.runner()
+
+        class NoUsage:
+            def post(self, body, thread=False):
+                r = C.Result()
+                r.status, r.complete, r.text, r.response_id = 200, True, "ok", "msg_x"
+                return r
+
+            def close(self):
+                pass
+        rn.client = NoUsage()
+        body = rn.body(list(rn.history), system="s")
+        rn.send(1, 0, 0, "turn", body)
+        self.assertGreater(rn.records[0]["charged_usd"], 0)
+        self.assertAlmostEqual(rn.records[0]["charged_usd"], max(rn.ub(False), rn.body_ub(body)))
+        self.assertAlmostEqual(rn.guard.spent, rn.records[0]["charged_usd"])
+
+    def test_l1_probe_charges_a_200_without_usage(self):
+        from threads_test import client as C
+        from threads_test.runner import Guard
+
+        class NoUsage:
+            def post(self, body, thread=False):
+                r = C.Result()
+                r.status, r.complete, r.text, r.response_id = 200, True, "OK", "msg_x"
+                return r
+        g = Guard(5)
+        probe.run(NoUsage(), g, "claude-haiku-5-5", "low", lambda m: None, {})
+        self.assertGreater(g.spent, 0)
+
+    def test_l2_ctrl_c_during_the_probe_prints_spend_and_writes_partial_probe_json(self):
+        self.st.base_delay = 1.0
+        p, master = spawn_tty(["--probe", "--results-dir", self.res], self.srv.url, text="SPEND UP TO $5\n")
+        self.addCleanup(os.close, master)
+        deadline = time.time() + 30
+        while len(self.st.log) < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        p.send_signal(signal.SIGINT)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 130, out + err)
+        self.assertIn("Probe stopped", out)
+        self.assertIn("Spent $", out)
+        self.assertIn("on the wire may add up to", out)
+        d = os.path.join(self.res, os.listdir(self.res)[0])
+        with open(os.path.join(d, "probe.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["verdict"], "INTERRUPTED")
+        self.assertGreater(rec["in_flight_worst_case_usd"], 0)
+        self.assertNotIn(FAKE_KEY, out + err + self.all_text())
+
+    def test_l5_results_are_private(self):
+        old = os.umask(0)
+        try:
+            r = self.go(["--results-dir", os.path.join(self.res, "fresh")])
+        finally:
+            os.umask(old)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        root = os.path.join(self.res, "fresh")
+        seen = 0
+        for dirpath, dirs, files in os.walk(root):
+            self.assertEqual(os.stat(dirpath).st_mode & 0o777, 0o700, dirpath)
+            for fn in files:
+                self.assertEqual(os.stat(os.path.join(dirpath, fn)).st_mode & 0o777, 0o600, fn)
+                seen += 1
+        self.assertGreaterEqual(seen, 2)
+
+
 class Interrupt(StubCase):
     def test_sigint_flushes_partial_results_and_prints_spend(self):
         self.st.base_delay = 0.4
         env = env_for(self.srv.url)
-        p = subprocess.Popen([sys.executable, "-I", CLI, "--run", "--skip-probe"] + SMALL + ["--results-dir", self.res], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-        p.stdin.write("SPEND UP TO $5\n")   # the default cap
-        p.stdin.flush()
+        p, master = spawn_tty(["--run", "--skip-probe"] + SMALL + ["--results-dir", self.res], self.srv.url, text="SPEND UP TO $5\n")   # the default cap
+        self.addCleanup(os.close, master)
         deadline = time.time() + 30
         while len(self.st.log) < 3 and time.time() < deadline:
             time.sleep(0.05)

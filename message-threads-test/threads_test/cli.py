@@ -76,7 +76,8 @@ def parser():
     p.add_argument("--effort", default="low", help="output_config.effort on every request; 'none' leaves it out (default low)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--token-margin", dest="margin", type=float, default=1.25, help="assumed worst-case tokens / --tokens (default 1.25)")
-    p.add_argument("--chars-per-token", type=float, default=3.2, help="characters per token used to size the history (default 3.2, on the low side to keep the prompt under --tokens)")
+    p.add_argument("--chars-per-token", type=float, default=3.2, help="characters per token used to size the history, 2.0 to 4.5 (default 3.2; the real ratio of this history is UNKNOWN, 3.2 is a guess on the low side; --count-tokens measures it)")
+    p.add_argument("--base-url-host", default=None, help="the only way to send the key to a host other than api.anthropic.com or loopback: name that host exactly (ANTHROPIC_BASE_URL must use it)")
     p.add_argument("--retries", type=int, default=1, help="retries per failed request (default 1)")
     p.add_argument("--count-tokens", action="store_true", help="with --run: count the history once with the free count_tokens endpoint before the confirmation (needs the key; not used in dry runs)")
     p.add_argument("--timeout", type=int, default=600)
@@ -139,7 +140,7 @@ def count_check(a, size, base, key):
     hist = convo.build_history(a.seed, size, a.chars_per_token)
     body = {"model": a.model, "system": convo.system_text("0" * 24), "tools": convo.TOOLS, "messages": hist}
     try:
-        n = C.Client(base, key, a.timeout).count_tokens(body)
+        n = C.Client(base, key, a.timeout, a.base_url_host).count_tokens(body)
     except ValueError as e:
         return "error: %s" % e
     out("count_tokens (free, counted once): the %d-token history is %d tokens (ratio %.2f)." % (size, n, n / size))
@@ -153,7 +154,17 @@ def write_json(outdir, name, obj):
 
 
 def run_probe(client, guard, a, outdir):
-    rec = probe.run(client, guard, a.probe_model, a.effort, out)
+    rec = {}
+    try:
+        probe.run(client, guard, a.probe_model, a.effort, out, rec)
+    except BaseException as e:   # Ctrl-C, SIGTERM or the spend cap: keep what the probe knows
+        rec["reason"] = "stopped early (%s)" % type(e).__name__
+        rec["spent_usd"] = round(guard.spent, 6)
+        write_json(outdir, "probe.json", rec)
+        wire = rec.get("in_flight_worst_case_usd", 0.0)
+        out("Probe stopped (%s). Spent $%.5f.%s Partial probe.json written." % (
+            type(e).__name__, guard.spent, " The request on the wire may add up to $%.5f." % wire if wire else ""))
+        raise
     out("PROBE VERDICT: %s  (%s)" % (rec["verdict"], rec["reason"]))
     if rec["verdict"] == probe.REJECTED:
         out("Threads were refused for this key or organization. The status and code above are the evidence; nothing more to run.")
@@ -173,6 +184,12 @@ def main(argv=None):
     if a.max_usd <= 0 or min(sizes + [a.turns, a.reps, a.nocache_turns, a.nocache_reps, a.max_tokens]) < 1 or a.reload_reps < 0 or a.retries < 0:
         out("error: counts and sizes must be positive")
         return 2
+    if not (math.isfinite(a.margin) and a.margin >= 1.0):
+        out("error: --token-margin must be a finite number of at least 1.0 (below 1.0 the cost bound is meaningless)")
+        return 2
+    if not (math.isfinite(a.chars_per_token) and 2.0 <= a.chars_per_token <= 4.5):
+        out("error: --chars-per-token must be between 2.0 and 4.5 (above 4.5 the history may exceed the size the bound assumes)")
+        return 2
     if a.effort not in ("none", "low", "medium", "high", "xhigh", "max"):
         out("error: --effort must be none, low, medium, high, xhigh or max")
         return 2
@@ -184,7 +201,7 @@ def main(argv=None):
         return 2
     base = os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_BASE)
     try:
-        C.parse_base(base)
+        C.parse_base(base, a.base_url_host)
     except ValueError as e:
         out("error: ANTHROPIC_BASE_URL: %s" % e)
         return 2
@@ -203,6 +220,9 @@ def main(argv=None):
         out("error: set ANTHROPIC_API_KEY in your environment (it is never printed or stored)")
         return 2
     R.add_secret(key)
+    if not sys.stdin.isatty():
+        out("Refusing: the phrase must be typed at a terminal.")
+        return 2
     if a.count_tokens and mode == "run":
         for size in sizes:
             msg = count_check(a, size, base, key)
@@ -219,13 +239,14 @@ def main(argv=None):
         return 2
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     outdir = os.path.join(a.results_dir, stamp)
-    os.makedirs(outdir, exist_ok=True)
+    report.private_dir(a.results_dir)
+    report.private_dir(outdir)
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, on_term)
-    client = C.Client(base, key, a.timeout)
+    client = C.Client(base, key, a.timeout, a.base_url_host)
     guard = Guard(a.max_usd)
     out("Results go to %s" % outdir)
     if a.skip_probe and mode == "run":
@@ -245,7 +266,7 @@ def main(argv=None):
     code, entries = 0, []
     for i, size in enumerate(sizes):
         sub = os.path.join(outdir, str(size)) if multi else outdir
-        os.makedirs(sub, exist_ok=True)
+        report.private_dir(sub)
         cfg = {"model": a.model, "tokens": size, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
                "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "checks": a.checks and i == 0,
                "expiry_test": a.expiry_test and i == 0, "expiry_wait": a.expiry_wait, "max_usd": a.max_usd,
@@ -262,7 +283,7 @@ def main(argv=None):
             report.write_text(outdir, "results.md", report.render_sizes_md(entries, cfg, runner.status if code else "complete so far" if i + 1 < len(sizes) else "complete", guard.spent))
         if code:
             break
-    out("Wrote results.json and results.md (not the key, no ids) under %s." % outdir)
+    out("Wrote results.json and results.md (not the key; ids matching known patterns are redacted) under %s." % outdir)
     return code
 
 
