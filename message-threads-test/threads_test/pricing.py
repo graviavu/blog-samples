@@ -38,11 +38,32 @@ def cost(model, usage):
     return parts
 
 
-def request_upper_bound(model, prompt_tokens_ub, max_tokens):
+def cost_ttl(model, usage, creation_1h=None, asked_1h=False):
+    """Like cost(), but cache-write tokens written with the 1-hour lifetime cost 2x the base input price. creation_1h is the
+    ephemeral_1h_input_tokens the response reported (None when it reported no split: then every written token is priced as 1-hour
+    when the request asked for 1 hour, the dearer reading)."""
+    p_in, p_out, p_w, p_r = tier(model, prompt_len(usage))
+    cc = usage.get("cache_creation_input_tokens", 0)
+    if creation_1h is None:
+        creation_1h = cc if asked_1h else 0
+    creation_1h = max(0, min(creation_1h, cc))
+    parts = {
+        "input": usage.get("input_tokens", 0) * p_in / 1e6,
+        "cache_write": ((cc - creation_1h) * p_w + creation_1h * 2 * p_in) / 1e6,
+        "cache_read": usage.get("cache_read_input_tokens", 0) * p_r / 1e6,
+        "output": usage.get("output_tokens", 0) * p_out / 1e6,
+    }
+    parts["total"] = sum(parts.values())
+    return parts
+
+
+def request_upper_bound(model, prompt_tokens_ub, max_tokens, write_1h=False):
     """Conservative dollar bound for one request: every prompt token at the dearer of input and cache-write
-    price (no cache-read credit), every output token up to max_tokens."""
+    price (no cache-read credit), every output token up to max_tokens. write_1h: the request asks for the 1-hour
+    cache, whose write costs 2x the base input price (prompt-caching page, read 2026-11-07)."""
     p_in, p_out, p_w, _ = tier(model, prompt_tokens_ub)
-    return prompt_tokens_ub * max(p_in, p_w) / 1e6 + max_tokens * p_out / 1e6
+    w = max(p_in, p_w, 2 * p_in if write_1h else 0.0)
+    return prompt_tokens_ub * w / 1e6 + max_tokens * p_out / 1e6
 
 
 def plan_counts(a):

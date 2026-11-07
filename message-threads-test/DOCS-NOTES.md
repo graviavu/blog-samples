@@ -81,7 +81,28 @@ below all read the same. What the re-read corrected or added:
 - Haiku 5.5 is priced by prompt length. Prompt length counts input, cache reads and cache writes. Each request is priced on its own: a request over 100,000 tokens pays the higher prices even when part of it is a cache hit.
 - All current models: 1M token context window, 128K max output.
 - The 1.1x data-residency multiplier applies only when `inference_geo` is set to US-only. This script does not set it.
-- The 1-hour cache (2x input write) is not used.
+- The 1-hour cache (2x input write) is used only by `--tune` (below); `--all` does not use it.
+
+## 1-hour cache and the `--tune` mode (prompt-caching page, fetched by plain HTTP and text search on 2026-11-07)
+
+CONFIRMED on the page:
+
+- Top-level (automatic) caching takes a TTL: `"cache_control": {"type": "ephemeral", "ttl": "1h"}`. The default is 5 minutes. `ttl` is the exact field name and `"1h"` the exact value.
+- 1-hour cache writes cost 2x the base input price (5-minute writes 1.25x, reads 0.1x; the page's table footnote has per-model exceptions for reads). This sample prices a 1-hour write as 2 x the base input price of the prompt-length tier: on Haiku 5.5 that is 0.20 per million up to 100,000 tokens and 1.00 over. The page's price table was not read per row for the Haiku tiers: UNKNOWN whether the 1-hour write follows Haiku's 100,000-token step exactly this way; the bound uses the dearer reading.
+- The response reports the split in `usage.cache_creation`: `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`; `cache_creation_input_tokens` is their sum. The client keeps the split; when a response gives none, a request that asked for 1 hour is priced as all-1-hour (the dearer reading).
+- The cache lifetime is measured from the START of the request that writes or reads the entry, and a read refreshes it. The 5-minute and 1-hour caches behave the same for latency.
+- The 1-hour duration is listed for the Claude API (and Bedrock, Claude Platform on AWS, Google Cloud, Foundry).
+
+From the message-threads page, already above: `cache_control` at the top level is a fixed field, so the same value (including `ttl`) must be sent on every request of a thread; the thread idle limit is 5 minutes; a continue after expiry returns 404 `thread_not_found`; a stored response restarts the idle timer.
+
+UNKNOWN (what `--tune` is there to find out, so it reports them rather than assuming):
+
+- Whether a new thread create that replays the same prefix reads a 1-hour cache entry written by a normal request. The page says nothing about the `thread` field and caching together beyond "a thread does not cache for you".
+- Whether a tiny continue really restarts the thread's idle timer so that a continue 8 minutes after the create still works. The page says each stored response restarts the timer; no example.
+- Whether the thread's idle timer counts from the start or the end of a request (the cache lifetime counts from the start). The report prints the gaps it measured, from the end of one request to the start of the next.
+- How much a keep-alive adds to the stored history: its user message plus its reply, assumed. The report derives it from `input` token counts and says it is approximate (thinking blocks may differ).
+- Whether the "thread TTFT stays lower and steadier as the conversation grows" claim holds at 15 turns of a 20K history. The report gives the numbers and no verdict.
+- The vendor figure of 35% is still not on the page.
 
 ## Default model choice
 

@@ -6,6 +6,8 @@
 #   ./run-test.sh --resume DIR     finish a PARTIAL results folder (same flags); only what is not done runs
 #   ./run-test.sh --probe          step 1: does this key accept message threads? Under 1 cent
 #   ./run-test.sh --run            the probe, then the latency arms at 20K and 100K tokens (worst case under $5)
+#   ./run-test.sh --tune           after --all: warm-cache reload, keep-alive and growth experiments on one timeline (about 9 minutes,
+#                                  own phrase SPEND UP TO $2, bound $1.44, not resumable); --tune --dry-run shows the plan
 #   ./run-test.sh --self-test      stub tests, no network beyond 127.0.0.1, no key
 #
 # Python 3 standard library only. The key is read from the environment, never printed or stored.
