@@ -43,6 +43,45 @@ The same steps one at a time, if you prefer:
 
 The probe writes `probe.json` (no key; ids matching known patterns are redacted). Every paid mode asks you to type `SPEND UP TO $<cap>` (default `SPEND UP TO $4.5`). The probe asks for it too, like the Bedrock sample.
 
+## After the first run: `--tune` (three experiments, one timeline)
+
+Run this after `--all` has finished and you have looked at `results.md`. It is a separate paid mode with its own typed phrase, `SPEND UP TO $2` (default and highest cap **2.0**, no override), and a **planned upper bound of $1.44 including the probe**, so it fits in what is left of a $5 credit after a first run. The default `--all` is unchanged.
+
+```bash
+./run-test.sh --tune --dry-run      # the plan, the timeline and the bound; nothing is sent
+./run-test.sh --tune                # asks for SPEND UP TO $2, then the probe (stops unless ACCEPTED), the free token count, the experiments
+```
+
+Order: `./run-test.sh` (dry run) then `--all` then `--tune`. `--tune` does not go with `--run`, `--probe`, `--all`, `--resume` or `--skip-probe`. **It cannot be resumed**: the timeline (the waits) is the point. If it stops (credit, key, cap, Ctrl-C) it saves a PARTIAL `tune.md` and `tune.json` with whatever was measured, prints the spend, and a new `--tune` starts from the beginning.
+
+All three run on `claude-haiku-5-5` with `effort: low` and `max_tokens` 100 on one timeline, so the waits overlap (about 9 minutes in all). Every experiment has its own prefix salt, so none shares cache with another. A countdown line is printed every 10 seconds while waiting.
+
+| # | Experiment | What it does | What it reports |
+|---|---|---|---|
+| 1 | Warm-cache reload (100K tokens) | A normal request writes a 1-hour cache entry (`cache_control: {"type": "ephemeral", "ttl": "1h"}` at the top level). Then a thread is created from the same history at t0. At t0+340 s (over the 5-minute idle limit) a continue must return 404 `thread_not_found`; that is the check that the thread is gone. Then the same prefix is replayed as a new thread create with the same `cache_control`. The existing cold reload (fresh salt, the arm 4 request with the default 5-minute `cache_control`) follows as the comparison | cache read and cache write tokens, cost and TTFT of the prime, the replay and the cold reload, and one plain sentence: did the replay read the 1-hour cache (YES, NO, PARTLY or UNKNOWN) |
+| 2 | Keep-alive (20K) | A thread is created at t0, a tiny continue ("ping, reply OK") goes out at t0+240 s, a real continue at t0+480 s | RESET (the real continue answered 200 although 480 s passed since the create), NOT RESET (or the thread expired anyway) on 404, or UNKNOWN; plus the tokens the keep-alive added to the stored history |
+| 3 | Growth (20K) | 15 turns in one thread against 15 turns of cached full resend, small user messages, the two arms interleaved turn by turn | TTFT per turn for both arms, thread / resend ratio per turn, cost per turn, the median of the first 5 and the last 5 turns for each arm, and the plain numbers behind the docs' claim that TTFT "stays lower and steadier as the conversation grows"; no more |
+
+The report is `results/<timestamp>/tune.md` plus `tune.json` (no key, no message or request ids; files 0600, folders 0700), with the same one-machine, one-day caveat and the exact n: experiments 1 and 2 are single requests per step (n = 1, not a rate), experiment 3 has 15 turns per arm. Anything the replies do not settle is reported UNKNOWN, not guessed: a thread that is still alive at the expiry check, a keep-alive that already got 404, a response that does not report the 1-hour split of the cache write, a real continue that came inside the 5-minute limit even without a reset.
+
+Rules that differ from `--all`:
+
+- There are **no automatic replays** in this mode. A continue that fails is a result. If one experiment cannot go on, the others still run, the report says which stopped, and the exit code is 4.
+- The bound counts every request attempted twice (`--retries 1`), prices the 1-hour cache write at 2x the base input price, takes the 100K step on the dearer side (over 100,000 tokens: input 0.50, 1-hour write 1.00, 5-minute write 0.625 per million), counts the replay and the 404 check at full price as if it succeeded, and assumes every reply fills `--tune-max-tokens`. Typical cost is far lower: about $0.05 to $0.20 (a model, not a measurement; it depends on which side of the 100K step the history lands).
+- Every guard of the other modes holds: the phrase must be typed at a terminal and nothing is sent before it; the host allowlist; the margin and ratio bounds, and the free token count before any full-size request (it rebuilds or refuses); the per-request check against the cap before each request; credit, billing and auth errors stop at once with PARTIAL files; the results are flushed after every request; redaction.
+- Options (all optional): `--tune-big 100000`, `--tune-small 20000`, `--tune-turns 15`, `--tune-max-tokens 100`, `--tune-keepalive-at 240`, `--tune-expiry-at 340`, `--tune-final-at 480` (seconds after t0), `--tune-idle-limit 300` (only for the wording of the verdicts), `--retries`, `--effort`, `--max-usd` (at most 2). The dry run shows the bound for any change; a bound above the cap refuses to start.
+
+### More samples at 20K (no new code)
+
+The 20K arms are cheap, so more repetitions need no new mode. This gives 20 samples per cached arm and 20 cold reloads, 2 no-cache requests and no behaviour checks, and its planned upper bound is **$0.88** (the dry run prints it; typical about $0.18). Cap it at $1 so it can never come near the credit left:
+
+```bash
+./run-test.sh --sizes 20000 --reps 20 --turns 1 --no-checks --nocache-reps 2 --nocache-turns 1 --max-usd 1     # dry run: prints the bound
+./run-test.sh --all --sizes 20000 --reps 20 --turns 1 --no-checks --nocache-reps 2 --nocache-turns 1 --max-usd 1   # asks for SPEND UP TO $1
+```
+
+The bound is under the default cap too, so `--max-usd 1` is only the tighter cap. If you change the counts and the dry run prints a bound above your cap, lower `--reps` or `--nocache-reps`, or the run refuses to start.
+
 ## Cost and the spend guard
 
 You pay with your own key. The default model is `claude-haiku-5-5`, the cheapest priced model in `DOCS-NOTES.md`. **Haiku 5.5 charges 5x per token for prompts over 100,000 tokens.** The 100K history can land either side of that line (UNKNOWN: the characters-per-token ratio of 3.2 is a guess; `--count-tokens` measures it for free), and the bound assumes the dearer side. Run `--count-tokens` on your first `--run`. Sonnet 5.5 (`--model claude-sonnet-5-5`) lists at $2 per million input tokens and $10 output, against Haiku's $0.50 and $2.50 above 100K tokens; Opus 5.5 and Fable 5.1 cost more again. Check the pricing page before you run.
@@ -106,7 +145,7 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 
 ## What the output means
 
-`results/<timestamp>/` holds `probe.json` (verdict ACCEPTED, REJECTED, INCONCLUSIVE, INTERRUPTED or PARTIAL), then one folder per size (`20000/`, `100000/`) with `results.json` (every request: status, TTFT, total time, usage, cost split) and `results.md` (the summary), and a top-level `results.md` with TTFT and cost by context size side by side. `spent_usd` in each size's file is cumulative for the whole run. With `--tokens N` there is one size and its files sit directly in the timestamp folder. No key is written, and ids matching known patterns are redacted. The results folders are created 0700 and the files 0600.
+`--tune` writes `tune.md`, `tune.json` and `probe.json` instead (see the section above). `results/<timestamp>/` holds `probe.json` (verdict ACCEPTED, REJECTED, INCONCLUSIVE, INTERRUPTED or PARTIAL), then one folder per size (`20000/`, `100000/`) with `results.json` (every request: status, TTFT, total time, usage, cost split) and `results.md` (the summary), and a top-level `results.md` with TTFT and cost by context size side by side. `spent_usd` in each size's file is cumulative for the whole run. With `--tokens N` there is one size and its files sit directly in the timestamp folder. No key is written, and ids matching known patterns are redacted. The results folders are created 0700 and the files 0600.
 
 | Column | Meaning |
 |---|---|
@@ -132,16 +171,16 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 ## Tests
 
 ```bash
-./run-test.sh --self-test     # 131 stub tests, no key, no network beyond 127.0.0.1
+./run-test.sh --self-test     # 186 stub tests, no key, no network beyond 127.0.0.1
 ```
 
-The stub emulates create and continue with the `thread` parameter, SSE streaming, 404 for unknown ids, the single-continue rule, cache accounting and usage numbers, and can inject 500s, cut streams, inflated usage and expiry. Tests cover: the default plan's worst case is at most $5 and the 500K command needs `--max-usd 10` and its own phrase; `--probe` makes exactly three requests with the right headers and bodies, costs under a cent, and gives ACCEPTED, REJECTED or INCONCLUSIVE in the right cases (a continue that ignores the thread is not ACCEPTED); `--run` stops after a rejected probe; two sizes run in separate folders under one shared cap with different cold prefixes; a dry run makes no connection; the estimate is an upper bound on what the stub bills; the spend guard stops at the cap and refuses a request that could cross it; the confirmation phrase is enforced and a wrong phrase makes no call; the key never appears in output or files; the 404 replay path; the single-continue rule; back-to-back requests on the real client against an HTTP/1.1 chunked keep-alive stub (exactly one server request per call, no duplicate billing); the cap validation (nan, inf, 0, negative, above 10); the cold-prefix salt (unique per arm and repetition, first in the system prompt, cache read 0); the savings math; median and p90; Ctrl-C flushes partial results. New: every credit, billing, quota, spend-limit and auth error shape stops at once with exactly one request after the error, no retry and no replay (including a credit 400 on a thread continue and an error event inside a stream), writes PARTIAL files (0600/0700, no key, no ids) and exits 5 or 6; a plain 429 with retry-after is still retried; `--all` runs probe, then the count, then the arms with one typed phrase, stops on REJECTED, adjusts or refuses on the measured ratio, and keeps the tty, margin, ratio and host guards; the default cap is 4.5 with bound 4.44; `--resume` runs only what is left, carries the spend, applies the cap to the remainder, and refuses malformed, non-private, symlinked, mismatched or out-of-range folders.
+The stub emulates create and continue with the `thread` parameter, SSE streaming, 404 for unknown ids, the single-continue rule, cache accounting and usage numbers, and can inject 500s, cut streams, inflated usage and expiry. Tests cover: the default plan's worst case is at most $5 and the 500K command needs `--max-usd 10` and its own phrase; `--probe` makes exactly three requests with the right headers and bodies, costs under a cent, and gives ACCEPTED, REJECTED or INCONCLUSIVE in the right cases (a continue that ignores the thread is not ACCEPTED); `--run` stops after a rejected probe; two sizes run in separate folders under one shared cap with different cold prefixes; a dry run makes no connection; the estimate is an upper bound on what the stub bills; the spend guard stops at the cap and refuses a request that could cross it; the confirmation phrase is enforced and a wrong phrase makes no call; the key never appears in output or files; the 404 replay path; the single-continue rule; back-to-back requests on the real client against an HTTP/1.1 chunked keep-alive stub (exactly one server request per call, no duplicate billing); the cap validation (nan, inf, 0, negative, above 10); the cold-prefix salt (unique per arm and repetition, first in the system prompt, cache read 0); the savings math; median and p90; Ctrl-C flushes partial results. New: every credit, billing, quota, spend-limit and auth error shape stops at once with exactly one request after the error, no retry and no replay (including a credit 400 on a thread continue and an error event inside a stream), writes PARTIAL files (0600/0700, no key, no ids) and exits 5 or 6; a plain 429 with retry-after is still retried; `--all` runs probe, then the count, then the arms with one typed phrase, stops on REJECTED, adjusts or refuses on the measured ratio, and keeps the tty, margin, ratio and host guards; the default cap is 4.5 with bound 4.44; `--tune` (45 tests in `tests/test_tune.py`: each experiment with success, the expected 404, keep-alive reset and not reset, a warm replay that does and does not read the 1-hour cache, the growth math, bound at most 1.5, cap refusals, a billing stop mid-timeline, Ctrl-C, tty-only phrase, nothing sent before the phrase, private files); `--resume` runs only what is left, carries the spend, applies the cap to the remainder, and refuses malformed, non-private, symlinked, mismatched or out-of-range folders.
 
 ## Layout
 
 ```
 run-test.sh              the one script you run
-threads_test/            cli, probe, runner (arms, checks, guard), client (HTTP + SSE, error classes), resume, pricing, convo, stats, report, redact
+threads_test/            cli, probe, runner (arms, checks, guard), tune and tune_report (--tune), client (HTTP + SSE, error classes), resume, pricing, convo, stats, report, redact
 tests/                   stub API server and the tests
 DOCS-NOTES.md            the facts and prices relied on, with the read date and the UNKNOWNs
 ```

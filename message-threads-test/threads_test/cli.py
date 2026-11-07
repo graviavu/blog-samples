@@ -1,6 +1,7 @@
 """Entry point. No flag (or --dry-run) prints the plan and the worst-case cost and makes no network call.
 --probe is step 1 (a few tiny requests), --run is the probe and then the arms, --all is the whole thing in one go (probe, free token count,
-arms, summary), --resume DIR finishes a PARTIAL folder. Every paid mode needs the typed phrase SPEND UP TO $<cap>, once.
+arms, summary), --resume DIR finishes a PARTIAL folder, --tune runs three experiments on one timeline (warm-cache reload, keep-alive, growth; own
+phrase, default and highest cap 2.0, not resumable). Every paid mode needs the typed phrase SPEND UP TO $<cap>, once.
 Exit codes: 0 done, 2 refused or not confirmed, 3 spend cap, 4 aborted or probe not ACCEPTED, 5 credit/billing/quota error, 6 key not accepted, 130 Ctrl-C."""
 import argparse
 import json
@@ -18,6 +19,7 @@ from threads_test import pricing  # noqa: E402
 from threads_test import probe  # noqa: E402
 from threads_test import report  # noqa: E402
 from threads_test import redact as R  # noqa: E402
+from threads_test import tune  # noqa: E402
 from threads_test import resume as RS  # noqa: E402
 from threads_test.client import FatalApiError  # noqa: E402
 from threads_test.runner import Guard, Runner, SpendCap  # noqa: E402
@@ -32,6 +34,7 @@ def out(msg=""):
 HARD_CEILING = 10.0
 DEFAULT_CAP = 4.5   # of R's $5 of credit, $0.50 is never touched; the default plan's bound is $4.44
 DEFAULT_SIZES = [20000, 100000]
+TUNE_CAP = 2.0       # --tune: default cap, and also the most it will take (no override); R's credit left after a first run is about $4.4
 
 
 def sizes_arg(text):
@@ -63,6 +66,15 @@ def parser():
     m.add_argument("--probe", action="store_true", help="step 1: a few tiny requests on a small model; does this key accept the threads beta? Under 1 cent. Asks for the typed phrase")
     m.add_argument("--run", action="store_true", help="the probe, then the latency arms (stops after the probe unless it says ACCEPTED). Asks for the typed phrase")
     m.add_argument("--all", action="store_true", help="the whole test in one command: plan, the typed phrase once, the probe (stops unless ACCEPTED), the free token count (refuses or adjusts the history size before any full-size request), the arms, the summary")
+    p.add_argument("--tune", action="store_true", help="a separate paid mode: three experiments on one timeline (warm-cache reload, keep-alive, growth), own typed phrase, default cap 2.0, about 9 minutes, NOT resumable (a PARTIAL tune.md/tune.json is saved). Runs the probe first. With --dry-run: only the plan")
+    p.add_argument("--tune-big", type=int, default=100000, help="--tune experiment 1 history size in tokens (default 100000)")
+    p.add_argument("--tune-small", type=int, default=20000, help="--tune experiments 2 and 3 history size in tokens (default 20000)")
+    p.add_argument("--tune-turns", type=int, default=15, help="--tune experiment 3 turns per arm (default 15)")
+    p.add_argument("--tune-max-tokens", type=int, default=100, help="--tune output cap per request (default 100)")
+    p.add_argument("--tune-keepalive-at", type=float, default=240.0, help="--tune seconds after t0 for the keep-alive continue (default 240)")
+    p.add_argument("--tune-expiry-at", type=float, default=340.0, help="--tune seconds after t0 for the expiry check and the warm replay (default 340, over the 5 minute idle limit)")
+    p.add_argument("--tune-final-at", type=float, default=480.0, help="--tune seconds after t0 for the real continue of the keep-alive experiment (default 480)")
+    p.add_argument("--tune-idle-limit", type=float, default=300.0, help="--tune the documented idle limit in seconds, used only to word the verdicts (default 300)")
     p.add_argument("--resume", metavar="RESULTS_DIR", default=None, help="finish a PARTIAL (or complete) results folder: skips the arms and sizes already done, runs the rest like --all, with the same flags, the same phrase and the cap applied to what is left (spend so far is read from the saved files). With --dry-run: only shows what is left")
     p.add_argument("--skip-probe", action="store_true", help="with --run: do not repeat the probe (only after --probe said ACCEPTED; saves under 1 cent)")
     p.add_argument("--probe-model", default="claude-haiku-5-5", help="model for the probe (default claude-haiku-5-5, the cheapest)")
@@ -77,7 +89,7 @@ def parser():
     p.add_argument("--no-checks", dest="checks", action="store_false", help="skip the 404 / double-continue checks")
     p.add_argument("--expiry-test", action="store_true", help="also wait just over 5 minutes idle and continue (slow, cheap)")
     p.add_argument("--expiry-wait", type=int, default=310, help="idle seconds for --expiry-test (default 310)")
-    p.add_argument("--max-usd", type=usd, default=DEFAULT_CAP, help="spend cap in USD: finite, above 0, at most %g (default %g; no override)" % (HARD_CEILING, DEFAULT_CAP))
+    p.add_argument("--max-usd", type=usd, default=None, help="spend cap in USD: finite, above 0, at most %g (default %g; with --tune the default and the most is %g; no override)" % (HARD_CEILING, DEFAULT_CAP, TUNE_CAP))
     p.add_argument("--max-tokens", type=int, default=512, help="output cap per request, thinking included (default 512)")
     p.add_argument("--effort", default="low", help="output_config.effort on every request; 'none' leaves it out (default low)")
     p.add_argument("--seed", type=int, default=1)
@@ -186,7 +198,7 @@ def write_json(outdir, name, obj):
     report.write_text(outdir, name, json.dumps(R.redact_obj(obj), indent=2, sort_keys=True) + "\n")
 
 
-def stop_message(kind, reason, spent, outdir, stage=None):
+def stop_message(kind, reason, spent, outdir, stage=None, resumable=True):
     what = ("the API reported a credit, billing or quota problem" if kind == "billing"
             else "the API did not accept the key (or it may not use this model or beta)")
     L = ["", "STOPPED: %s." % what, "  %s" % reason,
@@ -195,7 +207,10 @@ def stop_message(kind, reason, spent, outdir, stage=None):
         L.append("  Stage reached: size %s tokens, arm %s, repetition %s, turn %s (%s)." % (stage.get("tokens"), stage.get("arm"), stage.get("rep"), stage.get("turn"), stage.get("kind")))
     if outdir:
         L.append("  Partial results (marked PARTIAL) are in %s and usable as they are." % outdir)
-        L.append("  If your balance allows it later: ./run-test.sh --resume %s   (same flags; only the arms not yet done run)" % outdir)
+        if resumable:
+            L.append("  If your balance allows it later: ./run-test.sh --resume %s   (same flags; only the arms not yet done run)" % outdir)
+        else:
+            L.append("  --tune cannot be resumed; tune.md and tune.json hold what was measured (PARTIAL).")
     L.append("  Check your balance and plan in the Console." if kind == "billing" else "  Check ANTHROPIC_API_KEY.")
     return "\n".join(L)
 
@@ -263,8 +278,128 @@ def resume_plan(a, sizes, saved, probe_ub):
     return total
 
 
+def tune_plan(a):
+    return tune.plan(a.model, a.tune_big, a.tune_small, a.margin, a.tune_turns, a.tune_max_tokens, a.retries)
+
+
+def print_tune_plan(a, pl, probe_ub):
+    total = pl["total"] + probe_ub
+    out("TUNE PLAN (nothing is sent in a dry run)")
+    out("  model                %s   (probe on %s)" % (a.model, a.probe_model))
+    out("  step 1 probe         up to %d tiny requests; at most $%.4f; --tune stops unless it says ACCEPTED" % (probe.PROBE_REQUESTS, probe_ub))
+    out("  step 2 free count    the two histories are counted with count_tokens (free) and rebuilt once if the ratio is off")
+    out("  one timeline         t0 = threads of experiments 1 and 2 created; experiment 3 runs during the waits")
+    out("                       t0+%gs keep-alive (2)   t0+%gs expiry check, warm replay, cold reload (1)   t0+%gs real continue (2)   (about %.0f minutes in all)" % (
+        a.tune_keepalive_at, a.tune_expiry_at, a.tune_final_at, (a.tune_final_at + 60) / 60.0))
+    for key, title, size in (("e1", "1 warm-cache reload", a.tune_big), ("e2", "2 keep-alive", a.tune_small), ("e3", "3 growth", a.tune_small)):
+        e = pl[key]
+        out("  experiment %-20s %d-token history, %s; worst case assumed %d prompt tokens per request; bound $%.4f" % (title, size, "; ".join(e["requests"]), e["prompt_tokens_ub"], e["bound"]))
+    lo = pricing.tier(a.model, pl["e1"]["prompt_tokens_ub"])
+    out("  pricing assumed      for the %d-token prompt: input %.3f, output %.3f, 5m write %.3f per MTok; 1-hour write %.3f (2x input; prompt-caching page). Haiku 5.5 charges 5x per token over 100,000 tokens: the bound takes the dearer side" % (pl["e1"]["prompt_tokens_ub"], lo[0], lo[1], lo[2], 2 * lo[0]))
+    out("  bound rule           every prompt token at the dearer write price, no cache-read credit, every reply at --tune-max-tokens %d, every request attempted %d times (--retries %d), no automatic replays (a failed continue is a result)" % (
+        a.tune_max_tokens, pl["attempts_per_request"], a.retries))
+    out("  PLANNED UPPER BOUND  $%.2f   (cap $%.2f; includes retries, the replay and the probe; real spend is lower)" % (total, a.max_usd))
+    return total
+
+
+def tune_main(a, base):
+    """--tune [--dry-run]. Returns an exit code."""
+    if a.run or a.probe or a.all or a.resume or a.skip_probe:
+        out("error: --tune is its own mode; it does not go with --run, --probe, --all, --resume or --skip-probe")
+        return 2
+    if a.max_usd > TUNE_CAP:
+        out("error: --tune takes at most --max-usd %g (there is no override)" % TUNE_CAP)
+        return 2
+    times = (a.tune_keepalive_at, a.tune_expiry_at, a.tune_final_at, a.tune_idle_limit)
+    if not all(math.isfinite(x) and x >= 0 for x in times) or not a.tune_keepalive_at < a.tune_final_at or a.tune_idle_limit <= 0:
+        out("error: --tune times must be finite and not negative, --tune-keepalive-at must come before --tune-final-at, --tune-idle-limit above 0")
+        return 2
+    if min(a.tune_big, a.tune_small, a.tune_max_tokens) < 1 or a.tune_turns < 2:
+        out("error: --tune sizes and --tune-max-tokens must be positive and --tune-turns at least 2")
+        return 2
+    try:
+        pl = tune_plan(a)
+        probe_ub = probe.bound(a.probe_model)
+    except ValueError as e:
+        out("error: %s" % e)
+        return 2
+    total = print_tune_plan(a, pl, probe_ub)
+    over = total > a.max_usd
+    if over:
+        out("  EXCEEDS THE CAP by $%.2f. %s" % (total - a.max_usd, "A paid run would refuse to start." if a.dry_run else "Refusing to start."))
+    if a.dry_run:
+        out("Dry run: no network call made, no file written. The paid run is ./run-test.sh --tune (own phrase, not resumable).")
+        return 0
+    if over:
+        out("Lower --tune-big, --tune-small, --tune-turns or --retries, then run again.")
+        return 2
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        out("error: set ANTHROPIC_API_KEY in your environment (it is never printed or stored)")
+        return 2
+    R.add_secret(key)
+    if not sys.stdin.isatty():
+        out("Refusing: the phrase must be typed at a terminal.")
+        return 2
+    out("")
+    out("This sends paid requests with your API key to %s, in this order: the probe (stops unless ACCEPTED), the free token count, then the three experiments on one timeline "
+        "(about %.0f minutes, mostly waiting), and stops at the cap. It cannot be resumed; if it stops, tune.md and tune.json (PARTIAL) hold what was measured." % (base, (a.tune_final_at + 60) / 60.0))
+    out("To go ahead type exactly: %s" % phrase(a.max_usd))
+    sys.stdout.flush()
+    reply = sys.stdin.readline().rstrip("\r\n")
+    if reply != phrase(a.max_usd):
+        out("Not confirmed. No calls made.")
+        return 2
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    outdir = os.path.join(a.results_dir, stamp)
+    report.private_dir(a.results_dir)
+    report.private_dir(outdir)
+
+    def on_term(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_term)
+    client = C.Client(base, key, a.timeout, a.base_url_host)
+    guard = Guard(a.max_usd)
+    out("Results go to %s" % outdir)
+    try:
+        rec = run_probe(client, guard, a, outdir)
+    except FatalApiError as e:
+        out(stop_message(e.kind, e.reason, guard.spent, outdir, resumable=False))
+        return 5 if e.kind == "billing" else 6
+    if rec["effort_used"] == "none":
+        a.effort = "none"
+    if rec["verdict"] != probe.ACCEPTED:
+        out("Stopping before the experiments: the probe did not say ACCEPTED. Spent $%.5f." % guard.spent)
+        return 4
+    cpts = {}
+    for name, size in (("big", a.tune_big), ("small", a.tune_small)):
+        try:
+            cpt, why = count_adjust(a, size, a.chars_per_token, base, key)
+        except FatalApiError as e:
+            out(stop_message(e.kind, e.reason, guard.spent, outdir, resumable=False))
+            return 5 if e.kind == "billing" else 6
+        if why:
+            out(why)
+            out("Spent $%.5f (the probe only). No full-size request was sent." % guard.spent)
+            return 2
+        cpts[name] = cpt
+    cfg = {"model": a.model, "big": a.tune_big, "small": a.tune_small, "turns": a.tune_turns, "max_tokens": a.tune_max_tokens, "margin": a.margin,
+           "retries": a.retries, "effort": a.effort, "seed": a.seed, "salt_nonce": stamp, "cpt_big": cpts["big"], "cpt_small": cpts["small"],
+           "max_usd": a.max_usd, "keepalive_at": a.tune_keepalive_at, "expiry_at": a.tune_expiry_at, "final_at": a.tune_final_at,
+           "idle_limit": a.tune_idle_limit, "probe_bound_usd": probe_ub, "probe_verdict": rec["verdict"]}
+    t = tune.Tune(cfg, client, outdir, log=out, guard=guard)
+    code = t.run()
+    if code in (5, 6) and t.partial:
+        out(stop_message(t.partial["kind"], t.partial["reason"], guard.spent, outdir, t.partial.get("stage"), resumable=False))
+    out("Wrote tune.json and tune.md (not the key; no message or request ids) under %s." % outdir)
+    return code
+
+
 def main(argv=None):
     a = parser().parse_args(argv)
+    if a.max_usd is None:
+        a.max_usd = TUNE_CAP if a.tune else DEFAULT_CAP
     if a.resume and (a.run or a.probe):
         out("error: --resume goes with --all or alone (it runs like --all), not with --run or --probe")
         return 2
@@ -302,6 +437,8 @@ def main(argv=None):
     except ValueError as e:
         out("error: ANTHROPIC_BASE_URL: %s" % e)
         return 2
+    if a.tune:
+        return tune_main(a, base)
     saved = None
     if a.resume:
         def want_for(i, size, effort_used):
