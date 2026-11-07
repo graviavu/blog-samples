@@ -78,3 +78,34 @@ def estimate(model, a):
     small_ub = prompt_upper_bound(a.get("small_tokens", 2000), a["margin"], 1, a["max_tokens"])
     small = c["small"] * (1 + c["retries"]) * request_upper_bound(model, small_ub, a["max_tokens"])
     return {"total": c["attempts"] * per + small, "counts": c, "prompt_tokens_ub": ub, "per_request_ub": per}
+
+
+def estimate_sizes(model, a, sizes):
+    """Planned upper bound over several history sizes. The behaviour checks and the expiry test run once, at the first size.
+    Returns {"total", "per_size": [(tokens, estimate)]}."""
+    per, total = [], 0.0
+    for i, t in enumerate(sizes):
+        ai = dict(a, tokens=t, checks=bool(a.get("checks", True)) and i == 0, expiry_test=bool(a.get("expiry_test")) and i == 0)
+        e = estimate(model, ai)
+        per.append((t, e))
+        total += e["total"]
+    return {"total": total, "per_size": per}
+
+
+def typical(model, a, sizes, new_tokens=300, out_tokens=150):
+    """MODELLED typical cost, not a bound: the cache works as documented, the prompt is the size asked for plus 1,500 tokens
+    of system and tools, each follow-up adds new_tokens, each reply is out_tokens long, nothing is retried or replayed."""
+    total = 0.0
+    for i, t in enumerate(sizes):
+        p = t + 1500
+        p_in, p_out, p_w, p_r = tier(model, p)
+        o = out_tokens * p_out / 1e6
+        full_in = p * p_in / 1e6 + o
+        cold = p * p_w / 1e6 + o
+        warm = p * p_r / 1e6 + new_tokens * p_w / 1e6 + o
+        total += a["nocache_reps"] * a["nocache_turns"] * full_in
+        total += 2 * a["reps"] * (cold + a["turns"] * warm)       # arms 2 and 3
+        total += a["reload_reps"] * cold                          # arm 4
+        if i == 0 and a.get("checks", True):
+            total += cold + warm                                  # replay after the 404, one continue
+    return total

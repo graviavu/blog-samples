@@ -34,9 +34,9 @@ class Guard:
 
 
 class Runner:
-    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep):
+    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep, guard=None):
         self.cfg, self.client, self.outdir, self._log, self.sleep = cfg, client, outdir, log, sleep
-        self.guard = Guard(cfg["max_usd"])
+        self.guard = guard or Guard(cfg["max_usd"])   # one guard can be shared by the runs of several sizes
         self.records = []
         self.checks = {}
         self.notes = []

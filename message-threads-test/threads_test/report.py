@@ -168,3 +168,37 @@ def write_outputs(outdir, doc):
         for t in tmps:
             if os.path.exists(t):
                 os.remove(t)
+
+
+def render_sizes_md(entries, cfg, status, spent):
+    """entries: [(tokens, status, summary)] one per history size, in run order. Latency versus context size."""
+    L = ["# Message threads: latency versus context size", "",
+         "Status: **%s**. Model `%s`, spent $%.4f (cap $%.2f)." % (status, cfg["model"], spent, cfg["max_usd"]), "", "> " + DISCLAIMER, "",
+         "| History tokens | Arm | n | TTFT median ms | TTFT p90 ms | cost/turn | TTFT saving vs arm 1 |", "|---|---|---|---|---|---|---|"]
+    for tokens, st, summ in entries:
+        for arm in (1, 2, 3, 4):
+            r = summ["arms"].get(arm, {})
+            if not r.get("n"):
+                L.append("| %d | %s | 0 | n/a | n/a | n/a | n/a |" % (tokens, ARM_NAMES[arm]))
+                continue
+            L.append("| %d | %s | %d | %s | %s | %s | %s |" % (tokens, r["name"], r["n"], _f(r["ttft_ms_median"]), _f(r["ttft_ms_p90"]),
+                                                              _f(r["cost_usd_median"], 4, "$"), "baseline" if arm == 1 else _f(r["ttft_saving_pct"], 1, suf="%")))
+    L += ["", "| History tokens | run status | thread TTFT / cached-resend TTFT |", "|---|---|---|"]
+    for tokens, st, summ in entries:
+        t = summ.get("thread_vs_resend")
+        L.append("| %d | %s | %s |" % (tokens, st, _f(t and t["thread_vs_cached_resend_ttft_ratio"], 2)))
+    L += ["", "Per-size detail (checks, token parity, cache flags) is in each size's folder: `<tokens>/results.md`. "
+          "With few samples per cell a gap of a few points is noise; the vendor figure (about 35% lower median TTFT at 500K to 1M tokens) "
+          "is for sizes this default plan does not reach."]
+    return "\n".join(L) + "\n"
+
+
+def write_text(outdir, name, text):
+    tmp = os.path.join(outdir, name + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(outdir, name))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)

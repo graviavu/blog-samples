@@ -1,5 +1,7 @@
-"""Entry point. --dry-run prints the plan and the worst-case cost and makes no network call. --run asks for a typed confirmation."""
+"""Entry point. No flag (or --dry-run) prints the plan and the worst-case cost and makes no network call.
+--probe is step 1 (a few tiny requests), --run is the probe and then the arms. Both paid modes need the typed phrase SPEND UP TO $<cap>."""
 import argparse
+import json
 import math
 import os
 import signal
@@ -11,8 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from threads_test import client as C  # noqa: E402
 from threads_test import convo  # noqa: E402
 from threads_test import pricing  # noqa: E402
+from threads_test import probe  # noqa: E402
+from threads_test import report  # noqa: E402
 from threads_test import redact as R  # noqa: E402
-from threads_test.runner import Runner  # noqa: E402
+from threads_test.runner import Guard, Runner, SpendCap  # noqa: E402
 
 DEFAULT_BASE = "https://api.anthropic.com"
 
@@ -22,6 +26,18 @@ def out(msg=""):
 
 
 HARD_CEILING = 10.0
+DEFAULT_CAP = 5.0
+DEFAULT_SIZES = [20000, 100000]
+
+
+def sizes_arg(text):
+    try:
+        v = [int(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a comma separated list of integers: %r" % text)
+    if not v or len(v) > 4 or min(v) < 1 or len(set(v)) != len(v):
+        raise argparse.ArgumentTypeError("give 1 to 4 different positive sizes, for example 20000,100000")
+    return sorted(v)
 
 
 def usd(text):
@@ -39,19 +55,23 @@ def usd(text):
 def parser():
     p = argparse.ArgumentParser(prog="run-test.sh", description="Latency and cost of full resend vs prompt cache vs message thread vs reload.")
     m = p.add_mutually_exclusive_group()
-    m.add_argument("--dry-run", action="store_true", help="print the plan and the worst-case cost; no network call, no files")
-    m.add_argument("--run", action="store_true", help="make the paid calls (asks for a typed confirmation first)")
+    m.add_argument("--dry-run", action="store_true", help="print the plan and the worst-case cost; no network call, no files (also what you get with no flag)")
+    m.add_argument("--probe", action="store_true", help="step 1: a few tiny requests on a small model; does this key accept the threads beta? Under 1 cent. Asks for the typed phrase")
+    m.add_argument("--run", action="store_true", help="the probe, then the latency arms (stops after the probe unless it says ACCEPTED). Asks for the typed phrase")
+    p.add_argument("--skip-probe", action="store_true", help="with --run: do not repeat the probe (only after --probe said ACCEPTED; saves under 1 cent)")
+    p.add_argument("--probe-model", default="claude-haiku-5-5", help="model for the probe (default claude-haiku-5-5, the cheapest)")
     p.add_argument("--model", default="claude-haiku-5-5", help="default: the cheapest model with a price in DOCS-NOTES.md")
-    p.add_argument("--tokens", type=int, default=100000, help="size of the synthetic history (default 100000; 500000 costs about 5x)")
-    p.add_argument("--turns", type=int, default=5, help="follow-up turns per repetition in arms 2 and 3")
-    p.add_argument("--reps", type=int, default=3, help="repetitions of arms 2 and 3")
-    p.add_argument("--nocache-turns", type=int, default=2, help="requests per repetition in arm 1 (the dearest arm)")
-    p.add_argument("--nocache-reps", type=int, default=2, help="repetitions of arm 1")
+    p.add_argument("--sizes", type=sizes_arg, default=DEFAULT_SIZES, help="history sizes in tokens, comma separated, run smallest first (default 20000,100000)")
+    p.add_argument("--tokens", type=int, default=None, help="run ONE history size instead of --sizes (for example 500000; the bound grows about 5x per 5x size, so lower the reps and pass --max-usd)")
+    p.add_argument("--turns", type=int, default=3, help="follow-up turns per repetition in arms 2 and 3 (default 3)")
+    p.add_argument("--reps", type=int, default=2, help="repetitions of arms 2 and 3 (default 2)")
+    p.add_argument("--nocache-turns", type=int, default=2, help="requests per repetition in arm 1 (the dearest arm; default 2)")
+    p.add_argument("--nocache-reps", type=int, default=1, help="repetitions of arm 1 (default 1)")
     p.add_argument("--reload-reps", type=int, default=None, help="cold reload requests in arm 4 (default: --reps)")
     p.add_argument("--no-checks", dest="checks", action="store_false", help="skip the 404 / double-continue checks")
     p.add_argument("--expiry-test", action="store_true", help="also wait just over 5 minutes idle and continue (slow, cheap)")
     p.add_argument("--expiry-wait", type=int, default=310, help="idle seconds for --expiry-test (default 310)")
-    p.add_argument("--max-usd", type=usd, default=10.0, help="spend cap in USD: finite, above 0, at most %g (default %g; no override)" % (HARD_CEILING, HARD_CEILING))
+    p.add_argument("--max-usd", type=usd, default=DEFAULT_CAP, help="spend cap in USD: finite, above 0, at most %g (default %g; no override)" % (HARD_CEILING, DEFAULT_CAP))
     p.add_argument("--max-tokens", type=int, default=512, help="output cap per request, thinking included (default 512)")
     p.add_argument("--effort", default="low", help="output_config.effort on every request; 'none' leaves it out (default low)")
     p.add_argument("--seed", type=int, default=1)
@@ -68,67 +88,97 @@ def phrase(cap):
     return "SPEND UP TO $%s" % ("%.2f" % cap).rstrip("0").rstrip(".")
 
 
-def plan_args(a, tokens=None):
-    return {"tokens": tokens or a.tokens, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
+def plan_args(a):
+    return {"turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
             "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "expiry_test": a.expiry_test,
             "margin": a.margin, "max_tokens": a.max_tokens, "small_tokens": 2000, "checks": a.checks, "retries": a.retries}
 
 
-def print_plan(a, est):
-    c = est["counts"]
+def print_plan(a, sizes, est, probe_ub, mode):
     out("PLAN (nothing is sent in a dry run)")
     out("  model                %s" % a.model)
-    out("  history size         about %d tokens (worst case assumed %d per request)" % (a.tokens, est["prompt_tokens_ub"]))
-    out("  arm 1 no cache       %d reps x %d requests = %d" % (a.nocache_reps, a.nocache_turns, c["arm1"]))
-    out("  arm 2 prompt cache   %d reps x (1 prime + %d turns) = %d" % (a.reps, a.turns, c["arm2"]))
-    out("  arm 3 thread + cache %d reps x (1 create + %d continues) = %d" % (a.reps, a.turns, c["arm3"]))
-    out("  arm 4 cold reload    %d requests (unique salt, nothing cached)" % c["arm4"])
-    out("  behaviour checks     %s" % ("2 full-size requests (replay after a 404, one continue); the failing calls cost no tokens" if a.checks else "skipped"))
-    if a.expiry_test:
-        out("  expiry test          2 small requests, %d s idle" % a.expiry_wait)
-    out("  total                %d full-size requests + %d small" % (c["sized"], c["small"]))
-    out("  retries and replays  the bound adds %d replays (one per arm 3 continue) and attempts every request %d times (--retries %d): %d full-size attempts" % (c["replays"], 1 + c["retries"], c["retries"], c["attempts"]))
-    lo = pricing.tier(a.model, est["prompt_tokens_ub"])
-    out("  pricing assumed      per MTok input %.3f, output %.3f, cache write %.3f, cache read %.3f (tier for a %d-token prompt; DOCS-NOTES.md)" % (lo[0], lo[1], lo[2], lo[3], est["prompt_tokens_ub"]))
-    out("  bound rule           every prompt token billed at the dearer of input and cache-write price, no cache-read credit, every output up to --max-tokens %d" % a.max_tokens)
-    out("  PLANNED UPPER BOUND  $%.2f   (cap $%.2f; includes retries and replays; real spend is lower)" % (est["total"], a.max_usd))
-    out("  this one request     up to $%.4f" % est["per_request_ub"])
-    out("  for comparison, same flags at other sizes:")
-    for t in (100000, 500000):
-        if t != a.tokens:
-            e2 = pricing.estimate(a.model, plan_args(a, t))
-            out("    --tokens %-7d planned upper bound $%.2f%s" % (t, e2["total"], "" if e2["total"] <= a.max_usd else "  (over the cap: reduce --reps, --turns, --nocache-reps, --nocache-turns, or use --no-checks)"))
+    out("  step 1 probe         up to %d tiny requests on %s (plain, plain again without effort if refused, thread create, thread continue); at most $%.4f"
+        % (probe.PROBE_REQUESTS, a.probe_model, probe_ub))
+    if mode == "probe":
+        out("  step 2 arms          not in this mode (use --run)")
+        total = probe_ub
+    else:
+        total = est["total"] + probe_ub
+        out("  step 2 sizes         %s tokens of history, smallest first (the same flags for each size)" % ", ".join(str(t) for t in sizes))
+        for k, (t, e) in enumerate(est["per_size"]):
+            c = e["counts"]
+            out("  --- size %d tokens: worst case assumed %d per request" % (t, e["prompt_tokens_ub"]))
+            out("  arm 1 no cache       %d reps x %d requests = %d" % (a.nocache_reps, a.nocache_turns, c["arm1"]))
+            out("  arm 2 prompt cache   %d reps x (1 prime + %d turns) = %d" % (a.reps, a.turns, c["arm2"]))
+            out("  arm 3 thread + cache %d reps x (1 create + %d continues) = %d" % (a.reps, a.turns, c["arm3"]))
+            out("  arm 4 cold reload    %d requests (unique salt, nothing cached)" % c["arm4"])
+            if k == 0:
+                out("  behaviour checks     %s" % ("2 full-size requests (replay after a 404, one continue); the failing calls cost no tokens" if a.checks else "skipped"))
+                if a.expiry_test:
+                    out("  expiry test          2 small requests, %d s idle" % a.expiry_wait)
+            out("  requests             %d full-size + %d small; the bound adds %d replays (one per arm 3 continue) and attempts every request %d times (--retries %d): %d full-size attempts" % (
+                c["sized"], c["small"], c["replays"], 1 + c["retries"], c["retries"], c["attempts"]))
+            lo = pricing.tier(a.model, e["prompt_tokens_ub"])
+            out("  pricing assumed      per MTok input %.3f, output %.3f, cache write %.3f, cache read %.3f (tier for a %d-token prompt; DOCS-NOTES.md)" % (lo[0], lo[1], lo[2], lo[3], e["prompt_tokens_ub"]))
+            out("  bound for this size  $%.2f (one request up to $%.4f)" % (e["total"], e["per_request_ub"]))
+        out("  bound rule           every prompt token billed at the dearer of input and cache-write price, no cache-read credit, every output up to --max-tokens %d" % a.max_tokens)
+        out("  typical cost         about $%.2f if the cache works as documented and replies are short (a model, not a bound; DOCS-NOTES.md)" % pricing.typical(a.model, plan_args(a), sizes))
+    out("  PLANNED UPPER BOUND  $%s   (cap $%.2f; %s; real spend is lower)" % ("%.2f" % total if total >= 0.01 else "%.4f" % total, a.max_usd, "includes retries and replays and the probe" if mode != "probe" else "the probe alone"))
+    if mode == "dry":
+        out("  for comparison, other single sizes with the same flags (--tokens N):")
+        for t in (100000, 500000):
+            if [t] != sizes:
+                e2 = pricing.estimate_sizes(a.model, plan_args(a), [t])
+                tot = e2["total"] + probe_ub
+                out("    --tokens %-7d planned upper bound $%.2f%s" % (t, tot, "" if tot <= a.max_usd else "  (over the cap: lower --reps, --turns, --nocache-reps, --nocache-turns, use --no-checks, or raise --max-usd up to %g)" % HARD_CEILING))
+    return total
 
 
-def count_check(a, base, key):
+def count_check(a, size, base, key):
     """Opt-in: count the generated history once with the free count_tokens endpoint. Returns an error text or None."""
-    hist = convo.build_history(a.seed, a.tokens, a.chars_per_token)
+    hist = convo.build_history(a.seed, size, a.chars_per_token)
     body = {"model": a.model, "system": convo.system_text("0" * 24), "tools": convo.TOOLS, "messages": hist}
     try:
         n = C.Client(base, key, a.timeout).count_tokens(body)
     except ValueError as e:
         return "error: %s" % e
-    out("count_tokens (free, counted once): the history is %d tokens for --tokens %d (ratio %.2f)." % (n, a.tokens, n / a.tokens))
-    if n > a.tokens * a.margin:
-        return "Refusing to start: the history is over --tokens x --token-margin (%.0f). Lower --chars-per-token or --tokens; the bound would not hold." % (a.tokens * a.margin)
+    out("count_tokens (free, counted once): the %d-token history is %d tokens (ratio %.2f)." % (size, n, n / size))
+    if n > size * a.margin:
+        return "Refusing to start: the history is over --tokens x --token-margin (%.0f). Lower --chars-per-token or the size; the bound would not hold." % (size * a.margin)
     return None
+
+
+def write_json(outdir, name, obj):
+    report.write_text(outdir, name, json.dumps(R.redact_obj(obj), indent=2, sort_keys=True) + "\n")
+
+
+def run_probe(client, guard, a, outdir):
+    rec = probe.run(client, guard, a.probe_model, a.effort, out)
+    out("PROBE VERDICT: %s  (%s)" % (rec["verdict"], rec["reason"]))
+    if rec["verdict"] == probe.REJECTED:
+        out("Threads were refused for this key or organization. The status and code above are the evidence; nothing more to run.")
+    write_json(outdir, "probe.json", rec)
+    return rec
 
 
 def main(argv=None):
     a = parser().parse_args(argv)
-    if not (a.dry_run or a.run):
-        out("Nothing done: pass --dry-run to see the plan, or --run to spend money. See --help.")
-        return 2
+    mode = "run" if a.run else "probe" if a.probe else "dry"
     if a.reload_reps is None:
         a.reload_reps = a.reps
-    if a.max_usd <= 0 or min(a.tokens, a.turns, a.reps, a.nocache_turns, a.nocache_reps, a.max_tokens) < 1 or a.reload_reps < 0:
+    sizes = [a.tokens] if a.tokens is not None else list(a.sizes)
+    if a.tokens is not None and a.sizes != DEFAULT_SIZES:
+        out("error: use --tokens (one size) or --sizes, not both")
+        return 2
+    if a.max_usd <= 0 or min(sizes + [a.turns, a.reps, a.nocache_turns, a.nocache_reps, a.max_tokens]) < 1 or a.reload_reps < 0 or a.retries < 0:
         out("error: counts and sizes must be positive")
         return 2
     if a.effort not in ("none", "low", "medium", "high", "xhigh", "max"):
         out("error: --effort must be none, low, medium, high, xhigh or max")
         return 2
     try:
-        est = pricing.estimate(a.model, plan_args(a))
+        est = pricing.estimate_sizes(a.model, plan_args(a), sizes)
+        probe_ub = probe.bound(a.probe_model)
     except ValueError as e:
         out("error: %s" % e)
         return 2
@@ -138,26 +188,27 @@ def main(argv=None):
     except ValueError as e:
         out("error: ANTHROPIC_BASE_URL: %s" % e)
         return 2
-    print_plan(a, est)
-    over = est["total"] > a.max_usd
+    total = print_plan(a, sizes, est, probe_ub, mode)
+    over = total > a.max_usd
     if over:
-        out("  EXCEEDS THE CAP by $%.2f. %s" % (est["total"] - a.max_usd, "A real run would refuse to start." if a.dry_run else "Refusing to start."))
-    if a.dry_run:
-        out("Dry run: no network call made, no file written.")
+        out("  EXCEEDS THE CAP by $%.2f. %s" % (total - a.max_usd, "A paid run would refuse to start." if mode == "dry" else "Refusing to start."))
+    if mode == "dry":
+        out("Dry run: no network call made, no file written. Next: --probe (cents), then --run.")
         return 0
     if over:
-        out("Lower --tokens, --reps, --turns or --nocache-*, or raise --max-usd, then run again.")
+        out("Lower the sizes, --reps, --turns or --nocache-*, or raise --max-usd (at most %g), then run again." % HARD_CEILING)
         return 2
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         out("error: set ANTHROPIC_API_KEY in your environment (it is never printed or stored)")
         return 2
     R.add_secret(key)
-    if a.count_tokens:
-        msg = count_check(a, base, key)
-        if msg:
-            out(msg)
-            return 2
+    if a.count_tokens and mode == "run":
+        for size in sizes:
+            msg = count_check(a, size, base, key)
+            if msg:
+                out(msg)
+                return 2
     out("")
     out("This sends paid requests with your API key to %s and stops at the cap." % base)
     out("To go ahead type exactly: %s" % phrase(a.max_usd))
@@ -169,20 +220,49 @@ def main(argv=None):
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     outdir = os.path.join(a.results_dir, stamp)
     os.makedirs(outdir, exist_ok=True)
-    cfg = {"model": a.model, "tokens": a.tokens, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
-           "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "checks": a.checks, "expiry_test": a.expiry_test,
-           "expiry_wait": a.expiry_wait, "max_usd": a.max_usd, "max_tokens": a.max_tokens, "effort": a.effort, "seed": a.seed,
-           "margin": a.margin, "chars_per_token": a.chars_per_token, "retries": a.retries, "small_tokens": 2000,
-           "salt_nonce": stamp, "estimated_worst_case_usd": round(est["total"], 4)}
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, on_term)
-    runner = Runner(cfg, C.Client(base, key, a.timeout), outdir, log=out)
+    client = C.Client(base, key, a.timeout)
+    guard = Guard(a.max_usd)
     out("Results go to %s" % outdir)
-    code = runner.run()
-    out("Wrote results.json and results.md (not the key, no ids)." if os.path.exists(os.path.join(outdir, "results.md")) else "No results written.")
+    if a.skip_probe and mode == "run":
+        out("Probe skipped (--skip-probe): the arms start without checking that threads are accepted.")
+        rec = {"verdict": probe.ACCEPTED, "effort_used": a.effort}
+    else:
+        rec = run_probe(client, guard, a, outdir)
+    if rec["effort_used"] == "none":
+        a.effort = "none"   # the endpoint refused output_config.effort; the arms leave it out too
+    if mode == "probe":
+        out("Probe spent $%.5f. %s" % (guard.spent, "Next: --run." if rec["verdict"] == probe.ACCEPTED else "No --run until this is ACCEPTED."))
+        return 0 if rec["verdict"] == probe.ACCEPTED else 4
+    if rec["verdict"] != probe.ACCEPTED:
+        out("Stopping before the paid arms: the probe did not say ACCEPTED. Spent $%.5f." % guard.spent)
+        return 4
+    multi = len(sizes) > 1
+    code, entries = 0, []
+    for i, size in enumerate(sizes):
+        sub = os.path.join(outdir, str(size)) if multi else outdir
+        os.makedirs(sub, exist_ok=True)
+        cfg = {"model": a.model, "tokens": size, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
+               "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "checks": a.checks and i == 0,
+               "expiry_test": a.expiry_test and i == 0, "expiry_wait": a.expiry_wait, "max_usd": a.max_usd,
+               "max_tokens": a.max_tokens, "effort": a.effort, "seed": a.seed, "margin": a.margin,
+               "chars_per_token": a.chars_per_token, "retries": a.retries, "small_tokens": 2000,
+               "salt_nonce": ("%s-%d" % (stamp, size)) if multi else stamp,   # a different cold prefix for every size
+               "estimated_worst_case_usd": round(total, 4), "sizes": sizes}
+        if multi:
+            out("=== history size %d tokens (%d of %d) ===" % (size, i + 1, len(sizes)))
+        runner = Runner(cfg, client, sub, log=out, guard=guard)
+        code = runner.run()
+        entries.append((size, runner.status, report.summarize(runner.records)))
+        if multi:
+            report.write_text(outdir, "results.md", report.render_sizes_md(entries, cfg, runner.status if code else "complete so far" if i + 1 < len(sizes) else "complete", guard.spent))
+        if code:
+            break
+    out("Wrote results.json and results.md (not the key, no ids) under %s." % outdir)
     return code
 
 
@@ -192,6 +272,9 @@ def safe_main():
     except KeyboardInterrupt:
         out("interrupted")
         return 130
+    except SpendCap as e:
+        out("stopped at the spend cap: %s" % e)
+        return 3
     except SystemExit:
         raise
     except Exception as e:  # never show a raw traceback (it could carry request details)
