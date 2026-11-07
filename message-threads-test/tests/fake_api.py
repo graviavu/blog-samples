@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import itertools
 import json
+import re
 import threading
 import time
 
@@ -36,6 +37,9 @@ class State:
         self.usage_scale = 1         # inflate reported tokens to blow past the estimate
         self.think = False           # emit a thinking_delta first
         self.expire_after = None     # seconds; threads older than this 404
+        self.ignore_thread_context = False  # a continue that answers from the new message alone
+        self.reject_threads = False  # 400 on any request that carries thread (an account without the beta)
+        self.reject_effort = False   # 400 on output_config.effort
         self.event = threading.Event()
 
 
@@ -71,6 +75,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(*err(404, "not_found_error", "no such route"))
         if not hdrs.get("x-api-key"):
             return self.send_json(*err(401, "authentication_error", "missing key"))
+        if action == "401":
+            return self.send_json(*err(401, "authentication_error", "invalid x-api-key"))
+        if st.reject_threads and "thread" in body:
+            return self.send_json(*err(400, "invalid_request_error", "thread: Extra inputs are not permitted"))
+        if st.reject_effort and "output_config" in body:
+            return self.send_json(*err(400, "invalid_request_error", "output_config.effort: not supported"))
         if action == "500":
             return self.send_json(*err(500, "api_error", "injected failure"))
         status, obj = self.prepare(st, body, hdrs)
@@ -137,6 +147,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         usage, uncached = self.usage_for(st, conv)
         mid = "msg_%024x" % next(st.counter)
         text = "Reply to %s" % json.dumps(conv["messages"][-1])[-30:].replace('"', "").replace("\\", "")
+        if "codeword?" in json.dumps(conv["messages"][-1]):   # answer from the stored conversation, as a real thread would
+            m = re.search(r"PELICAN-\d+", json.dumps(conv["messages"][:-1]))
+            text = m.group(0) if m and not st.ignore_thread_context else "I do not know"
         time.sleep(st.base_delay + st.delay_per_token * uncached)
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")

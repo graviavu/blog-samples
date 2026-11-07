@@ -41,7 +41,7 @@ class StubCase(unittest.TestCase):
 
     def go(self, extra=(), cap="10", confirm=None, **kw):
         confirm = "SPEND UP TO $%s\n" % cap if confirm is None else confirm
-        return run_cli(["--run"] + SMALL + ["--max-usd", cap, "--results-dir", self.res] + list(extra), url=self.srv.url, stdin=confirm, **kw)
+        return run_cli(["--run", "--skip-probe"] + SMALL + ["--max-usd", cap, "--results-dir", self.res] + list(extra), url=self.srv.url, stdin=confirm, **kw)
 
     def results(self):
         dirs = sorted(os.listdir(self.res))

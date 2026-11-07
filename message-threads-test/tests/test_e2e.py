@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 
+from threads_test import pricing, probe
 from tests.helpers import CLI, FAKE_KEY, SMALL, StubCase, env_for, run_cli
 
 
@@ -19,19 +21,23 @@ class DryRun(StubCase):
         self.assertIn("PLANNED UPPER BOUND", r.stdout)
         self.assertIn("no network call made", r.stdout)
 
-    def test_no_flag_does_nothing(self):
-        r = run_cli([], url=self.srv.url)
-        self.assertEqual(r.returncode, 2)
+    def test_no_flag_is_a_dry_run(self):
+        r = run_cli([], url=self.srv.url, key="")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(len(self.st.log), 0)
+        self.assertIn("PLANNED UPPER BOUND", r.stdout)
+        self.assertIn("Next: --probe", r.stdout)
 
     def test_there_is_no_yes_flag(self):
         r = run_cli(["--run", "--yes"], url=self.srv.url)
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(len(self.st.log), 0)
 
-    def test_dry_run_shows_500k_alongside_100k(self):
+    def test_dry_run_shows_500k_alongside_the_default_sizes(self):
         r = run_cli(["--dry-run"], key="")
         self.assertIn("--tokens 500000", r.stdout)
+        self.assertIn("size 20000 tokens", r.stdout)
+        self.assertIn("size 100000 tokens", r.stdout)
         self.assertIn("PLANNED UPPER BOUND", r.stdout)
 
     def test_estimate_over_cap_refuses_real_run(self):
@@ -272,9 +278,9 @@ class Interrupt(StubCase):
     def test_sigint_flushes_partial_results_and_prints_spend(self):
         self.st.base_delay = 0.4
         env = env_for(self.srv.url)
-        p = subprocess.Popen([sys.executable, "-I", CLI, "--run"] + SMALL + ["--results-dir", self.res], stdin=subprocess.PIPE,
+        p = subprocess.Popen([sys.executable, "-I", CLI, "--run", "--skip-probe"] + SMALL + ["--results-dir", self.res], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-        p.stdin.write("SPEND UP TO $10\n")
+        p.stdin.write("SPEND UP TO $5\n")   # the default cap
         p.stdin.flush()
         deadline = time.time() + 30
         while len(self.st.log) < 3 and time.time() < deadline:
@@ -338,13 +344,259 @@ class CapValidation(unittest.TestCase):
             self.assertNotIn("PLANNED UPPER BOUND", r.stdout, bad)
 
     def test_good_caps_accepted(self):
-        for ok in ("10", "9.99", "0.01"):
+        for ok in ("10", "9.99", "5", "0.5"):
             r = run_cli(["--dry-run", "--max-usd", ok], key="")
             self.assertEqual(r.returncode, 0, ok)
 
     def test_no_override_flag(self):
         r = run_cli(["--dry-run", "--max-usd", "20", "--force"], key="")
         self.assertEqual(r.returncode, 2)
+
+
+class DefaultBound(unittest.TestCase):
+    """The default plan (20K and 100K tokens, Haiku 5.5) must have a worst case, with retries, replays and the probe, of at most $5."""
+
+    def bound(self, args):
+        r = run_cli(["--dry-run"] + args, key="")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        m = re.search(r"PLANNED UPPER BOUND\s+\$([0-9.]+)\s+\(cap \$([0-9.]+)", r.stdout)
+        self.assertTrue(m, r.stdout)
+        return float(m.group(1)), float(m.group(2)), r.stdout
+
+    def test_default_worst_case_is_at_most_5_dollars(self):
+        total, cap, text = self.bound([])
+        self.assertLessEqual(total, 5.0)
+        self.assertEqual(cap, 5.0)
+        self.assertGreater(total, 3.0)   # the bound is not accidentally tiny
+        self.assertNotIn("EXCEEDS THE CAP", text)
+
+    def test_default_covers_the_two_sizes_and_the_probe(self):
+        _, _, text = self.bound([])
+        self.assertIn("20000, 100000 tokens", text)
+        self.assertIn("up to 4 tiny requests", text)
+        self.assertIn("includes retries and replays and the probe", text)
+
+    def test_the_bound_sums_the_sizes_and_the_probe(self):
+        a = {"turns": 3, "reps": 2, "nocache_turns": 2, "nocache_reps": 1, "reload_reps": 2, "expiry_test": False,
+             "margin": 1.25, "max_tokens": 512, "small_tokens": 2000, "checks": True, "retries": 1}
+        e = pricing.estimate_sizes("claude-haiku-5-5", a, [20000, 100000])
+        self.assertEqual([t for t, _ in e["per_size"]], [20000, 100000])
+        self.assertAlmostEqual(e["total"], sum(x["total"] for _, x in e["per_size"]))
+        self.assertEqual(e["per_size"][0][1]["counts"]["checks"], 2)   # checks run once, at the first size
+        self.assertEqual(e["per_size"][1][1]["counts"]["checks"], 0)
+        total = e["total"] + probe.bound("claude-haiku-5-5")
+        self.assertLessEqual(total, 5.0)
+        self.assertLess(pricing.typical("claude-haiku-5-5", a, [20000, 100000]), total / 4)
+
+    def test_100k_alone_with_old_defaults_is_over_5(self):
+        total, cap, text = self.bound(["--tokens", "100000", "--reps", "3", "--turns", "5", "--nocache-reps", "2"])
+        self.assertGreater(total, 5.0)
+        self.assertIn("EXCEEDS THE CAP", text)
+
+    def test_raising_the_size_needs_the_cap_raised_and_the_phrase(self):
+        reduced = ["--tokens", "500000", "--reps", "1", "--turns", "2", "--nocache-reps", "1", "--nocache-turns", "1", "--no-checks"]
+        total, cap, text = self.bound(reduced)
+        self.assertGreater(total, 5.0)
+        self.assertLessEqual(total, 10.0)
+        r = run_cli(["--run"] + reduced, key="x", stdin="SPEND UP TO $5\n")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("Refusing to start", r.stdout)
+        total2, cap2, _ = self.bound(reduced + ["--max-usd", "10"])
+        self.assertEqual(cap2, 10.0)
+        self.assertNotIn("EXCEEDS", run_cli(["--dry-run", "--max-usd", "10"] + reduced, key="").stdout)
+
+    def test_tokens_and_sizes_together_refused(self):
+        r = run_cli(["--dry-run", "--tokens", "5000", "--sizes", "1000,2000"], key="")
+        self.assertEqual(r.returncode, 2)
+
+    def test_bad_sizes_refused(self):
+        for bad in ("0", "abc", "100,100", "1,2,3,4,5", ""):
+            r = run_cli(["--dry-run", "--sizes", bad], key="")
+            self.assertEqual(r.returncode, 2, bad)
+
+
+class MultiSize(StubCase):
+    def sizes_run(self, extra=()):
+        return run_cli(["--run", "--skip-probe", "--sizes", "2000,4000", "--turns", "2", "--reps", "2", "--nocache-turns", "2",
+                        "--nocache-reps", "1", "--max-tokens", "64", "--chars-per-token", "4.0", "--results-dir", self.res] + list(extra),
+                       url=self.srv.url, stdin="SPEND UP TO $5\n")
+
+    def test_two_sizes_run_smallest_first_in_their_own_folders(self):
+        r = self.sizes_run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        stamp = os.path.join(self.res, os.listdir(self.res)[0])
+        self.assertEqual(sorted(os.listdir(stamp)), ["2000", "4000", "results.md"])
+        for sz in ("2000", "4000"):
+            self.assertEqual(sorted(os.listdir(os.path.join(stamp, sz))), ["results.json", "results.md"])
+        with open(os.path.join(stamp, "results.md")) as f:
+            md = f.read()
+        self.assertIn("latency versus context size", md)
+        self.assertIn("| 2000 |", md)
+        self.assertIn("| 4000 |", md)
+        with open(os.path.join(stamp, "2000", "results.json")) as f:
+            small = json.load(f)
+        with open(os.path.join(stamp, "4000", "results.json")) as f:
+            big = json.load(f)
+        self.assertIn("a_bogus_id_404_and_replay", small["checks"])
+        self.assertEqual(big["checks"], {})     # the checks run once, at the first size
+        self.assertGreater(big["summary"]["arms"]["2"]["tokens_median"]["cache_read_input_tokens"],
+                           small["summary"]["arms"]["2"]["tokens_median"]["cache_read_input_tokens"])
+
+    def test_the_spend_cap_is_shared_across_sizes(self):
+        r = self.sizes_run()
+        stamp = os.path.join(self.res, os.listdir(self.res)[0])
+        with open(os.path.join(stamp, "2000", "results.json")) as f:
+            first = json.load(f)["spent_usd"]
+        with open(os.path.join(stamp, "4000", "results.json")) as f:
+            second = json.load(f)["spent_usd"]
+        self.assertGreater(second, first)       # cumulative: one guard for the whole run
+
+    def test_every_size_has_its_own_cold_prefix(self):
+        self.sizes_run()
+        salts = {}
+        for path, hdrs, body in self.st.log:
+            sysx = body.get("system") or ""
+            if sysx.startswith("[salt "):
+                salts.setdefault(sysx[6:30], 0)
+                salts[sysx[6:30]] += 1
+        first_per_size = [k for k in salts]
+        self.assertEqual(len(first_per_size), len(set(first_per_size)))
+        # arm 4 reloads at the two sizes use different salts, so the second size never reads the first size's cache
+        doc_cold = 0
+        for d in os.listdir(os.path.join(self.res, os.listdir(self.res)[0])):
+            if d.isdigit():
+                with open(os.path.join(self.res, os.listdir(self.res)[0], d, "results.json")) as f:
+                    doc_cold += json.load(f)["summary"]["cache"]["cold_prefix_not_cold"]
+        self.assertEqual(doc_cold, 0)
+
+
+class Probe(StubCase):
+    def probe(self, extra=(), cap="5", confirm=None, key=FAKE_KEY):
+        confirm = "SPEND UP TO $%s\n" % cap if confirm is None else confirm
+        return run_cli(["--probe", "--max-usd", cap, "--results-dir", self.res] + list(extra), url=self.srv.url, stdin=confirm, key=key)
+
+    def test_accepted_makes_exactly_three_requests_and_costs_under_a_cent(self):
+        r = self.probe()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PROBE VERDICT: ACCEPTED", r.stdout)
+        self.assertEqual(len(self.st.log), 3)
+        plain, create, cont = [b for _, _, b in self.st.log]
+        self.assertNotIn("thread", plain)
+        self.assertEqual(create["thread"], {"type": "create"})
+        self.assertEqual(cont["thread"]["type"], "continue")
+        self.assertNotIn("system", cont)
+        self.assertNotIn("tools", cont)
+        hdrs = [h for _, h, _ in self.st.log]
+        self.assertNotIn("anthropic-beta", hdrs[0])
+        self.assertEqual(hdrs[1]["anthropic-beta"], "message-threads-2026-08-12")
+        self.assertEqual(hdrs[2]["anthropic-beta"], "message-threads-2026-08-12")
+        for b in (plain, create, cont):
+            self.assertEqual(b["model"], "claude-haiku-5-5")
+            self.assertEqual(b["output_config"], {"effort": "low"})
+        with open(os.path.join(self.res, os.listdir(self.res)[0], "probe.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["verdict"], "ACCEPTED")
+        self.assertLess(rec["spent_usd"], 0.01)
+        self.assertLess(probe.bound("claude-haiku-5-5"), 0.01)
+
+    def test_the_continue_sends_only_the_question_and_the_codeword_comes_from_the_create(self):
+        self.probe()
+        _, create, cont = [b for _, _, b in self.st.log]
+        word = re.search(r"PELICAN-\d+", json.dumps(create)).group(0)
+        self.assertNotIn(word, json.dumps(cont))
+        self.assertEqual(len(cont["messages"]), 1)
+
+    def test_needs_the_typed_phrase_and_the_key(self):
+        for bad in ("yes\n", "SPEND UP TO $10\n", ""):
+            r = self.probe(confirm=bad)
+            self.assertEqual(r.returncode, 2)
+            self.assertEqual(len(self.st.log), 0)
+        r = self.probe(key="")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(len(self.st.log), 0)
+
+    def test_the_key_is_never_printed_or_written(self):
+        r = self.probe()
+        self.assertNotIn(FAKE_KEY, r.stdout + r.stderr + self.all_text())
+
+    def test_rejected_when_the_beta_header_is_refused(self):
+        self.st.reject_threads = True
+        r = self.probe()
+        self.assertEqual(r.returncode, 4, r.stdout)
+        self.assertIn("PROBE VERDICT: REJECTED", r.stdout)
+        self.assertIn("HTTP 400", r.stdout)
+        self.assertEqual(len(self.st.log), 2)   # plain, then the refused create: no continue
+
+    def test_inconclusive_when_the_plain_request_fails(self):
+        self.st.actions = ["401"]
+        r = self.probe()
+        self.assertEqual(r.returncode, 4, r.stdout)
+        self.assertIn("PROBE VERDICT: INCONCLUSIVE", r.stdout)
+        self.assertEqual(len(self.st.log), 1)   # nothing else is sent
+
+    def test_inconclusive_when_the_continue_names_a_thread_error(self):
+        self.st.expire_after = 0.0
+        r = self.probe()
+        self.assertEqual(r.returncode, 4, r.stdout)
+        self.assertIn("INCONCLUSIVE", r.stdout)
+        self.assertIn("thread_not_found", r.stdout)
+
+    def test_effort_refused_retries_the_plain_request_without_it(self):
+        self.st.reject_effort = True
+        r = self.probe()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        bodies = [b for _, _, b in self.st.log]
+        self.assertEqual(len(bodies), 4)
+        self.assertIn("output_config", bodies[0])
+        for b in bodies[1:]:
+            self.assertNotIn("output_config", b)
+
+    def test_a_continue_that_ignores_the_thread_is_inconclusive_not_accepted(self):
+        self.st.ignore_thread_context = True
+        r = self.probe()
+        self.assertEqual(r.returncode, 4, r.stdout)
+        self.assertIn("PROBE VERDICT: INCONCLUSIVE", r.stdout)
+        self.assertIn("thread field may have been ignored", r.stdout)
+
+    def test_probe_makes_no_arm_requests_and_writes_only_probe_json(self):
+        self.probe()
+        self.assertEqual(os.listdir(os.path.join(self.res, os.listdir(self.res)[0])), ["probe.json"])
+
+    def test_run_stops_after_a_rejected_probe_without_spending_on_the_arms(self):
+        self.st.reject_threads = True
+        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n")
+        self.assertEqual(r.returncode, 4, r.stdout)
+        self.assertIn("Stopping before the paid arms", r.stdout)
+        self.assertEqual(len(self.st.log), 2)
+
+    def test_run_probes_first_then_runs_the_arms(self):
+        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PROBE VERDICT: ACCEPTED", r.stdout)
+        self.assertGreater(len(self.st.log), 3)
+        self.assertEqual(self.st.log[0][2]["max_tokens"], 256)   # the probe came first
+        stamp = os.path.join(self.res, os.listdir(self.res)[0])
+        self.assertEqual(sorted(os.listdir(stamp)), ["probe.json", "results.json", "results.md"])
+
+    def test_decide_rules(self):
+        from threads_test.client import Result
+
+        def res(status, ok=False, code=None):
+            x = Result()
+            x.status, x.error_code = status, code
+            if ok:
+                x.complete = True
+            return x
+        good = res(200, True)
+        self.assertEqual(probe.decide(None, None, None, False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(res(401), None, None, False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(good, res(400, code="thread_unsupported_request"), None, False)[0], "REJECTED")
+        self.assertEqual(probe.decide(good, res(503), None, False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(good, res(429), None, False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(good, good, res(404, code="thread_not_found"), False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(good, good, res(400), False)[0], "REJECTED")
+        self.assertEqual(probe.decide(good, good, good, False)[0], "INCONCLUSIVE")
+        self.assertEqual(probe.decide(good, good, good, True)[0], "ACCEPTED")
 
 
 class CountTokens(StubCase):
@@ -383,11 +635,11 @@ class TopLevelHandler(StubCase):
 
 
 class Wrapper(unittest.TestCase):
-    def test_run_test_sh_refuses_without_flag(self):
+    def test_run_test_sh_with_no_flag_is_a_dry_run(self):
         sh = os.path.join(os.path.dirname(CLI), "..", "run-test.sh")
         r = subprocess.run([sh], capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("Nothing done", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no network call made", r.stdout)
 
 
 if __name__ == "__main__":
