@@ -104,6 +104,17 @@ below all read the same. What the re-read corrected or added:
 - Worst case at list prices: four requests at 400 prompt tokens and 256 output tokens, about $0.0007. Real cost is a fraction of that.
 - UNKNOWN until R runs it: whether this account is allowed the beta, which status and code a refusal returns, and whether a 256-token cap leaves room for the codeword after a short thought at `effort: low`. If the reply is cut before the codeword the verdict is INCONCLUSIVE, not ACCEPTED.
 
+## Errors page (platform.claude.com/docs/en/api/errors, read 2026-11-07 by plain HTTP fetch and text search; WebFetch was not available to the builder)
+
+- 400 `invalid_request_error`: bad format or content; also returned when usage reaches an organization or workspace spend limit you set (the Claude Code workspace can return a 429 instead).
+- 401 `authentication_error`: a problem with the API key (malformed, revoked, expired). 402 `billing_error`: "There's an issue with your billing or payment information." 403 `permission_error`: the key may not use the resource.
+- 429 `rate_limit_error`: a rate limit, a usage tier's monthly spend cap, or a Claude Code workspace spend limit. A tier spend-cap 429 has no `retry-after` header and keeps failing until access resumes.
+- 500 `api_error`, 504 `timeout_error`, 529 `overloaded_error` are transient; 413 `request_too_large`.
+- An error can also arrive as an `error` event after a 200 in a stream.
+- UNKNOWN: the exact message text of a "credit balance too low" error (not on that page; which status and type it uses is also not stated beyond the list above). The sample therefore also stops on a 400, 403 or 429 whose body mentions credit, balance, billing, quota, spend limit or cap, payment, insufficient funds or purchase. That keyword list is a guess.
+- UNKNOWN: whether a plain rate-limit 429 always carries `retry-after`. The sample treats a 429 without it as a possible spend cap and stops (a PARTIAL that can be resumed).
+- UNKNOWN: whether a stream cut by such an error is billed. It is charged at its bound.
+
 ## Not verified
 
 - Everything above comes from the docs text (re-read 2026-11-07). No request was made to the API while writing or re-checking this sample.

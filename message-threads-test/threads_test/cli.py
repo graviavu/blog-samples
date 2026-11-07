@@ -1,5 +1,7 @@
 """Entry point. No flag (or --dry-run) prints the plan and the worst-case cost and makes no network call.
---probe is step 1 (a few tiny requests), --run is the probe and then the arms. Both paid modes need the typed phrase SPEND UP TO $<cap>."""
+--probe is step 1 (a few tiny requests), --run is the probe and then the arms, --all is the whole thing in one go (probe, free token count,
+arms, summary), --resume DIR finishes a PARTIAL folder. Every paid mode needs the typed phrase SPEND UP TO $<cap>, once.
+Exit codes: 0 done, 2 refused or not confirmed, 3 spend cap, 4 aborted or probe not ACCEPTED, 5 credit/billing/quota error, 6 key not accepted, 130 Ctrl-C."""
 import argparse
 import json
 import math
@@ -16,6 +18,8 @@ from threads_test import pricing  # noqa: E402
 from threads_test import probe  # noqa: E402
 from threads_test import report  # noqa: E402
 from threads_test import redact as R  # noqa: E402
+from threads_test import resume as RS  # noqa: E402
+from threads_test.client import FatalApiError  # noqa: E402
 from threads_test.runner import Guard, Runner, SpendCap  # noqa: E402
 
 DEFAULT_BASE = "https://api.anthropic.com"
@@ -26,7 +30,7 @@ def out(msg=""):
 
 
 HARD_CEILING = 10.0
-DEFAULT_CAP = 5.0
+DEFAULT_CAP = 4.5   # of R's $5 of credit, $0.50 is never touched; the default plan's bound is $4.44
 DEFAULT_SIZES = [20000, 100000]
 
 
@@ -58,6 +62,8 @@ def parser():
     m.add_argument("--dry-run", action="store_true", help="print the plan and the worst-case cost; no network call, no files (also what you get with no flag)")
     m.add_argument("--probe", action="store_true", help="step 1: a few tiny requests on a small model; does this key accept the threads beta? Under 1 cent. Asks for the typed phrase")
     m.add_argument("--run", action="store_true", help="the probe, then the latency arms (stops after the probe unless it says ACCEPTED). Asks for the typed phrase")
+    m.add_argument("--all", action="store_true", help="the whole test in one command: plan, the typed phrase once, the probe (stops unless ACCEPTED), the free token count (refuses or adjusts the history size before any full-size request), the arms, the summary")
+    p.add_argument("--resume", metavar="RESULTS_DIR", default=None, help="finish a PARTIAL (or complete) results folder: skips the arms and sizes already done, runs the rest like --all, with the same flags, the same phrase and the cap applied to what is left (spend so far is read from the saved files). With --dry-run: only shows what is left")
     p.add_argument("--skip-probe", action="store_true", help="with --run: do not repeat the probe (only after --probe said ACCEPTED; saves under 1 cent)")
     p.add_argument("--probe-model", default="claude-haiku-5-5", help="model for the probe (default claude-haiku-5-5, the cheapest)")
     p.add_argument("--model", default="claude-haiku-5-5", help="default: the cheapest model with a price in DOCS-NOTES.md")
@@ -135,12 +141,16 @@ def print_plan(a, sizes, est, probe_ub, mode):
     return total
 
 
-def count_check(a, size, base, key):
-    """Opt-in: count the generated history once with the free count_tokens endpoint. Returns an error text or None."""
-    hist = convo.build_history(a.seed, size, a.chars_per_token)
+def count_tokens_of(a, size, cpt, base, key):
+    hist = convo.build_history(a.seed, size, cpt)
     body = {"model": a.model, "system": convo.system_text("0" * 24), "tools": convo.TOOLS, "messages": hist}
+    return C.Client(base, key, a.timeout, a.base_url_host).count_tokens(body)
+
+
+def count_check(a, size, base, key):
+    """Opt-in (--run --count-tokens): count the generated history once with the free count_tokens endpoint. Returns an error text or None."""
     try:
-        n = C.Client(base, key, a.timeout, a.base_url_host).count_tokens(body)
+        n = count_tokens_of(a, size, a.chars_per_token, base, key)
     except ValueError as e:
         return "error: %s" % e
     out("count_tokens (free, counted once): the %d-token history is %d tokens (ratio %.2f)." % (size, n, n / size))
@@ -149,14 +159,55 @@ def count_check(a, size, base, key):
     return None
 
 
+def count_adjust(a, size, cpt, base, key):
+    """--all: count the history (free), and when it is over --token-margin x size, or under 70% of the size, rebuild it once with the
+    measured characters-per-token and count again. Returns (chars_per_token, None) or (None, refusal text). The cost bound depends on
+    the size and the margin, not on the ratio, so an adjusted history keeps the bound."""
+    lo, hi = size * 0.7, size * a.margin
+    for attempt in (1, 2):
+        try:
+            n = count_tokens_of(a, size, cpt, base, key)
+        except ValueError as e:
+            return None, "error: %s" % e
+        out("count_tokens (free): the %d-token history is %d tokens (ratio %.2f, --chars-per-token %.2f)." % (size, n, n / size, cpt))
+        if lo <= n <= hi:
+            return cpt, None
+        if attempt == 2:
+            break
+        new = cpt * size / max(n, 1)
+        if not (math.isfinite(new) and 2.0 <= new <= 4.5):
+            return None, "Refusing to start: the history is %d tokens for a size of %d and the measured ratio would need --chars-per-token %.2f, outside 2.0 to 4.5. Nothing was sent at full size." % (n, size, new)
+        out("  adjusting --chars-per-token %.2f -> %.2f for this size and counting again (free)." % (cpt, new))
+        cpt = new
+    return None, "Refusing to start: after one adjustment the %d-token history still counts %d tokens (allowed %d to %d). Nothing was sent at full size." % (size, n, lo, hi)
+
+
 def write_json(outdir, name, obj):
     report.write_text(outdir, name, json.dumps(R.redact_obj(obj), indent=2, sort_keys=True) + "\n")
+
+
+def stop_message(kind, reason, spent, outdir, stage=None):
+    what = ("the API reported a credit, billing or quota problem" if kind == "billing"
+            else "the API did not accept the key (or it may not use this model or beta)")
+    L = ["", "STOPPED: %s." % what, "  %s" % reason,
+         "  Nothing more was sent and nothing was retried. Spent so far (counted from the usage fields): $%.5f. The refused request is charged nothing." % spent]
+    if stage:
+        L.append("  Stage reached: size %s tokens, arm %s, repetition %s, turn %s (%s)." % (stage.get("tokens"), stage.get("arm"), stage.get("rep"), stage.get("turn"), stage.get("kind")))
+    if outdir:
+        L.append("  Partial results (marked PARTIAL) are in %s and usable as they are." % outdir)
+        L.append("  If your balance allows it later: ./run-test.sh --resume %s   (same flags; only the arms not yet done run)" % outdir)
+    L.append("  Check your balance and plan in the Console." if kind == "billing" else "  Check ANTHROPIC_API_KEY.")
+    return "\n".join(L)
 
 
 def run_probe(client, guard, a, outdir):
     rec = {}
     try:
         probe.run(client, guard, a.probe_model, a.effort, out, rec)
+    except FatalApiError as e:
+        rec.update(verdict="PARTIAL", reason="PARTIAL: %s error, stopped at once, no retry (%s)" % (e.kind, e.reason), spent_usd=round(guard.spent, 6))
+        write_json(outdir, "probe.json", rec)
+        raise
     except BaseException as e:   # Ctrl-C, SIGTERM or the spend cap: keep what the probe knows
         rec["reason"] = "stopped early (%s)" % type(e).__name__
         rec["spent_usd"] = round(guard.spent, 6)
@@ -172,9 +223,52 @@ def run_probe(client, guard, a, outdir):
     return rec
 
 
+def size_cfg(a, i, size, sizes, total, effort):
+    return {"model": a.model, "tokens": size, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
+            "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "checks": a.checks and i == 0,
+            "expiry_test": a.expiry_test and i == 0, "expiry_wait": a.expiry_wait, "max_usd": a.max_usd,
+            "max_tokens": a.max_tokens, "effort": effort, "seed": a.seed, "margin": a.margin,
+            "chars_per_token": a.chars_per_token, "retries": a.retries, "small_tokens": 2000,
+            "estimated_worst_case_usd": round(total, 4), "sizes": sizes}
+
+
+def size_done(a, st, want_checks):
+    """Is every arm of this size (and its checks, when wanted) already complete in the saved state?"""
+    return bool(st) and len(st["done"]) == a.nocache_reps + 2 * a.reps + a.reload_reps and (st["checks_done"] or not want_checks)
+
+
+def resume_plan(a, sizes, saved, probe_ub):
+    """Print what is left and return (remaining bound in dollars including the probe if it must be repeated)."""
+    pa = plan_args(a)
+    out("RESUME PLAN (nothing is sent in a dry run)")
+    out("  results folder       %s" % a.resume)
+    out("  spent so far         $%.4f (the highest of what the saved files claim and what their records add up to, plus any request that was on the wire)" % saved["spent"])
+    total = 0.0
+    if saved["probe_ok"]:
+        out("  step 1 probe         already ACCEPTED in the saved probe.json: not repeated")
+    else:
+        total += probe_ub
+        out("  step 1 probe         not ACCEPTED yet in the saved folder: repeated, at most $%.4f" % probe_ub)
+    for i, size in enumerate(sizes):
+        st = saved["sizes"].get(size)
+        ai = dict(pa, tokens=size, checks=a.checks and i == 0, expiry_test=a.expiry_test and i == 0)
+        counts = pricing.remaining_counts(ai, st["done"], st["checks_done"]) if st else None
+        e = pricing.estimate(a.model, ai, counts)
+        total += e["total"]
+        c = e["counts"]
+        done = "none" if not st else ", ".join("arm %d rep %d" % u for u in sorted(st["done"])) or "none"
+        out("  --- size %d tokens: done %s%s" % (size, done, "; behaviour checks done" if st and st["checks_done"] and ai["checks"] else ""))
+        out("      left: %d full-size + %d small requests, %d full-size attempts with replays and retries; bound $%.2f" % (c["sized"], c["small"], c["attempts"], e["total"]))
+    out("  REMAINING UPPER BOUND $%.2f  + spent $%.4f = $%.2f   (cap $%.2f; real spend is lower)" % (total, saved["spent"], total + saved["spent"], a.max_usd))
+    return total
+
+
 def main(argv=None):
     a = parser().parse_args(argv)
-    mode = "run" if a.run else "probe" if a.probe else "dry"
+    if a.resume and (a.run or a.probe):
+        out("error: --resume goes with --all or alone (it runs like --all), not with --run or --probe")
+        return 2
+    mode = "dry" if a.dry_run else "all" if (a.all or a.resume) else "run" if a.run else "probe" if a.probe else "dry"
     if a.reload_reps is None:
         a.reload_reps = a.reps
     sizes = [a.tokens] if a.tokens is not None else list(a.sizes)
@@ -193,6 +287,9 @@ def main(argv=None):
     if a.effort not in ("none", "low", "medium", "high", "xhigh", "max"):
         out("error: --effort must be none, low, medium, high, xhigh or max")
         return 2
+    if a.skip_probe and (a.all or a.resume):
+        out("error: --skip-probe does not go with --all or --resume (the probe is part of the automatic run; it is skipped by itself when a saved probe.json already says ACCEPTED)")
+        return 2
     try:
         est = pricing.estimate_sizes(a.model, plan_args(a), sizes)
         probe_ub = probe.bound(a.probe_model)
@@ -205,12 +302,30 @@ def main(argv=None):
     except ValueError as e:
         out("error: ANTHROPIC_BASE_URL: %s" % e)
         return 2
-    total = print_plan(a, sizes, est, probe_ub, mode)
+    saved = None
+    if a.resume:
+        def want_for(i, size, effort_used):
+            return {"model": a.model, "tokens": size, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
+                    "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "max_tokens": a.max_tokens, "seed": a.seed,
+                    "margin": a.margin, "retries": a.retries, "checks": a.checks and i == 0, "expiry_test": a.expiry_test and i == 0,
+                    "effort": "none" if effort_used == "none" else a.effort, "sizes": sizes}
+        try:
+            saved = RS.load(a.resume, sizes, want_for, a.max_usd)
+        except RS.ResumeError as e:
+            out("Refusing to resume: %s" % e)
+            return 2
+        left = resume_plan(a, sizes, saved, probe_ub)
+        total = left + saved["spent"]
+        if saved["probe_ok"] and all(size_done(a, saved["sizes"][s], a.checks and k == 0) for k, s in enumerate(sizes)):
+            out("Nothing left to run: every arm and size in %s is complete." % a.resume)
+            return 0
+    else:
+        total = print_plan(a, sizes, est, probe_ub, mode)
     over = total > a.max_usd
     if over:
         out("  EXCEEDS THE CAP by $%.2f. %s" % (total - a.max_usd, "A paid run would refuse to start." if mode == "dry" else "Refusing to start."))
     if mode == "dry":
-        out("Dry run: no network call made, no file written. Next: --probe (cents), then --run.")
+        out("Dry run: no network call made, no file written. Next: ./run-test.sh --all (probe, token count, run, summary in one go), or --probe and then --run step by step.")
         return 0
     if over:
         out("Lower the sizes, --reps, --turns or --nocache-*, or raise --max-usd (at most %g), then run again." % HARD_CEILING)
@@ -225,12 +340,19 @@ def main(argv=None):
         return 2
     if a.count_tokens and mode == "run":
         for size in sizes:
-            msg = count_check(a, size, base, key)
+            try:
+                msg = count_check(a, size, base, key)
+            except FatalApiError as e:
+                out(stop_message(e.kind, e.reason, 0.0, None))
+                return 5 if e.kind == "billing" else 6
             if msg:
                 out(msg)
                 return 2
     out("")
-    out("This sends paid requests with your API key to %s and stops at the cap." % base)
+    if mode == "all":
+        out("This sends paid requests with your API key to %s, in this order: the probe (stops unless ACCEPTED), the free token count, then the arms, and stops at the cap." % base)
+    else:
+        out("This sends paid requests with your API key to %s and stops at the cap." % base)
     out("To go ahead type exactly: %s" % phrase(a.max_usd))
     sys.stdout.flush()
     reply = sys.stdin.readline().rstrip("\r\n")
@@ -238,9 +360,13 @@ def main(argv=None):
         out("Not confirmed. No calls made.")
         return 2
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    outdir = os.path.join(a.results_dir, stamp)
-    report.private_dir(a.results_dir)
-    report.private_dir(outdir)
+    if a.resume:
+        outdir = a.resume
+        stamp += "-resume"
+    else:
+        outdir = os.path.join(a.results_dir, stamp)
+        report.private_dir(a.results_dir)
+        report.private_dir(outdir)
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
@@ -248,41 +374,61 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, on_term)
     client = C.Client(base, key, a.timeout, a.base_url_host)
     guard = Guard(a.max_usd)
+    if saved:
+        guard.spent = saved["spent"]   # the cap covers the whole folder, not only this run
     out("Results go to %s" % outdir)
     if a.skip_probe and mode == "run":
         out("Probe skipped (--skip-probe): the arms start without checking that threads are accepted.")
         rec = {"verdict": probe.ACCEPTED, "effort_used": a.effort}
+    elif saved and saved["probe_ok"]:
+        out("Probe not repeated: the saved probe.json says ACCEPTED.")
+        rec = {"verdict": probe.ACCEPTED, "effort_used": saved["effort_used"] or a.effort}
     else:
-        rec = run_probe(client, guard, a, outdir)
+        try:
+            rec = run_probe(client, guard, a, outdir)
+        except FatalApiError as e:
+            out(stop_message(e.kind, e.reason, guard.spent, outdir))
+            return 5 if e.kind == "billing" else 6
     if rec["effort_used"] == "none":
         a.effort = "none"   # the endpoint refused output_config.effort; the arms leave it out too
     if mode == "probe":
-        out("Probe spent $%.5f. %s" % (guard.spent, "Next: --run." if rec["verdict"] == probe.ACCEPTED else "No --run until this is ACCEPTED."))
+        out("Probe spent $%.5f. %s" % (guard.spent, "Next: --all, or --run." if rec["verdict"] == probe.ACCEPTED else "No --run until this is ACCEPTED."))
         return 0 if rec["verdict"] == probe.ACCEPTED else 4
     if rec["verdict"] != probe.ACCEPTED:
         out("Stopping before the paid arms: the probe did not say ACCEPTED. Spent $%.5f." % guard.spent)
         return 4
     multi = len(sizes) > 1
-    code, entries = 0, []
+    code, entries, runner = 0, [], None
     for i, size in enumerate(sizes):
         sub = os.path.join(outdir, str(size)) if multi else outdir
         report.private_dir(sub)
-        cfg = {"model": a.model, "tokens": size, "turns": a.turns, "reps": a.reps, "nocache_turns": a.nocache_turns,
-               "nocache_reps": a.nocache_reps, "reload_reps": a.reload_reps, "checks": a.checks and i == 0,
-               "expiry_test": a.expiry_test and i == 0, "expiry_wait": a.expiry_wait, "max_usd": a.max_usd,
-               "max_tokens": a.max_tokens, "effort": a.effort, "seed": a.seed, "margin": a.margin,
-               "chars_per_token": a.chars_per_token, "retries": a.retries, "small_tokens": 2000,
-               "salt_nonce": ("%s-%d" % (stamp, size)) if multi else stamp,   # a different cold prefix for every size
-               "estimated_worst_case_usd": round(total, 4), "sizes": sizes}
+        st = saved["sizes"].get(size) if saved else None
+        cfg = size_cfg(a, i, size, sizes, total, a.effort)
+        cfg["salt_nonce"] = ("%s-%d" % (stamp, size)) if multi else stamp   # a different cold prefix for every size and for a resumed run
+        if st:
+            cfg["chars_per_token"] = st["chars_per_token"]   # the same history as the arms already done
+        if mode == "all" and not size_done(a, st, cfg["checks"]):
+            try:
+                cpt, why = count_adjust(a, size, cfg["chars_per_token"], base, key)
+            except FatalApiError as e:
+                out(stop_message(e.kind, e.reason, guard.spent, outdir))
+                return 5 if e.kind == "billing" else 6
+            if why:
+                out(why)
+                out("Spent $%.5f (the probe only%s). No full-size request was sent for this size." % (guard.spent, "" if not entries else " and the earlier sizes"))
+                return 2
+            cfg["chars_per_token"] = cpt
         if multi:
             out("=== history size %d tokens (%d of %d) ===" % (size, i + 1, len(sizes)))
-        runner = Runner(cfg, client, sub, log=out, guard=guard)
+        runner = Runner(cfg, client, sub, log=out, guard=guard, resume=st)
         code = runner.run()
         entries.append((size, runner.status, report.summarize(runner.records)))
         if multi:
             report.write_text(outdir, "results.md", report.render_sizes_md(entries, cfg, runner.status if code else "complete so far" if i + 1 < len(sizes) else "complete", guard.spent))
         if code:
             break
+    if code in (5, 6) and runner and runner.partial:
+        out(stop_message(runner.partial["kind"], runner.partial["reason"], guard.spent, outdir, runner.partial.get("stage")))
     out("Wrote results.json and results.md (not the key; ids matching known patterns are redacted) under %s." % outdir)
     return code
 
@@ -296,6 +442,9 @@ def safe_main():
     except SpendCap as e:
         out("stopped at the spend cap: %s" % e)
         return 3
+    except FatalApiError as e:
+        out(stop_message(e.kind, e.reason, 0.0, None))
+        return 5 if e.kind == "billing" else 6
     except SystemExit:
         raise
     except Exception as e:  # never show a raw traceback (it could carry request details)

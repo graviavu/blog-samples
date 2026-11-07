@@ -68,10 +68,32 @@ def prompt_upper_bound(tokens, margin, turns, max_tokens):
     return int(math.ceil(tokens * margin)) + 1000 + turns * (max_tokens + 200)
 
 
-def estimate(model, a):
+def remaining_counts(a, done, checks_done):
+    """Request counts for what is left of a size after a partial run. done: set of (arm, rep) units already complete;
+    checks_done: the behaviour checks (and expiry test) already complete. Same keys as plan_counts."""
+    want = {1: a["nocache_reps"], 2: a["reps"], 3: a["reps"], 4: a["reload_reps"]}
+    left = {arm: sum(1 for rep in range(n) if (arm, rep) not in done) for arm, n in want.items()}
+    run_checks = a.get("checks", True) and not checks_done
+    c = {
+        "arm1": left[1] * a["nocache_turns"],
+        "arm2": left[2] * (1 + a["turns"]),
+        "arm3": left[3] * (1 + a["turns"]),
+        "arm4": left[4],
+        "checks": 2 if run_checks else 0,
+        "small": 2 if (a.get("expiry_test") and not checks_done) else 0,
+        "replays": left[3] * a["turns"],
+        "retries": a.get("retries", 1),
+    }
+    c["sized"] = c["arm1"] + c["arm2"] + c["arm3"] + c["arm4"] + c["checks"]
+    c["sized_with_replays"] = c["sized"] + c["replays"]
+    c["attempts"] = c["sized_with_replays"] * (1 + c["retries"])
+    return c
+
+
+def estimate(model, a, counts=None):
     """Planned upper bound in USD: every planned request, plus one replay per arm 3 continue, each attempted
-    1 + retries times, each at the per-request bound (no cache-read credit)."""
-    c = plan_counts(a)
+    1 + retries times, each at the per-request bound (no cache-read credit). counts: remaining_counts() on a resume."""
+    c = counts or plan_counts(a)
     grow_turns = max(a["turns"], a["nocache_turns"])
     ub = prompt_upper_bound(a["tokens"], a["margin"], grow_turns, a["max_tokens"])
     per = request_upper_bound(model, ub, a["max_tokens"])

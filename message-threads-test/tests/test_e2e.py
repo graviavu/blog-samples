@@ -26,7 +26,7 @@ class DryRun(StubCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(len(self.st.log), 0)
         self.assertIn("PLANNED UPPER BOUND", r.stdout)
-        self.assertIn("Next: --probe", r.stdout)
+        self.assertIn("Next: ./run-test.sh --all", r.stdout)
 
     def test_there_is_no_yes_flag(self):
         r = run_cli(["--run", "--yes"], url=self.srv.url)
@@ -68,7 +68,7 @@ class Confirmation(StubCase):
         self.assertEqual(os.listdir(self.res), [])
 
     def test_piped_stdin_is_refused_for_probe_and_before_count_tokens(self):
-        r = run_cli(["--probe", "--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n", pipe_stdin=True)
+        r = run_cli(["--probe", "--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $4.5\n", pipe_stdin=True)
         self.assertEqual(r.returncode, 2)
         r = run_cli(["--run", "--count-tokens"] + SMALL + ["--max-usd", "10", "--results-dir", self.res], url=self.srv.url,
                     stdin="SPEND UP TO $10\n", pipe_stdin=True)
@@ -373,7 +373,7 @@ class Hardening(StubCase):
 
     def test_l2_ctrl_c_during_the_probe_prints_spend_and_writes_partial_probe_json(self):
         self.st.base_delay = 1.0
-        p, master = spawn_tty(["--probe", "--results-dir", self.res], self.srv.url, text="SPEND UP TO $5\n")
+        p, master = spawn_tty(["--probe", "--results-dir", self.res], self.srv.url, text="SPEND UP TO $4.5\n")
         self.addCleanup(os.close, master)
         deadline = time.time() + 30
         while len(self.st.log) < 1 and time.time() < deadline:
@@ -412,7 +412,7 @@ class Interrupt(StubCase):
     def test_sigint_flushes_partial_results_and_prints_spend(self):
         self.st.base_delay = 0.4
         env = env_for(self.srv.url)
-        p, master = spawn_tty(["--run", "--skip-probe"] + SMALL + ["--results-dir", self.res], self.srv.url, text="SPEND UP TO $5\n")   # the default cap
+        p, master = spawn_tty(["--run", "--skip-probe"] + SMALL + ["--results-dir", self.res], self.srv.url, text="SPEND UP TO $4.5\n")   # the default cap
         self.addCleanup(os.close, master)
         deadline = time.time() + 30
         while len(self.st.log) < 3 and time.time() < deadline:
@@ -497,8 +497,8 @@ class DefaultBound(unittest.TestCase):
 
     def test_default_worst_case_is_at_most_5_dollars(self):
         total, cap, text = self.bound([])
-        self.assertLessEqual(total, 5.0)
-        self.assertEqual(cap, 5.0)
+        self.assertLessEqual(total, 4.5)
+        self.assertEqual(cap, 4.5)
         self.assertGreater(total, 3.0)   # the bound is not accidentally tiny
         self.assertNotIn("EXCEEDS THE CAP", text)
 
@@ -517,7 +517,7 @@ class DefaultBound(unittest.TestCase):
         self.assertEqual(e["per_size"][0][1]["counts"]["checks"], 2)   # checks run once, at the first size
         self.assertEqual(e["per_size"][1][1]["counts"]["checks"], 0)
         total = e["total"] + probe.bound("claude-haiku-5-5")
-        self.assertLessEqual(total, 5.0)
+        self.assertLessEqual(total, 4.5)
         self.assertLess(pricing.typical("claude-haiku-5-5", a, [20000, 100000]), total / 4)
 
     def test_100k_alone_with_old_defaults_is_over_5(self):
@@ -530,7 +530,7 @@ class DefaultBound(unittest.TestCase):
         total, cap, text = self.bound(reduced)
         self.assertGreater(total, 5.0)
         self.assertLessEqual(total, 10.0)
-        r = run_cli(["--run"] + reduced, key="x", stdin="SPEND UP TO $5\n")
+        r = run_cli(["--run"] + reduced, key="x", stdin="SPEND UP TO $4.5\n")
         self.assertEqual(r.returncode, 2)
         self.assertIn("Refusing to start", r.stdout)
         total2, cap2, _ = self.bound(reduced + ["--max-usd", "10"])
@@ -551,7 +551,7 @@ class MultiSize(StubCase):
     def sizes_run(self, extra=()):
         return run_cli(["--run", "--skip-probe", "--sizes", "2000,4000", "--turns", "2", "--reps", "2", "--nocache-turns", "2",
                         "--nocache-reps", "1", "--max-tokens", "64", "--chars-per-token", "4.0", "--results-dir", self.res] + list(extra),
-                       url=self.srv.url, stdin="SPEND UP TO $5\n")
+                       url=self.srv.url, stdin="SPEND UP TO $4.5\n")
 
     def test_two_sizes_run_smallest_first_in_their_own_folders(self):
         r = self.sizes_run()
@@ -603,7 +603,7 @@ class MultiSize(StubCase):
 
 
 class Probe(StubCase):
-    def probe(self, extra=(), cap="5", confirm=None, key=FAKE_KEY):
+    def probe(self, extra=(), cap="4.5", confirm=None, key=FAKE_KEY):
         confirm = "SPEND UP TO $%s\n" % cap if confirm is None else confirm
         return run_cli(["--probe", "--max-usd", cap, "--results-dir", self.res] + list(extra), url=self.srv.url, stdin=confirm, key=key)
 
@@ -660,11 +660,12 @@ class Probe(StubCase):
         self.assertEqual(len(self.st.log), 2)   # plain, then the refused create: no continue
 
     def test_inconclusive_when_the_plain_request_fails(self):
-        self.st.actions = ["401"]
+        self.st.error_after, self.st.error_shape = 0, (404, "not_found_error", "model: not found", {})   # not a key or money problem
         r = self.probe()
         self.assertEqual(r.returncode, 4, r.stdout)
         self.assertIn("PROBE VERDICT: INCONCLUSIVE", r.stdout)
-        self.assertEqual(len(self.st.log), 1)   # nothing else is sent
+        self.assertEqual(len(self.st.log), 2)   # the plain request and its retry without effort; no thread request is sent
+        self.assertTrue(all("thread" not in b for _, _, b in self.st.log))
 
     def test_inconclusive_when_the_continue_names_a_thread_error(self):
         self.st.expire_after = 0.0
@@ -696,13 +697,13 @@ class Probe(StubCase):
 
     def test_run_stops_after_a_rejected_probe_without_spending_on_the_arms(self):
         self.st.reject_threads = True
-        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n")
+        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $4.5\n")
         self.assertEqual(r.returncode, 4, r.stdout)
         self.assertIn("Stopping before the paid arms", r.stdout)
         self.assertEqual(len(self.st.log), 2)
 
     def test_run_probes_first_then_runs_the_arms(self):
-        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $5\n")
+        r = run_cli(["--run"] + SMALL + ["--results-dir", self.res], url=self.srv.url, stdin="SPEND UP TO $4.5\n")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PROBE VERDICT: ACCEPTED", r.stdout)
         self.assertGreater(len(self.st.log), 3)

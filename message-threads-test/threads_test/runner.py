@@ -5,6 +5,7 @@ import sys
 import time
 
 from . import convo, pricing, report
+from .client import FatalApiError
 from . import redact as R
 
 BOGUS_ID = "msg_" + "0" * 24
@@ -35,7 +36,7 @@ class Guard:
 
 
 class Runner:
-    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep, guard=None):
+    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep, guard=None, resume=None):
         self.cfg, self.client, self.outdir, self._log, self.sleep = cfg, client, outdir, log, sleep
         self.guard = guard or Guard(cfg["max_usd"])   # one guard can be shared by the runs of several sizes
         self.records = []
@@ -48,6 +49,19 @@ class Runner:
         self.n_requests = 0
         self.in_flight = 0.0
         self.in_flight_at_stop = 0.0
+        self.stage = None            # the request in progress (or the last one sent), for the PARTIAL record
+        self.partial = None          # set when the run stopped on a credit, billing or auth error
+        self.done_units = set()      # (arm, rep) units that ran to the end; a resume skips them
+        self.checks_done = False
+        self.abandoned_usd = 0.0
+        if resume:                   # already validated by resume.load
+            self.records = list(resume["records"])
+            self.done_units = set(resume["done"])
+            self.checks = dict(resume["checks"])
+            self.checks_done = resume["checks_done"]
+            self.n_requests = resume["requests"]
+            self.abandoned_usd = resume["abandoned_usd"]
+            self.notes = list(resume.get("notes", []))
 
     def log(self, msg):
         self._log(R.redact(msg))
@@ -84,6 +98,7 @@ class Runner:
         while True:
             attempt += 1
             projected = max(self.ub(small), self.body_ub(body))   # one request can never cross the cap
+            self.stage = {"tokens": c["tokens"], "arm": arm, "rep": rep, "turn": turn, "kind": kind, "attempt": attempt}
             self.guard.check(projected)
             self.in_flight = projected   # worst case of the request on the wire, known before it is sent
             res = self.client.post(body, thread=thread)
@@ -108,6 +123,9 @@ class Runner:
                 "%.0fms" % rec["ttft_ms"] if rec["ttft_ms"] is not None else "-",
                 "%.0fms" % rec["total_ms"] if rec["total_ms"] is not None else "-", charged, self.guard.spent + charged))
             self.guard.add(charged)
+            fatal = res.fatal()
+            if fatal:   # credit, billing, quota or auth error: never retried, never replayed, never an "allowed" status
+                raise FatalApiError(*fatal)
             if res.ok and not self.calibrated and not small:
                 self.calibrate(res)
             if res.ok or res.status in allow:
@@ -173,9 +191,10 @@ class Runner:
             order = order[rep % 4:] + order[:rep % 4]  # rotate the order each repetition to spread drift
             for arm in order:
                 n, fn = arms[arm]
-                if rep < n:
+                if rep < n and (arm, rep) not in self.done_units:
                     self.log("arm %d, repetition %d" % (arm, rep + 1))
                     fn(rep)
+                    self.done_units.add((arm, rep))
                     self.flush()
 
     # ----- behaviour checks
@@ -225,10 +244,15 @@ class Runner:
     # ----- output
     def doc(self):
         cfg = {k: v for k, v in self.cfg.items() if k not in ("salt_nonce",)}
-        return {"status": self.status, "started_utc": self.started, "spent_usd": round(self.guard.spent, 6), "in_flight_worst_case_usd": round(self.in_flight_at_stop, 6), "requests": self.n_requests,
+        d = {"status": self.status, "started_utc": self.started, "spent_usd": round(self.guard.spent, 6), "in_flight_worst_case_usd": round(self.in_flight_at_stop, 6), "requests": self.n_requests,
                 "config": cfg, "environment": {"python": platform.python_version(), "os": platform.system()},
                 "disclaimer": report.DISCLAIMER, "summary": report.summarize(self.records), "checks": self.checks,
-                "notes": self.notes, "records": self.records}
+                "notes": self.notes, "records": self.records,
+                "completed_units": sorted([a, r] for a, r in self.done_units), "checks_done": self.checks_done,
+                "abandoned_records_usd": round(self.abandoned_usd, 6)}
+        if self.partial:
+            d["partial"] = dict(self.partial, spent_usd=round(self.guard.spent, 6))
+        return d
 
     def flush(self):
         report.write_outputs(self.outdir, R.redact_obj(self.doc()))
@@ -238,11 +262,16 @@ class Runner:
         code = 0
         try:
             self.run_units()
-            if self.cfg["checks"]:
+            if self.cfg["checks"] and not self.checks_done:
                 self.run_checks()
+            self.checks_done = True
             self.status = "complete"
         except SpendCap as e:
             self.status, code = "aborted: spend cap (%s)" % e, 3
+        except FatalApiError as e:
+            self.partial = {"partial": True, "kind": e.kind, "reason": R.redact(e.reason), "stage": self.stage,
+                            "retried": False, "resume_with": "--resume <this results folder>"}
+            self.status, code = "PARTIAL: %s error, stopped at once, no retry (%s)" % (e.kind, R.redact(e.reason)), 5 if e.kind == "billing" else 6
         except RunAbort as e:
             self.status, code = "aborted: %s" % e, 4
         except KeyboardInterrupt:

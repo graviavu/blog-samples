@@ -96,11 +96,21 @@ def _f(x, nd=0, pre="", suf=""):
     return "n/a" if x is None else "%s%.*f%s" % (pre, nd, x, suf)
 
 
+def _partial_lines(p):
+    if not p:
+        return []
+    st = p.get("stage") or {}
+    return ["**PARTIAL.** The run stopped on a %s error and did not retry: %s. Stage reached: arm %s, repetition %s, turn %s (%s). "
+            "Spend counted: $%.4f. Only the turns recorded below were completed; the numbers cover them alone. "
+            "Finish later with `--resume` on this folder." % (p.get("kind"), p.get("reason"), st.get("arm"), st.get("rep"), st.get("turn"), st.get("kind"), p.get("spent_usd", 0.0)), ""]
+
+
 def render_md(doc):
     s = doc["summary"]
     c = doc["config"]
     L = ["# Message threads latency test", "", "Status: **%s**. Model `%s`, about %d tokens of history, spent $%.4f (cap $%.2f)." % (
         doc["status"], c["model"], c["tokens"], doc["spent_usd"], c["max_usd"]), "", "> " + DISCLAIMER, "",
+         ] + _partial_lines(doc.get("partial")) + [
          "## Savings versus arm 1 (no cache)", "",
          "| Arm | n | TTFT median ms | TTFT p90 ms | total median ms | cost/turn | cache write tok | cache read tok | TTFT saving | cost saving |",
          "|---|---|---|---|---|---|---|---|---|---|"]

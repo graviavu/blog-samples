@@ -6,6 +6,7 @@ import random
 
 from . import client as C
 from . import pricing
+from .client import FatalApiError
 
 ACCEPTED, REJECTED, INCONCLUSIVE = "ACCEPTED", "REJECTED", "INCONCLUSIVE"
 PROBE_REQUESTS = 4        # plain, plain again without effort if refused, create, continue
@@ -92,6 +93,10 @@ def run(client, guard, model, effort, log, rec=None):
         guard.add(charged)
         log("  probe %-9s status %s%s cost $%.5f" % (label, res.status if res.status else "ERR",
                                                      (" " + str(res.error_code)) if res.error_code else "", charged))
+        fatal = res.fatal()
+        if fatal:   # credit, billing, quota or auth error: stop at once, no retry
+            rec["fatal"] = {"kind": fatal[0], "reason": fatal[1], "step": label}
+            raise FatalApiError(*fatal)
         return res
 
     word = "PELICAN-%d" % random.SystemRandom().randint(1000, 9999)

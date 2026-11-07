@@ -41,6 +41,10 @@ class State:
         self.reject_threads = False  # 400 on any request that carries thread (an account without the beta)
         self.reject_effort = False   # 400 on output_config.effort
         self.event = threading.Event()
+        self.error_after = None      # after this many /v1/messages requests, every one fails with error_shape (credit, billing, auth ...)
+        self.error_shape = None      # (status, error type, message, extra headers dict)
+        self.msg_requests = 0
+        self.count_error = None      # same shape, for /v1/messages/count_tokens
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -49,9 +53,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send_json(self, status, obj):
+    def send_json(self, status, obj, headers=None):
         raw = json.dumps(obj).encode()
         self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
@@ -70,11 +76,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st.event.set()
         if self.path == "/v1/messages/count_tokens":
             st.count_calls = getattr(st, "count_calls", 0) + 1
+            if st.count_error:
+                status, etype, msg, hdrs = st.count_error
+                return self.send_json(*err(status, etype, msg), headers=hdrs)
             return self.send_json(200, {"input_tokens": tok({"s": body.get("system"), "t": body.get("tools"), "m": body.get("messages")}) * st.count_scale})
         if self.path != "/v1/messages":
             return self.send_json(*err(404, "not_found_error", "no such route"))
         if not hdrs.get("x-api-key"):
             return self.send_json(*err(401, "authentication_error", "missing key"))
+        with st.lock:
+            st.msg_requests += 1
+            n_msg = st.msg_requests
+        if st.error_after is not None and n_msg > st.error_after:
+            status, etype, msg, hdrs = st.error_shape
+            return self.send_json(*err(status, etype, msg), headers=hdrs)
         if action == "401":
             return self.send_json(*err(401, "authentication_error", "invalid x-api-key"))
         if st.reject_threads and "thread" in body:
@@ -163,6 +178,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             w.flush()
         ev("message_start", {"message": {"id": mid, "type": "message", "role": "assistant", "content": [], "model": conv["model"],
                                          "usage": dict(usage, output_tokens=1)}})
+        if action == "stream_billing":   # an error event inside a 200 stream
+            ev("error", {"error": {"type": "billing_error", "message": "credit balance is too low"}})
+            w.write(b"0\r\n\r\n")
+            w.flush()
+            return
         ev("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}})
         ev("ping", {})
         if st.think:
