@@ -52,6 +52,8 @@ Run this after `--all` has finished and you have looked at `results.md`. It is a
 ./run-test.sh --tune                # asks for SPEND UP TO $2, then the probe (stops unless ACCEPTED), the free token count, the experiments
 ```
 
+Keep the Mac awake for the whole run, for example `caffeinate -i ./run-test.sh --tune`. A sleep during the run can distort the gaps (the timeline uses wall-clock time, and the cache and thread lifetimes are counted by the server); an event that runs more than 20 s later than planned is noted in `tune.md`.
+
 Order: `./run-test.sh` (dry run) then `--all` then `--tune`. `--tune` does not go with `--run`, `--probe`, `--all`, `--resume` or `--skip-probe`. **It cannot be resumed**: the timeline (the waits) is the point. If it stops (credit, key, cap, Ctrl-C) it saves a PARTIAL `tune.md` and `tune.json` with whatever was measured, prints the spend, and a new `--tune` starts from the beginning.
 
 All three run on `claude-haiku-5-5` with `effort: low` and `max_tokens` 100 on one timeline, so the waits overlap (about 9 minutes in all). Every experiment has its own prefix salt, so none shares cache with another. A countdown line is printed every 10 seconds while waiting.

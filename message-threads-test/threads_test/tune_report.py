@@ -41,6 +41,8 @@ def cache_verdict(prime, replay):
     r, p = replay["cache_read_tokens"], replay["prompt_tokens"]
     split = prime["cache_creation_1h_reported"]
     tail = "" if split is not None else " The response reported no ephemeral_1h split, so it is UNKNOWN whether the entry was written with the 1-hour lifetime."
+    if r >= 0.9 * wrote and split is not None and split < 0.9 * wrote:
+        return "read a cache, but the entry was 5m: the replay read %d of its %d prompt tokens, but only %d of the %d tokens the priming request wrote carried the 1-hour lifetime, so this does not show the 1-hour cache." % (r, p, split, wrote)
     if r >= 0.9 * wrote:
         return "YES: the replay read %d of its %d prompt tokens from the cache (%.0f%%); the priming request wrote %d.%s" % (r, p, 100.0 * r / max(p, 1), wrote, tail)
     if r == 0:

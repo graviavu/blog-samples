@@ -314,6 +314,9 @@ def tune_main(a, base):
     if not all(math.isfinite(x) and x >= 0 for x in times) or not a.tune_keepalive_at < a.tune_final_at or a.tune_idle_limit <= 0:
         out("error: --tune times must be finite and not negative, --tune-keepalive-at must come before --tune-final-at, --tune-idle-limit above 0")
         return 2
+    if a.tune_expiry_at <= a.tune_idle_limit:
+        out("error: --tune-expiry-at (%g) must be above --tune-idle-limit (%g), or the expiry check would come inside the documented idle limit" % (a.tune_expiry_at, a.tune_idle_limit))
+        return 2
     if min(a.tune_big, a.tune_small, a.tune_max_tokens) < 1 or a.tune_turns < 2:
         out("error: --tune sizes and --tune-max-tokens must be positive and --tune-turns at least 2")
         return 2

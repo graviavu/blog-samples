@@ -21,6 +21,7 @@ from .runner import Guard, SpendCap, RunAbort
 
 KEEPALIVE_TEXT = "ping, reply OK"
 COUNTDOWN_EVERY = 10.0
+LATE_NOTE_S = 20.0
 
 
 class ExpAbort(Exception):
@@ -55,7 +56,7 @@ def plan(model, big, small, margin, turns, max_tokens, retries):
 
 
 class Tune:
-    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep, clock=time.monotonic, guard=None):
+    def __init__(self, cfg, client, outdir, log=print, sleep=time.sleep, clock=time.time, guard=None):
         self.cfg, self.client, self.outdir, self._log, self.sleep, self.clock = cfg, client, outdir, log, sleep, clock
         self.guard = guard or Guard(cfg["max_usd"])
         self.records = []
@@ -162,7 +163,11 @@ class Tune:
             self.sleep(min(left, COUNTDOWN_EVERY))
 
     def event(self, name, planned):
-        self.events.append({"name": name, "planned_s": planned, "actual_s": round(self.now() - self.t0, 2)})
+        actual = round(self.now() - self.t0, 2)
+        self.events.append({"name": name, "planned_s": planned, "actual_s": actual})
+        if actual - planned > LATE_NOTE_S:
+            self.notes.append("Event %s ran %.0f s later than planned (planned %.0f s, actual %.0f s after t0). Gaps in the verdicts use the actual times. If the Mac slept during the run, the gaps and the cache and thread lifetimes may be distorted." % (
+                name, actual - planned, planned, actual))
 
     def setup(self):
         """Before t0: the experiment 1 prime, a normal request that writes the 1-hour entry."""
@@ -179,8 +184,13 @@ class Tune:
         res, _ = self.send("e1", "thread_create", 0, self.body(list(self.big_hist), system=self.salt("tune-e1"), ttl="1h", thread={"type": "create"}),
                            self.ub_for("e1"), thread=True)
         self.state["e1_id"] = res.response_id
+        if not res.response_id:
+            self.notes.append("Experiment 1: the thread create returned 200 without a response id, so the expiry check is UNKNOWN and was not sent.")
+            self.log("experiment 1: the thread create returned no response id; the continue check is skipped")
 
     def e1_check(self):
+        if not self.state.get("e1_id"):
+            return
         res, _ = self.send("e1", "continue_check", 1, self.body([convo.user_msg(1)], ttl="1h", thread={"type": "continue", "previous_message_id": self.state["e1_id"]}),
                            self.ub_for("e1"), thread=True, allow=(400, 404))
 

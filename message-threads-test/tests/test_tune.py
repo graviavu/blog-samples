@@ -15,7 +15,7 @@ from tests.fake_api import Server
 from tests.helpers import FAKE_KEY, StubCase, run_cli, spawn_tty
 
 CLI_TUNE = ["--tune", "--tune-big", "4000", "--tune-small", "2000", "--tune-turns", "4", "--tune-max-tokens", "32", "--chars-per-token", "4.0",
-            "--tune-keepalive-at", "0", "--tune-expiry-at", "0", "--tune-final-at", "0.2"]
+            "--tune-keepalive-at", "0", "--tune-expiry-at", "0.1", "--tune-idle-limit", "0.05", "--tune-final-at", "0.2"]
 
 
 class FakeClock:
@@ -61,6 +61,58 @@ class InProc(StubCase):
 
     def bodies(self):
         return [b for path, h, b in self.st.log if path == "/v1/messages"]
+
+
+class Wrap:
+    """A client that delegates, with a hook on the Result of each post."""
+
+    def __init__(self, inner, hook):
+        self.inner, self.hook, self.n = inner, hook, 0
+
+    def post(self, body, thread=False):
+        self.n += 1
+        return self.hook(self, body, self.inner.post(body, thread=thread))
+
+    def close(self):
+        self.inner.close()
+
+
+class Robustness(InProc):
+    def test_the_default_clock_is_wall_clock_time(self):
+        import inspect
+        self.assertIs(inspect.signature(tune.Tune.__init__).parameters["clock"].default, time.time)
+
+    def test_a_run_on_schedule_has_no_lateness_note(self):
+        t, _ = self.make()
+        self.assertEqual(t.run(), 0)
+        self.assertFalse([n for n in t.notes if "later than planned" in n], t.notes)
+
+    def test_a_late_event_is_noted_in_the_notes_and_the_report(self):
+        def hook(w, body, res):
+            self.fc.t += 25.0   # each request "takes" 25 s, as if the machine slept
+            return res
+        t, out = self.make(client=Wrap(C.Client(self.srv.url, FAKE_KEY), hook))
+        t.run()
+        late = [n for n in t.notes if "later than planned" in n]
+        self.assertTrue(late, t.notes)
+        self.assertIn("slept", late[0])
+        with open(os.path.join(out, "tune.md")) as f:
+            self.assertIn("later than planned", f.read())
+
+    def test_a_create_without_a_response_id_is_unknown_and_sends_no_continue(self):
+        def hook(w, body, res):
+            if (body.get("thread") or {}).get("type") == "create" and not w.__dict__.get("done"):
+                w.done = True
+                res.response_id = None
+            return res
+        t, _ = self.make(client=Wrap(C.Client(self.srv.url, FAKE_KEY), hook))
+        t.run()
+        a = self.an(t)
+        self.assertTrue(a["e1"]["thread_expired"].startswith("UNKNOWN"), a["e1"]["thread_expired"])
+        self.assertFalse([r for r in t.records if r["label"] == "continue_check"])
+        for b in self.bodies():
+            self.assertIsNot((b.get("thread") or {}).get("previous_message_id", 1), None)
+        self.assertTrue([n for n in t.notes if "without a response id" in n], t.notes)
 
 
 class Experiments(InProc):
@@ -398,6 +450,16 @@ class Math(unittest.TestCase):
         self.assertTrue(v(None, self.rec()).startswith("UNKNOWN"))
         self.assertIn("UNKNOWN whether the entry was written with the 1-hour", v(self.rec(cache_creation_tokens=1000, cache_creation_1h_reported=None), self.rec(cache_read_tokens=1000)))
 
+    def test_cache_verdict_requires_the_1h_part_of_the_write(self):
+        v = tune_report.cache_verdict
+        rep = self.rec(prompt_tokens=1000, cache_read_tokens=1000, cache_creation_tokens=0)
+        for split in (0, 500, 899):
+            r = v(self.rec(cache_creation_tokens=1000, cache_creation_1h_reported=split), rep)
+            self.assertTrue(r.startswith("read a cache, but the entry was 5m"), r)
+        self.assertTrue(v(self.rec(cache_creation_tokens=1000, cache_creation_1h_reported=900), rep).startswith("YES"))
+        self.assertTrue(v(self.rec(cache_creation_tokens=1000, cache_creation_1h_reported=None), rep).startswith("YES"))
+        self.assertIn("UNKNOWN whether", v(self.rec(cache_creation_tokens=1000, cache_creation_1h_reported=None), rep))
+
     def test_expiry_verdict(self):
         c = self.rec(t_start_s=0, t_end_s=3)
         e = tune_report.expiry_verdict
@@ -521,7 +583,8 @@ class CliTune(StubCase):
         self.assertEqual(self.st.log, [])
 
     def test_bad_timeline_flags(self):
-        for bad in (["--tune-keepalive-at", "5", "--tune-final-at", "5"], ["--tune-expiry-at", "-1"], ["--tune-turns", "1"], ["--tune-keepalive-at", "nan"]):
+        for bad in (["--tune-keepalive-at", "5", "--tune-final-at", "5"], ["--tune-expiry-at", "-1"], ["--tune-turns", "1"], ["--tune-keepalive-at", "nan"],
+                    ["--tune-expiry-at", "300"], ["--tune-expiry-at", "100", "--tune-idle-limit", "300"]):
             r = run_cli(["--tune", "--dry-run"] + bad, url=self.srv.url)
             self.assertEqual(r.returncode, 2, bad)
 
