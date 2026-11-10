@@ -4,12 +4,13 @@ of the main harness; nothing here duplicates them.
 
 B+  BODY BYTES AND UPLOAD TIME  a ~100K-token history, three arms per network condition: a cached full resend, a thread create (what a
                                 replay sends) and a thread continue. The conditions are no throttle, then a client-side send throttle at
-                                1 Mbps and 5 Mbps. Per request: body bytes, time until the last body byte was handed to the socket,
-                                TTFT, total time, usage, cost. Measured bytes per token = resend body bytes / prompt tokens.
-E   DROPPED-STREAM RETRY        5 runs: create a thread, start a continue, close the stream after the first content delta (before
-                                message_stop), send the SAME continue again, record which of success, thread_already_continued,
-                                thread_continue_in_flight comes back, then replay with a create. The usage of every request and the UTC
-                                window are logged so the orphaned generation can be looked for in the Console.
+                                1 Mbps and 5 Mbps. Per request: body bytes, connection setup (DNS, TCP, TLS), upload (from the end of
+                                setup until the last body byte was handed to the kernel; OS default send buffers), TTFT, total time,
+                                usage, cost. Bytes per token of this synthetic history = resend body bytes / prompt tokens.
+E   DROPPED-STREAM RETRY        5 runs per resend gap (default gaps 0 s and 5 s, so 10 runs): create a thread, start a continue, close the
+                                stream after the first content delta (before message_stop), wait the gap, send the SAME continue again,
+                                record which of success, thread_already_continued, thread_continue_in_flight comes back, then replay with
+                                a create. The usage of every request and the dated UTC window are logged for the Console check.
 A   CLIENT-SIDE SAVEPOINT        a cached 10-turn main line, then two forks from the same prefix at turn N (each: the prefix plus a different new
                                 user message). Per fork: cache read tokens, cost, TTFT, and whether it read the entry written at turn N.
 
@@ -30,6 +31,7 @@ from .runner import Guard, SpendCap
 TESTS = ("B", "E", "A")
 DELTA_TOKENS = 2000        # tokens a warm request is assumed to add (written, not read) in the estimate
 A_GROW_UB = 2000           # worst-case tokens one test A turn adds to the prompt
+UTC_FMT = "%Y-%m-%d %H:%M:%S"
 E_LONG_ASK = ("Ignore the one-sentence rule for this turn: list 40 numbered observations about the incident, one per line, "
               "so that the reply streams for a while.")
 
@@ -72,7 +74,7 @@ def plan(cfg):
                     "worst": (1 + n_warm) * pricing.request_upper_bound(m, ub, mt)}
     if "E" in cfg["tests"]:
         ub = ub_tokens(cfg["e_tokens"], mg, 2 * cfg["e_max_tokens"])
-        n = cfg["e_runs"] * 4          # create, continue (cut), same continue again, replay create
+        n = cfg["e_runs"] * len(cfg["e_gaps"]) * 4     # per run: create, continue (cut), same continue again, replay create
         out["E"] = {"requests": n, "cold": 1, "warm": n - 1, "prompt_tokens_ub": ub,
                     "expected": req_expected(m, ub, "cold", cfg["e_max_tokens"]) + (n - 1) * req_expected(m, ub, "warm", cfg["e_max_tokens"]),
                     "worst": n * pricing.request_upper_bound(m, ub, cfg["e_max_tokens"])}
@@ -138,9 +140,10 @@ class Ops:
     def ub_for(self, test):
         return self.plan["tests"][test]["prompt_tokens_ub"]
 
-    def send(self, test, label, body, thread=False, need_ok=True, allow=(), **post_kw):
+    def send(self, test, label, body, thread=False, need_ok=True, allow=(), extra=None, **post_kw):
         """One request: the guard before, the usage-based charge after, a flush, no retry. Returns (Result, record).
-        need_ok: a request that is not a 200 with message_stop (and not an allowed status or a deliberate abort) ends the test."""
+        need_ok: a request that is not a 200 with message_stop (and not an allowed status or a deliberate abort) ends the test.
+        A request that passed the wall-clock deadline is charged its full worst case and never resent."""
         c = self.cfg
         mt = body["max_tokens"]
         projected = max(pricing.request_upper_bound(c["model"], self.ub_for(test), mt),
@@ -155,27 +158,33 @@ class Ops:
         self.n_requests += 1
         parts = pricing.cost(c["model"], res.usage) if res.usage else {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "total": 0.0}
         charged = parts["total"]
-        if res.aborted and res.usage:   # input side known from message_start; the output of a cut stream is unknown: charge max_tokens of it
+        if res.deadline_hit:
+            charged = max(charged, projected)
+        elif res.aborted and res.usage:   # input side known from message_start; the output of a cut stream is unknown: charge max_tokens of it
             charged += mt * pricing.tier(c["model"], pricing.prompt_len(res.usage))[1] / 1e6
         elif (res.status == 200 and not res.usage) or (res.status == 200 and not res.complete and not res.aborted) or (res.status is None and res.exception):
             charged = max(charged, projected)
         rec = {"test": test, "label": label, "status": res.status, "complete": res.complete, "aborted": res.aborted,
                "error_code": res.error_code, "body_bytes": res.body_bytes,
+               "connect_ms": None if res.connect_s is None else res.connect_s * 1000,
                "body_sent_ms": None if res.body_sent_s is None else res.body_sent_s * 1000,
+               "upload_ms": None if (res.body_sent_s is None or res.connect_s is None) else (res.body_sent_s - res.connect_s) * 1000,
+               "deadline_hit": res.deadline_hit,
                "rate_mbps": post_kw.get("rate_bps", 0) / 1e6 if post_kw.get("rate_bps") else None,
                "ttft_ms": None if res.ttft is None else res.ttft * 1000, "total_ms": None if res.total is None else res.total * 1000,
                "first_kind": res.first_kind, "stop_reason": res.stop_reason,
                "usage": {k: res.usage.get(k, 0) for k in pricing.USAGE_KEYS}, "cost": parts, "charged_usd": charged,
-               "utc_start": time.strftime("%H:%M:%S", t_start), "utc_end": time.strftime("%H:%M:%S", t_end), "stage": {}}
+               "utc_start": time.strftime(UTC_FMT, t_start), "utc_end": time.strftime(UTC_FMT, t_end), "stage": {}}
+        rec.update(extra or {})
         if res.error:
             rec["error"] = res.error
         if res.exception:
             rec["exception"] = res.exception
         self.records.append(rec)
-        self.log("  %s %-22s status %s%s ttft %s sent %s cost $%.4f spent $%.4f" % (
-            test, label, res.status if res.status else "ERR", " (cut by the client)" if res.aborted else "",
+        self.log("  %s %-22s status %s%s ttft %s upload %s cost $%.4f spent $%.4f" % (
+            test, label, res.status if res.status else "ERR", " (cut by the client)" if res.aborted else (" (deadline passed, not resent)" if res.deadline_hit else ""),
             "%.0fms" % rec["ttft_ms"] if rec["ttft_ms"] is not None else "-",
-            "%.0fms" % rec["body_sent_ms"] if rec["body_sent_ms"] is not None else "-", charged, self.guard.spent + charged))
+            "%.0fms" % rec["upload_ms"] if rec["upload_ms"] is not None else "-", charged, self.guard.spent + charged))
         try:
             self.guard.add(charged)
         finally:
@@ -226,14 +235,17 @@ class Ops:
         sys_, hist = self.salt("ops-e"), self.hist["E"]
         mt = c["e_max_tokens"]
         ask = {"role": "user", "content": [{"type": "text", "text": E_LONG_ASK}]}
-        for run in range(1, c["e_runs"] + 1):
-            self.log("test E run %d of %d" % (run, c["e_runs"]))
+        plan_ = [g for _ in range(c["e_runs"]) for g in c["e_gaps"]]    # the gaps take turns, so no gap gets only the early runs
+        for run, gap in enumerate(plan_, 1):
+            self.log("test E run %d of %d (the same continue is resent %gs after the cut)" % (run, len(plan_), gap))
             cr, _ = self.send("E", "create r%d" % run, self.body(list(hist), system=sys_, thread={"type": "create"}, max_tokens=mt), thread=True)
             if not cr.response_id:
                 raise TestAbort("E", "the thread create returned 200 without a response id; no continue sent")
             cont = self.body([ask], thread={"type": "continue", "previous_message_id": cr.response_id}, max_tokens=mt)
-            self.send("E", "continue cut r%d" % run, cont, thread=True, abort_after_delta=True)
-            again, _ = self.send("E", "same continue r%d" % run, cont, thread=True, need_ok=False)
+            self.send("E", "continue cut r%d" % run, cont, thread=True, abort_after_delta=True, extra={"gap_s": gap})
+            if gap > 0:
+                self.sleep(gap)
+            again, _ = self.send("E", "same continue r%d" % run, cont, thread=True, need_ok=False, extra={"gap_s": gap})
             self.log("    the same continue came back: %s" % ops_report.outcome(again.status, again.ok, again.error_code))
             self.send("E", "replay create r%d" % run, self.body(list(hist) + [convo.assistant_msg(cr.text), ask], system=sys_, thread={"type": "create"}, max_tokens=mt), thread=True)
 

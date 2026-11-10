@@ -1,10 +1,18 @@
 """run-ops-test.sh: tests B+, E and A against the stub, the cost cap, the dry run and the wrapper script.
 Stub only: no key, no network beyond 127.0.0.1."""
+import http.client
+import inspect
 import json
 import os
+import pty
+import signal
+import socket
 import stat
 import subprocess
+import sys
 import tempfile
+import termios
+import threading
 import time
 import unittest
 
@@ -16,11 +24,11 @@ from tests.helpers import FAKE_KEY, OPS_CLI, ROOT, StubCase, env_for, run_cli
 
 SH = os.path.join(ROOT, "run-ops-test.sh")
 SMALL_OPS = ["--b-tokens", "3000", "--e-tokens", "3000", "--a-tokens", "3000", "--b-rates", "50,100", "--e-runs", "2", "--a-turns", "5",
-             "--a-fork-at", "2", "--max-tokens", "32", "--e-max-tokens", "64", "--chars-per-token", "4.0"]
+             "--a-fork-at", "2", "--max-tokens", "32", "--e-max-tokens", "64", "--chars-per-token", "4.0", "--e-gaps", "0"]
 
 
 def cfg(**over):
-    c = dict(model="claude-haiku-5-5", tests=["B", "E", "A"], b_tokens=3000, rates=[50.0, 100.0], b_reps=1, e_runs=2, e_tokens=3000, e_max_tokens=64,
+    c = dict(model="claude-haiku-5-5", tests=["B", "E", "A"], b_tokens=3000, rates=[50.0, 100.0], b_reps=1, e_runs=2, e_gaps=[0.0], e_tokens=3000, e_max_tokens=64,
              a_tokens=3000, a_turns=5, a_fork_at=2, max_tokens=32, margin=1.25, effort="low", seed=1, salt_nonce="n1",
              cpt={3000: 4.0}, max_usd=0.60, probe_bound_usd=0.0)
     c.update(over)
@@ -49,8 +57,8 @@ class InProc(StubCase):
     def make(self, client=None, guard=None, **over):
         out = os.path.join(self.res, "o%d" % len(os.listdir(self.res)))
         os.makedirs(out, mode=0o700)
-        self.logs = []
-        o = ops.Ops(cfg(**over), client or C.Client(self.srv.url, FAKE_KEY), out, log=self.logs.append, guard=guard)
+        self.logs, self.slept = [], []
+        o = ops.Ops(cfg(**over), client or C.Client(self.srv.url, FAKE_KEY), out, log=self.logs.append, guard=guard, sleep=self.slept.append)
         return o, out
 
     def bodies(self):
@@ -96,6 +104,59 @@ class Client(StubCase):
         free = c.post(b, measure_upload=True)
         self.assertLess(free.body_sent_s, floor / 2)
 
+    def test_connect_is_its_own_figure_and_upload_starts_after_it(self):
+        c = C.Client(self.srv.url, FAKE_KEY)
+        r = c.post(self.body(), measure_upload=True)
+        self.assertTrue(r.ok)
+        self.assertIsNotNone(r.connect_s)
+        self.assertGreaterEqual(r.connect_s, 0)
+        self.assertGreaterEqual(r.body_sent_s, r.connect_s)
+        self.assertGreaterEqual(r.ttft, r.body_sent_s)
+
+    def test_the_send_buffer_is_left_at_the_os_default(self):
+        # SO_SNDBUF turns off send-buffer auto-tuning on macOS/BSD and caps an unthrottled upload; the client must never set it
+        self.assertNotIn("socket.SO_SNDBUF", inspect.getsource(C))
+        seen = []
+        real = socket.socket.setsockopt
+
+        class Spy(socket.socket):
+            def setsockopt(self, *a):
+                seen.append(a)
+                return real(self, *a)
+        orig = socket.socket
+        socket.socket = Spy
+        try:
+            r = C.Client(self.srv.url, FAKE_KEY).post(self.body(), measure_upload=True)
+        finally:
+            socket.socket = orig
+        self.assertTrue(r.ok)
+        self.assertFalse([a for a in seen if a[:2] == (socket.SOL_SOCKET, socket.SO_SNDBUF)], seen)
+
+    def test_the_deadline_ends_a_trickling_stream_and_does_not_resend(self):
+        self.st.event_delay = 0.4                  # 6 events after message_start: about 2.4 s of stream
+        c = C.Client(self.srv.url, FAKE_KEY, timeout=30, deadline=0.8)
+        t0 = time.perf_counter()
+        r = c.post(self.body(100))
+        took = time.perf_counter() - t0
+        self.assertTrue(r.deadline_hit)
+        self.assertFalse(r.ok)
+        self.assertIn("deadline", r.exception)
+        self.assertLess(took, 1.8)                 # ended near the deadline, not at the end of the stream or the 30 s read timeout
+        self.assertEqual(len(self.st.log), 1)      # never resent
+
+    def test_the_deadline_also_bounds_a_paced_upload(self):
+        c = C.Client(self.srv.url, FAKE_KEY, timeout=30, deadline=0.5)
+        t0 = time.perf_counter()
+        r = c.post(self.body(200000), rate_bps=1e6)    # about 1.6 s at 1 Mbps
+        self.assertTrue(r.deadline_hit)
+        self.assertLess(time.perf_counter() - t0, 1.3)
+
+    def test_a_request_that_finishes_inside_the_deadline_is_untouched(self):
+        r = C.Client(self.srv.url, FAKE_KEY, deadline=30).post(self.body(100))
+        self.assertTrue(r.ok)
+        self.assertFalse(r.deadline_hit)
+        self.assertIsNone(r.exception)
+
     def test_abort_after_the_first_delta_is_before_message_stop(self):
         c = C.Client(self.srv.url, FAKE_KEY)
         r = c.post(self.body(100), abort_after_delta=True)
@@ -123,8 +184,11 @@ class TestB(InProc):
         self.assertAlmostEqual(by[("open", "create")]["body_bytes"], by[("open", "resend")]["body_bytes"], delta=400)
         for r in b["rows"]:
             self.assertGreaterEqual(r["upload_ms"], 0)
-            self.assertLessEqual(r["upload_ms"], r["ttft_ms"] + 1)
-            self.assertAlmostEqual(r["ttft_after_upload_ms"], r["ttft_ms"] - r["upload_ms"], places=3)
+            self.assertGreaterEqual(r["connect_ms"], 0)
+            self.assertLessEqual(r["connect_ms"] + r["upload_ms"], r["ttft_ms"] + 1)
+            self.assertAlmostEqual(r["ttft_after_upload_ms"], r["ttft_ms"] - r["connect_ms"] - r["upload_ms"], places=3)
+        for rec in recs[1:]:   # upload excludes the connection setup
+            self.assertAlmostEqual(rec["upload_ms"], rec["body_sent_ms"] - rec["connect_ms"], places=6)
         for k in (("50Mbps", "resend"), ("100Mbps", "create")):
             self.assertIsNotNone(by[k]["arithmetic_upload_ms"])
             self.assertGreaterEqual(by[k]["upload_ms"], by[k]["arithmetic_upload_ms"] * 0.98)
@@ -137,6 +201,24 @@ class TestB(InProc):
         p0 = b["projection"][0]
         self.assertAlmostEqual(p0["bytes"], 100000 * b["bytes_per_token"]["resend"])
         self.assertAlmostEqual(p0["seconds"]["1"], p0["bytes"] * 8 / 1e6)
+        with open(os.path.join(out, "ops.md")) as f:
+            md = f.read()
+        for s_ in ("Connect (ms)", "of this synthetic history", "not a measurement of Claude Code tool output", "OS default send buffers"):
+            self.assertIn(s_, md)
+
+    def test_a_request_past_the_deadline_is_charged_its_worst_case_and_stops_the_test(self):
+        def hook(w, body, res):
+            if w.n == 2:
+                res.status, res.complete, res.deadline_hit, res.exception = 200, False, True, "request deadline of 300s passed"
+            return res
+        o, _ = self.make(client=Wrap(C.Client(self.srv.url, FAKE_KEY), hook), tests=["B"])
+        self.assertEqual(o.run(), 4)
+        self.assertIn("B", o.aborts)
+        self.assertEqual(len(o.records), 2)                 # nothing resent, nothing after it in B
+        rec = o.records[1]
+        self.assertTrue(rec["deadline_hit"])
+        mt = cfg()["max_tokens"]
+        self.assertGreaterEqual(rec["charged_usd"], pricing.request_upper_bound("claude-haiku-5-5", o.ub_for("B"), mt) - 1e-12)
 
     def test_every_request_shape(self):
         o, _ = self.make(tests=["B"])
@@ -213,10 +295,32 @@ class TestE(InProc):
         self.assertEqual((b["complete_requests"], b["cut_requests"]), (10, 5))      # create and replay; the cut ones and the refused repeat do not count
         self.assertEqual(b["complete_usage"]["output_tokens"], sum(r["usage"]["output_tokens"] for r in o.records if r["complete"]))
         self.assertTrue(b["window_utc"][0] and b["window_utc"][1])
+        self.assertRegex(b["window_utc"][0], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")     # the window carries the date
         with open(os.path.join(out, "ops.md")) as f:
             md = f.read()
         self.assertIn("Billing check for the Console", md)
         self.assertIn("thread_already_continued 5", md)
+        # the billing text: a cut always bills the tokens before the cut; compare against e_max_tokens x cuts; run E on its own
+        self.assertIn("Every cut stream bills at least", md)
+        self.assertIn("about 320 (64 x 5", md)
+        self.assertIn("--run --tests E` on its own", md)
+        self.assertNotIn("the cut generations were billed", md)
+        self.assertEqual(self.slept, [])                                             # gap 0: an immediate resend
+
+    def test_resend_gaps_take_turns_and_count_in_the_estimate(self):
+        o, out = self.make(tests=["E"], e_runs=2, e_gaps=[0.0, 5.0])
+        self.assertEqual(o.plan["tests"]["E"]["requests"], 16)
+        self.assertEqual(o.run(), 0, o.status)
+        self.assertEqual(len(self.bodies()), 16)
+        self.assertEqual(self.slept, [5.0, 5.0])
+        e = self.an(o)["E"]
+        self.assertEqual([r["gap_s"] for r in e["runs"]], [0.0, 5.0, 0.0, 5.0])
+        self.assertEqual(e["counts_by_gap"], {"0": {"thread_already_continued": 2}, "5": {"thread_already_continued": 2}})
+        self.assertLessEqual(o.guard.spent, o.plan["expected"])
+        with open(os.path.join(out, "ops.md")) as f:
+            md = f.read()
+        self.assertIn("Resent after 5 s: thread_already_continued 2.", md)
+        self.assertIn("gaps 0 and 5 s", md)
 
     def test_other_outcomes_are_counted(self):
         def hook(w, body, res):
@@ -312,13 +416,13 @@ class TestA(InProc):
 
 class Money(InProc):
     def test_the_default_estimate_is_under_the_default_cap(self):
-        c = cfg(b_tokens=100000, e_tokens=20000, a_tokens=20000, rates=[1.0, 5.0], e_runs=5, a_turns=10, a_fork_at=5, max_tokens=100, e_max_tokens=300, cpt={})
+        c = cfg(b_tokens=100000, e_tokens=20000, a_tokens=20000, rates=[1.0, 5.0], e_runs=5, e_gaps=[0.0, 5.0], a_turns=10, a_fork_at=5, max_tokens=100, e_max_tokens=300, cpt={})
         pl = ops.plan(c)
         self.assertLess(pl["expected"], 0.60)
         self.assertGreater(pl["expected"], 0.05)
         self.assertGreater(pl["worst"], pl["expected"])
         self.assertEqual(pl["tests"]["B"]["requests"], 10)
-        self.assertEqual(pl["tests"]["E"]["requests"], 20)
+        self.assertEqual(pl["tests"]["E"]["requests"], 40)
         self.assertEqual(pl["tests"]["A"]["requests"], 12)
 
     def test_the_100k_history_is_priced_on_the_dearer_side_of_the_step(self):
@@ -443,6 +547,22 @@ class Cli(StubCase):
         self.assertNotEqual(p.returncode, 0)
         p = ops_cli(["--dry-run", "--b-rates", "0"], url=self.srv.url)
         self.assertNotEqual(p.returncode, 0)
+        for bad in (["--e-gaps", "-1"], ["--e-gaps", "61"], ["--e-gaps", "nan"], ["--request-deadline", "10"], ["--request-deadline", "nan"]):
+            p = ops_cli(["--dry-run"] + bad, url=self.srv.url)
+            self.assertNotEqual(p.returncode, 0, bad)
+
+    def test_a_rate_too_slow_for_the_history_is_refused(self):
+        # 100000 tokens x 1.25 x 3.2 bytes = 400 KB = 3.2 Mbit: 0.02 Mbps would take 160 s, over the 120 s limit
+        p = ops_cli(["--dry-run", "--b-rates", "0.02"], url=self.srv.url)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("would take about 160 s", p.stdout)
+        self.assertIn("at least 0.03 Mbps", p.stdout)
+        self.assertEqual(ops_cli(["--dry-run", "--b-rates", "0.03"], url=self.srv.url).returncode, 0)
+        # a short deadline lowers the limit to half of it
+        p = ops_cli(["--dry-run", "--b-rates", "0.1", "--request-deadline", "30"], url=self.srv.url)
+        self.assertEqual(p.returncode, 2)
+        # the rate check is about B+ only
+        self.assertEqual(ops_cli(["--dry-run", "--b-rates", "0.02", "--tests", "E"], url=self.srv.url).returncode, 0)
 
     def test_a_wrong_phrase_or_a_pipe_makes_no_call(self):
         p = ops_cli(self.args("--run"), url=self.srv.url, stdin="SPEND UP TO $4.5\n")
@@ -475,12 +595,13 @@ class Cli(StubCase):
             doc = json.load(f)
         self.assertEqual(doc["status"], "complete")
         self.assertEqual(doc["requests"], 10 + 8 + 7)
+        self.assertEqual(doc["config"]["request_deadline_s"], 300.0)
         self.assertLess(doc["spent_usd"], 0.60)
         with open(os.path.join(d, "ops.md")) as f:
             md = f.read()
         with open(os.path.join(d, "ops.json")) as f:
             raw_json = f.read()
-        for s in ("### B+", "### E:", "### A:", "Measured bytes per token", "Billing check for the Console", "HIT:", "| --- |"):
+        for s in ("### B+", "### E:", "### A:", "Bytes per token of this synthetic history", "Billing check for the Console", "HIT:", "| --- |"):
             self.assertIn(s, md)
         # the key is in no output and no file; no message or request ids either
         blob = p.stdout + p.stderr + md + raw_json
@@ -531,21 +652,28 @@ class Wrapper(unittest.TestCase):
         p = subprocess.run([SH, "--run", "--b-tokens", "1000000"], capture_output=True, text=True, env=env_for(None, ""), timeout=60)
         self.assertEqual(p.returncode, 2)
 
-    def test_term_is_passed_on_and_temp_files_are_removed(self):
+    def test_the_script_execs_the_program_and_deletes_nothing(self):
+        with open(SH) as f:
+            code = [ln for ln in f.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        self.assertEqual(code[-1], 'exec "$PY" -I "$ROOT/threads_test/ops_cli.py" "$@"')
+        joined = "\n".join(code)
+        for word in ("trap", "&\n", " & ", "wait", "rm ", "find ", "-delete"):
+            self.assertNotIn(word, joined, word)
+
+    def test_term_reaches_the_program_directly(self):
         with tempfile.TemporaryDirectory() as d:
             fake = os.path.join(d, "fakepy")
             marker = os.path.join(d, "got-term")
-            tmpfile = os.path.join(ROOT, "results", "stray.json.tmp")
             with open(fake, "w") as f:
-                f.write('#!/usr/bin/env bash\ntrap \'echo term > "%s"; exit 7\' TERM\nmkdir -p "%s"\ntouch "%s"\necho ready\nwhile true; do sleep 0.1; done\n'
-                        % (marker, os.path.dirname(tmpfile), tmpfile))
+                f.write('#!/usr/bin/env bash\ntrap \'echo term > "%s"; exit 7\' TERM\necho "ready $$"\nwhile true; do sleep 0.1; done\n' % marker)
             os.chmod(fake, 0o755)
-            created_results = not os.path.exists(os.path.join(ROOT, "results"))
             e = env_for(None, "")
             e["PYTHON_BIN"] = fake
             p = subprocess.Popen([SH, "--dry-run"], stdout=subprocess.PIPE, text=True, env=e)
             try:
-                self.assertEqual(p.stdout.readline().strip(), "ready")
+                line = p.stdout.readline().split()
+                self.assertEqual(line[0], "ready")
+                self.assertEqual(int(line[1]), p.pid)          # exec: the program is the script's own process
                 p.terminate()
                 self.assertEqual(p.wait(timeout=20), 7)       # the program's own exit code comes back
             finally:
@@ -553,9 +681,6 @@ class Wrapper(unittest.TestCase):
                     p.kill()
                 p.stdout.close()
             self.assertTrue(os.path.exists(marker))
-            self.assertFalse(os.path.exists(tmpfile))
-            if created_results:
-                os.rmdir(os.path.join(ROOT, "results"))
 
     def test_the_typed_phrase_reaches_the_program_through_the_script(self):
         import pty
@@ -563,7 +688,7 @@ class Wrapper(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as res:
                 master, slave = pty.openpty()
-                p = subprocess.Popen([SH, "--run", "--tests", "E", "--e-runs", "1", "--e-tokens", "3000", "--e-max-tokens", "32", "--chars-per-token", "4.0",
+                p = subprocess.Popen([SH, "--run", "--tests", "E", "--e-runs", "1", "--e-gaps", "0", "--e-tokens", "3000", "--e-max-tokens", "32", "--chars-per-token", "4.0",
                                       "--results-dir", res], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env_for(srv.url))
                 os.close(slave)
                 os.write(master, b"SPEND UP TO $0.6\n")
@@ -583,6 +708,158 @@ class Wrapper(unittest.TestCase):
             src = f.read()
         for word in ("pfctl", "dnctl", "tc ", "sudo", "networksetup", "curl", "iptables"):
             self.assertNotIn(word, src.replace("firewall, traffic shaper", ""), word)
+
+
+# Starts a command as the leader of a new session whose controlling terminal is the pty on stdin, so a \x03 typed on the
+# master is turned into SIGINT for its foreground process group by the terminal itself, as at R's keyboard.
+CTTY = ("import fcntl, os, sys, termios\n"
+        "os.setsid()\n"
+        "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+        "os.execv(sys.argv[1], sys.argv[1:])\n")
+
+
+class CtrlC(unittest.TestCase):
+    """Ctrl-C and SIGTERM through run-ops-test.sh during a paid run against the stub: the run stops and flushes a PARTIAL report."""
+
+    def setUp(self):
+        self.srv = Server().start()
+        self.st = self.srv.state
+        self.st.base_delay = 0.5                 # every answer takes a while, so a request is on the wire when the signal comes
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.srv.stop()
+        self.tmp.cleanup()
+
+    def start(self):
+        master, slave = pty.openpty()
+        attrs = termios.tcgetattr(slave)
+        attrs[3] |= termios.ISIG | termios.ICANON
+        attrs[6][termios.VINTR] = b"\x03"
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+        p = subprocess.Popen([sys.executable, "-I", "-c", CTTY, SH, "--run", "--tests", "B", "--b-tokens", "3000", "--b-rates", "50",
+                              "--max-tokens", "32", "--chars-per-token", "4.0", "--results-dir", self.tmp.name],
+                             stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env_for(self.srv.url))
+        os.close(slave)
+        drain = threading.Thread(target=self._drain, args=(master,), daemon=True)   # the echo of the typed phrase goes to the master
+        drain.start()
+        os.write(master, b"SPEND UP TO $0.6\n")
+        return p, master
+
+    @staticmethod
+    def _drain(fd):
+        try:
+            while os.read(fd, 1024):
+                pass
+        except OSError:
+            pass
+
+    def wait_for_test_requests(self, n):
+        end = time.time() + 60
+        while time.time() < end:
+            if len([1 for path, h, b in self.st.log if path == "/v1/messages" and "system" in b and len(json.dumps(b)) > 3000]) >= n:
+                return
+            time.sleep(0.05)
+        self.fail("the run never reached test B+")
+
+    def check_partial(self, p, out, err):
+        self.assertEqual(p.returncode, 130, out + err)
+        self.assertIn("PARTIAL: interrupted", out)
+        d = os.path.join(self.tmp.name, os.listdir(self.tmp.name)[0])
+        with open(os.path.join(d, "ops.json")) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["status"], "PARTIAL: interrupted")
+        self.assertGreater(doc["in_flight_worst_case_usd"], 0)
+        self.assertLess(doc["requests"], 10)
+        with open(os.path.join(d, "ops.md")) as f:
+            self.assertIn("PARTIAL: interrupted", f.read())
+        self.assertFalse([fn for fn in os.listdir(d) if fn.endswith(".tmp")])
+
+    def test_ctrl_c_through_the_script_stops_the_run_and_flushes_a_partial_report(self):
+        p, master = self.start()
+        try:
+            self.wait_for_test_requests(2)
+            n_before = len(self.st.log)
+            os.write(master, b"\x03")
+            out, err = p.communicate(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            os.close(master)
+        self.check_partial(p, out, err)
+        self.assertLessEqual(len(self.st.log), n_before + 1)   # nothing new after the interrupt beyond the request already being sent
+
+    def test_sigterm_to_the_script_stops_the_run_and_flushes_a_partial_report(self):
+        p, master = self.start()
+        try:
+            self.wait_for_test_requests(2)
+            os.kill(p.pid, signal.SIGTERM)            # the script's pid is the program's pid (exec)
+            out, err = p.communicate(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            os.close(master)
+        self.check_partial(p, out, err)
+
+
+class DefaultRequestBytes(unittest.TestCase):
+    """With measure_upload, rate_bps and abort_after_delta all off, Client.post() sends the same bytes as before they existed:
+    one http.client request() with the same headers and body."""
+
+    def capture(self, send):
+        got = []
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def serve():
+            c, _ = srv.accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += c.recv(65536)
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            n = int([ln.split(b":", 1)[1] for ln in head.split(b"\r\n") if ln.lower().startswith(b"content-length:")][0])
+            while len(rest) < n:
+                rest += c.recv(65536)
+            got.append(head + b"\r\n\r\n" + rest)
+            sse = (b"event: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"id\": \"m\", \"usage\": {\"input_tokens\": 1}}}\n\n"
+                   b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+            c.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\nconnection: close\r\n\r\n" % len(sse) + sse)
+            c.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            send("http://127.0.0.1:%d" % srv.getsockname()[1], srv.getsockname()[1])
+            t.join(10)
+        finally:
+            srv.close()
+        return got[0]
+
+    def previous(self, port, body, thread):
+        # the request as Client.post() made it before measure_upload, rate_bps and abort_after_delta existed (main, 21cffee)
+        headers = {"content-type": "application/json", "accept": "text/event-stream", "x-api-key": FAKE_KEY,
+                   "anthropic-version": C.API_VERSION, "connection": "close"}
+        if thread:
+            headers["anthropic-beta"] = C.BETA
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request("POST", "/v1/messages", body=json.dumps(body).encode(), headers=headers)
+            conn.getresponse().read()
+        finally:
+            conn.close()
+
+    def test_same_bytes_and_headers_as_before(self):
+        body = {"model": "claude-haiku-5-5", "max_tokens": 16, "stream": True, "messages": [{"role": "user", "content": "hello " * 2000}],
+                "thread": {"type": "create"}, "cache_control": {"type": "ephemeral"}}
+        for thread in (False, True):
+            for deadline in (None, 60):
+                new = self.capture(lambda url, port: C.Client(url, FAKE_KEY, deadline=deadline).post(body, thread=thread))
+                old = self.capture(lambda url, port: self.previous(port, body, thread))
+                # the Host header carries each listener's own port; everything else must match byte for byte
+                strip = lambda raw: b"\r\n".join(ln for ln in raw.split(b"\r\n") if not ln.lower().startswith(b"host:"))
+                self.assertEqual(strip(new), strip(old), (thread, deadline))
+                self.assertIn(b"x-api-key: " + FAKE_KEY.encode(), new)
+                self.assertEqual(b"anthropic-beta: " + C.BETA.encode() in new, thread)
 
 
 if __name__ == "__main__":

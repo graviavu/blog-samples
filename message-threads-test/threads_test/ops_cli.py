@@ -24,6 +24,8 @@ from threads_test.runner import Guard  # noqa: E402
 
 out = cli.out
 DEFAULT_CAP = 0.60
+MAX_UPLOAD_S = 120.0      # a --b-rates value whose upload of the B+ history would take longer than this is refused
+MAX_GAP_S = 60.0
 
 
 def rates_arg(text):
@@ -34,6 +36,21 @@ def rates_arg(text):
     if any((not math.isfinite(x)) or x <= 0 for x in v):
         raise argparse.ArgumentTypeError("rates must be finite and above 0 (Mbps)")
     return v
+
+
+def gaps_arg(text):
+    try:
+        v = [float(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a comma separated list of numbers: %r" % text)
+    if not v or any((not math.isfinite(x)) or x < 0 or x > MAX_GAP_S for x in v):
+        raise argparse.ArgumentTypeError("gaps must be finite, from 0 to %g seconds" % MAX_GAP_S)
+    return v
+
+
+def b_upload_s(a, rate_mbps):
+    """Seconds the B+ history body would take at rate_mbps: tokens x margin x chars per token bytes (ASCII JSON), over the rate."""
+    return a.b_tokens * a.margin * a.chars_per_token * 8.0 / (rate_mbps * 1e6)
 
 
 def tests_arg(text):
@@ -56,7 +73,8 @@ def parser():
     p.add_argument("--b-tokens", type=int, default=100000, help="B+ history size in tokens (default 100000)")
     p.add_argument("--b-rates", type=rates_arg, default=[1.0, 5.0], help="B+ send throttles in Mbps, comma separated; a no-throttle condition always runs first (default 1,5)")
     p.add_argument("--b-reps", type=int, default=1, help="B+ repetitions of every condition (default 1)")
-    p.add_argument("--e-runs", type=int, default=5, help="E runs (default 5)")
+    p.add_argument("--e-runs", type=int, default=5, help="E runs per resend gap (default 5)")
+    p.add_argument("--e-gaps", type=gaps_arg, default=[0.0, 5.0], help="E seconds between the cut and the resend of the same continue, comma separated, 0 to %g; every gap gets --e-runs runs (default 0,5)" % MAX_GAP_S)
     p.add_argument("--e-tokens", type=int, default=20000, help="E history size in tokens (default 20000)")
     p.add_argument("--e-max-tokens", type=int, default=300, help="E output cap per request; a longer reply keeps the stream open longer (default 300)")
     p.add_argument("--a-tokens", type=int, default=20000, help="A history size in tokens (default 20000)")
@@ -68,7 +86,8 @@ def parser():
     p.add_argument("--token-margin", dest="margin", type=float, default=1.25, help="assumed worst-case tokens / size (default 1.25)")
     p.add_argument("--chars-per-token", type=float, default=3.2, help="characters per token used to size the history, 2.0 to 4.5 (default 3.2; the free token count adjusts it)")
     p.add_argument("--base-url-host", default=None, help="the only way to send the key to a host other than api.anthropic.com or loopback: name that host exactly")
-    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--timeout", type=int, default=600, help="seconds for one socket operation (connect, one read) (default 600)")
+    p.add_argument("--request-deadline", type=float, default=300.0, help="wall-clock seconds for one whole request, 30 to 1800; when it passes the client ends the request, charges its worst case and does not resend it (default 300)")
     p.add_argument("--results-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results"))
     return p
 
@@ -87,6 +106,16 @@ def validate(a):
         return "--chars-per-token must be between 2.0 and 4.5"
     if a.effort not in ("none", "low", "medium", "high", "xhigh", "max"):
         return "--effort must be none, low, medium, high, xhigh or max"
+    if not (math.isfinite(a.request_deadline) and 30 <= a.request_deadline <= 1800):
+        return "--request-deadline must be from 30 to 1800 seconds"
+    if a.timeout < 1:
+        return "--timeout must be at least 1"
+    if "B" in a.tests:
+        limit = min(MAX_UPLOAD_S, a.request_deadline / 2)
+        for r in a.b_rates:
+            if b_upload_s(a, r) > limit:
+                return ("--b-rates %g Mbps would take about %.0f s to upload the %d-token history (limit %.0f s). Use a rate of at least %.2f Mbps."
+                        % (r, b_upload_s(a, r), a.b_tokens, limit, b_upload_s(a, 1.0) / limit + 0.005))
     return None
 
 
@@ -100,7 +129,7 @@ def sizes_of(a):
 
 def cfg_of(a, cpt, probe_ub, stamp=""):
     return {"model": a.model, "tests": list(a.tests), "b_tokens": a.b_tokens, "rates": list(a.b_rates), "b_reps": a.b_reps, "e_runs": a.e_runs,
-            "e_tokens": a.e_tokens, "e_max_tokens": a.e_max_tokens, "a_tokens": a.a_tokens, "a_turns": a.a_turns, "a_fork_at": a.a_fork_at,
+            "e_tokens": a.e_tokens, "e_max_tokens": a.e_max_tokens, "e_gaps": list(a.e_gaps), "request_deadline_s": a.request_deadline, "a_tokens": a.a_tokens, "a_turns": a.a_turns, "a_fork_at": a.a_fork_at,
             "max_tokens": a.max_tokens, "margin": a.margin, "effort": a.effort, "seed": a.seed, "salt_nonce": stamp, "cpt": cpt,
             "max_usd": a.max_usd, "probe_bound_usd": probe_ub}
 
@@ -115,17 +144,18 @@ def print_plan(a, pl, probe_ub):
         conds = ["no throttle"] + ["%g Mbps" % r for r in a.b_rates]
         out("  test B+              %d requests: 1 cold prime, then per condition (%s) x %d rep: cached full resend, thread create, thread continue; %d-token history, up to %d prompt tokens assumed; expected $%.4f" % (
             t["B"]["requests"], ", ".join(conds), a.b_reps, a.b_tokens, t["B"]["prompt_tokens_ub"], t["B"]["expected"]))
-        out("                       measures: body bytes, time until the last body byte was sent, TTFT, total, usage, cost; bytes per token")
+        out("                       measures: body bytes, connection setup, upload (setup end to last byte handed to the kernel, default send buffers), TTFT, total, usage, cost; bytes per token of this synthetic history")
     if "E" in t:
-        out("  test E               %d requests: %d runs x (create, continue cut after the first delta, the same continue again, replay create); %d-token history; expected $%.4f" % (
-            t["E"]["requests"], a.e_runs, a.e_tokens, t["E"]["expected"]))
-        out("                       measures: which of success, thread_already_continued, thread_continue_in_flight comes back; usage and UTC window for the Console")
+        out("  test E               %d requests: %d runs x %d resend gaps (%s s) x (create, continue cut after the first delta, the same continue again after the gap, replay create); %d-token history; expected $%.4f" % (
+            t["E"]["requests"], a.e_runs, len(a.e_gaps), ", ".join("%g" % g for g in a.e_gaps), a.e_tokens, t["E"]["expected"]))
+        out("                       measures: which of success, thread_already_continued, thread_continue_in_flight comes back; usage and the dated UTC window for the Console check (run --tests E on its own for that)")
     if "A" in t:
         out("  test A               %d requests: %d cached main-line turns, then two forks from turn %d; %d-token history; expected $%.4f" % (
             t["A"]["requests"], a.a_turns, a.a_fork_at, a.a_tokens, t["A"]["expected"]))
         out("                       measures: cache read tokens, cost and TTFT of each fork against the entry written at turn %d" % a.a_fork_at)
     total = pl["expected"] + probe_ub
     out("  no retries and no automatic replays: a failed request is a result; a test that cannot go on stops and the others run")
+    out("  deadline             %g s per request on the wall clock; a request that passes it is ended, charged at its worst case and not resent" % a.request_deadline)
     out("  ESTIMATE             $%.4f   (expected: cache works as documented, prompts at %.2fx the size on the dearer side of the 100K price step, every reply at its cap, plus the probe)" % (total, a.margin))
     out("  WORST CASE           $%.2f   (information only: no request reads the cache, every prompt token at the dearer of input and write price)" % (pl["worst"] + probe_ub))
     out("  CAP                  $%.2f   (--max-usd; the run refuses to start when the ESTIMATE is over it, and stops when the spent total plus the next request's worst case would pass it)" % a.max_usd)
@@ -191,7 +221,7 @@ def main(argv=None):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, on_term)
-    client = C.Client(base, key, a.timeout, a.base_url_host)
+    client = C.Client(base, key, a.timeout, a.base_url_host, deadline=a.request_deadline)
     guard = Guard(a.max_usd)
     out("Results go to %s" % outdir)
     try:
