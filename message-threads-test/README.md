@@ -2,8 +2,7 @@
 
 **The problem:** a long agent loop re-uploads and re-processes its whole history on every turn, and you pay for it in time to first
 token (TTFT) and in tokens. Prompt caching, message threads and a plain reload each claim to help. This sample measures all three on
-your own API key and shows the saving of each against the worst case, a full resend with no cache. It checks the vendor claim of about
-35% lower median TTFT with threads at 500K to 1M tokens, on your machine, and it checks what happens when a thread is gone.
+your own API key and shows the saving of each against the worst case, a full resend with no cache. It measures how much lower the median TTFT is with threads at 500K to 1M tokens, on your machine, and it checks what happens when a thread is gone.
 
 The default run uses 20K and 100K tokens of history, which shows how latency grows with context but does not reach the 500K to 1M range of that claim; the reduced 500K command under Cost says how to get near it.
 
@@ -157,7 +156,7 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 | TTFT / cost saving | percent below arm 1's median. Negative means worse than arm 1 (a cold reload pays the cache-write premium) |
 | first-turn cost | arms 2 and 3 pay a cold write on their first turn. The second table shows the average per request including it |
 | Token parity | whether arms sent the same number of prompt tokens at the same turn, within 3%. Differences come from each model reply |
-| Thread vs resend | thread median TTFT divided by cached-resend median TTFT. This is the number to hold against the vendor's 35% |
+| Thread vs resend | thread median TTFT divided by cached-resend median TTFT. A value under 1 means threads answered sooner |
 
 ## Results from the author's runs
 
@@ -214,7 +213,7 @@ Seven follow-up turns each for the cached resend and the thread. No cache and co
 | 500K | Thread + cache | 1,318 | 3,066 | $0.0255 |
 | 500K | Cold reload | 15,044 | 15,044 | $0.3143 |
 
-The thread's median first-token time was 28% lower than the cached resend (1,318 ms against 1,838 ms). The vendor quotes about 35%. Average cost per request including the cold first turn: $0.0617 for the cached resend and $0.0616 for the thread, 75% below no cache.
+The thread's median TTFT was 28% lower than the cached resend (1,318 ms against 1,838 ms). Average cost per request including the cold first turn: $0.0617 for the cached resend and $0.0616 for the thread, 75% below no cache.
 
 ### Expiry
 
@@ -223,13 +222,13 @@ The thread's median first-token time was 28% lower than the cached resend (1,318
 
 ### What I haven't tested
 
-Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, and more than one 500K run: the vendor's range goes to 1M tokens. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
+Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, up to 1M tokens, and more than one 500K run. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
 
 ## Limits
 
 - Thinking blocks are left out of the history the resend arms send, while a thread may keep the thinking blocks of its own earlier turns. That can make the arms differ in tokens and TTFT for reasons unrelated to threads, so read the token-usage comparison before you trust a TTFT difference. The docs offer effort as the main lever for thinking, so every request uses `--effort low`. The effort page also allows `thinking: {"type": "disabled"}` on Haiku 5.5 at high effort or below; this sample does not use it.
 - One machine, one network, one day. With 6 follow-up samples per arm and size at the default, a few points of difference are noise. Run it again on another day before you quote a number.
-- The vendor claim of about 35% lower median TTFT at 500K to 1M tokens is what is being checked. The docs page I read only says TTFT "stays lower and steadier" and gives no figure; see `DOCS-NOTES.md`.
+- The docs page says TTFT "stays lower and steadier" as the conversation grows and gives no figure. This sample measures the figure; see `DOCS-NOTES.md`.
 - The history is synthetic text and log lines. Token counts depend on the tokenizer; the first answer shows the actual size, and `results.md` notes it if it is far from `--tokens`.
 - Threads are best-effort, in beta, and **not ZDR eligible** (and not HIPAA eligible). Do not run this on an organization that needs either.
 - Haiku 5.5 may emit a thinking block before text. `effort: low` is documented for Haiku 5.5; the probe still retries without it if your endpoint refuses it, and tells you. The effort page warns that at `low` the model is more likely to skip a check in long agent prompts, which does not matter for a latency test with short answers.
