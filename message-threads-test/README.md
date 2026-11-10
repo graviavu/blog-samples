@@ -83,6 +83,28 @@ The 20K arms are cheap, so more repetitions need no new mode. This gives 20 samp
 
 The bound is under the default cap too, so `--max-usd 1` is only the tighter cap. If you change the counts and the dry run prints a bound above your cap, lower `--reps` or `--nocache-reps`, or the run refuses to start.
 
+## Operations tests: `run-ops-test.sh` (upload size, dropped stream, savepoint)
+
+A second script, separate from `run-test.sh`, for three questions the latency arms do not answer. It reuses the same client, history, guard, prices and probe. Default model `claude-haiku-5-5`; it needs the same key and the same typed phrase rule.
+
+```bash
+./run-ops-test.sh               # dry run: the plan, the ESTIMATE and the cap; no network, no files
+./run-ops-test.sh --run         # asks once for SPEND UP TO $0.6, then the probe, the free token counts, tests B+, E, A
+./run-ops-test.sh --self-test   # the stub tests, no key
+```
+
+| Test | What it does | What it reports |
+|---|---|---|
+| B+ | A cold prime of a 100K-token history, then at no throttle, 1 Mbps and 5 Mbps: a cached full resend, a thread create (what a replay sends) and a thread continue | Per request: request body bytes, time until the last body byte was handed to the socket, TTFT, TTFT after the upload, total, prompt tokens, cost. The measured bytes per token (body bytes over the usage field's prompt tokens), and that ratio times 100K, 500K and 1M tokens as megabytes and as seconds at 1, 5, 20 and 100 Mbps |
+| E | 5 runs: create a thread, send a continue, close the stream after the first content delta (before `message_stop`), send the same continue again at once, then replay with a create | Which of success, `thread_already_continued`, `thread_continue_in_flight` or another code the repeated continue got; the usage of every request, the UTC window and a ready sentence for the Console check of the cut generation, whose billing stays UNKNOWN until you look |
+| A | A cached 10-turn main line at 20K, then two forks from the same prefix at turn 5 (the prefix plus a different new user message) | Cache read tokens, cost and TTFT of each fork, against the prompt of turn 5; the verdict says whether a fork read the entry written at turn 5 (HIT), only the one before (EARLIER ENTRY ONLY), part of it, or nothing |
+
+- **Cost.** The dry run prints the ESTIMATE before anything is sent: the cache works as documented, prompts at 1.25x the size on the dearer side of Haiku's 100K step, every reply at its cap, plus the probe. About $0.18 by default (B+ about $0.15 of it). It also prints the WORST CASE with no cache read at all (information only). The run **refuses to start when the estimate is over the cap** (default $0.60; `--max-usd` raises it on purpose, at most 10) and, during the run, checks the worst case of every request against what is left of the cap before sending it and stops with a PARTIAL `ops.md` when it would pass. Cut streams are charged at their input plus the full output cap. Nothing is retried and nothing is replayed automatically: a failed request is a result, a test that cannot go on stops and the others still run.
+- **The throttle** paces the request body inside the program (16 KB chunks against a clock). It changes nothing on your machine or network, so there is nothing to restore; Ctrl-C and SIGTERM still flush the partial results and the script removes stray temp files. It models a slow uplink: no latency, loss or TLS effects. "Upload" is when the client handed over the last byte (with a 16 KB socket buffer), not when the server received it. The Arithmetic column is bytes over the rate; a throttled upload sits at or just above it.
+- **Output.** `results/<timestamp>/ops.md` (README-style tables) and `ops.json`, next to `probe.json`; files 0600, no key, no message or request ids. `results/` is git-ignored and nothing is committed for you.
+- Options: `--tests B,E,A`, `--b-tokens`, `--b-rates 1,5`, `--b-reps`, `--e-runs`, `--e-tokens`, `--e-max-tokens`, `--a-tokens`, `--a-turns`, `--a-fork-at`, `--max-tokens`, `--effort`, `--max-usd`. The dry run shows the estimate for any change.
+- Not covered here: a tool call cut by `max_tokens`, rate-limit headers, a 20-turn tool loop, a gateway in the path.
+
 ## Cost and the spend guard
 
 You pay with your own key. The default model is `claude-haiku-5-5`, the cheapest priced model in `DOCS-NOTES.md`. **Haiku 5.5 charges 5x per token for prompts over 100,000 tokens.** The 100K history can land either side of that line (UNKNOWN: the characters-per-token ratio of 3.2 is a guess; `--count-tokens` measures it for free), and the bound assumes the dearer side. Run `--count-tokens` on your first `--run`. Sonnet 5.5 (`--model claude-sonnet-5-5`) lists at $2 per million input tokens and $10 output, against Haiku's $0.50 and $2.50 above 100K tokens; Opus 5.5 and Fable 5.1 cost more again. Check the pricing page before you run.
@@ -238,7 +260,8 @@ Replays and keep-alives beyond one each: the warm-cache replay and the idle-time
 ## Tests
 
 ```bash
-./run-test.sh --self-test     # 186 stub tests, no key, no network beyond 127.0.0.1
+./run-test.sh --self-test     # all stub tests (about 4 minutes), no key, no network beyond 127.0.0.1
+./run-ops-test.sh --self-test # the same suite; CI runs only the ops tests (tests/test_ops.py, about 25 seconds)
 ```
 
 The stub emulates create and continue with the `thread` parameter, SSE streaming, 404 for unknown ids, the single-continue rule, cache accounting and usage numbers, and can inject 500s, cut streams, inflated usage and expiry. Tests cover: the default plan's worst case is at most $5 and the 500K command needs `--max-usd 10` and its own phrase; `--probe` makes exactly three requests with the right headers and bodies, costs under a cent, and gives ACCEPTED, REJECTED or INCONCLUSIVE in the right cases (a continue that ignores the thread is not ACCEPTED); `--run` stops after a rejected probe; two sizes run in separate folders under one shared cap with different cold prefixes; a dry run makes no connection; the estimate is an upper bound on what the stub bills; the spend guard stops at the cap and refuses a request that could cross it; the confirmation phrase is enforced and a wrong phrase makes no call; the key never appears in output or files; the 404 replay path; the single-continue rule; back-to-back requests on the real client against an HTTP/1.1 chunked keep-alive stub (exactly one server request per call, no duplicate billing); the cap validation (nan, inf, 0, negative, above 10); the cold-prefix salt (unique per arm and repetition, first in the system prompt, cache read 0); the savings math; median and p90; Ctrl-C flushes partial results. New: every credit, billing, quota, spend-limit and auth error shape stops at once with exactly one request after the error, no retry and no replay (including a credit 400 on a thread continue and an error event inside a stream), writes PARTIAL files (0600/0700, no key, no ids) and exits 5 or 6; a plain 429 with retry-after is still retried; `--all` runs probe, then the count, then the arms with one typed phrase, stops on REJECTED, adjusts or refuses on the measured ratio, and keeps the tty, margin, ratio and host guards; the default cap is 4.5 with bound 4.44; `--tune` (45 tests in `tests/test_tune.py`: each experiment with success, the expected 404, keep-alive reset and not reset, a warm replay that does and does not read the 1-hour cache, the growth math, bound at most 1.5, cap refusals, a billing stop mid-timeline, Ctrl-C, tty-only phrase, nothing sent before the phrase, private files); `--resume` runs only what is left, carries the spend, applies the cap to the remainder, and refuses malformed, non-private, symlinked, mismatched or out-of-range folders.
@@ -246,8 +269,9 @@ The stub emulates create and continue with the `thread` parameter, SSE streaming
 ## Layout
 
 ```
-run-test.sh              the one script you run
-threads_test/            cli, probe, runner (arms, checks, guard), tune and tune_report (--tune), client (HTTP + SSE, error classes), resume, pricing, convo, stats, report, redact
+run-test.sh              the script you run for the latency arms
+run-ops-test.sh          the script you run for the operations tests (B+, E, A)
+threads_test/            cli, probe, runner (arms, checks, guard), tune and tune_report (--tune), ops, ops_cli and ops_report (run-ops-test.sh), client (HTTP + SSE, paced upload, error classes), resume, pricing, convo, stats, report, redact
 tests/                   stub API server and the tests
 DOCS-NOTES.md            the facts and prices relied on, with the read date and the UNKNOWNs
 ```
