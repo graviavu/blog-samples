@@ -159,6 +159,68 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 | Token parity | whether arms sent the same number of prompt tokens at the same turn, within 3%. Differences come from each model reply |
 | Thread vs resend | thread median TTFT divided by cached-resend median TTFT. This is the number to hold against the vendor's 35% |
 
+## Results from the author's runs
+
+These are the numbers behind the blog post. One machine, one network, one day. Network conditions change first-token times, so your numbers will differ. Cost is an estimated usage value from list prices, not an invoice.
+
+### Pilot: context levers on an 8-turn file task (Sonnet, four arms, two runs each)
+
+| Arm | Context at turn 8 | Change | Cost per run |
+| --- | ---: | ---: | ---: |
+| Baseline | 42.7K | - | $0.137 |
+| Trimmed reads | 10.9K | -74% | $0.044 |
+| Subagent isolation | 7.7K | -82% | $0.179 |
+| Summary, then fresh session | 10.6K | -75% | $0.120 |
+
+### Simulation: pricing a real agent loop at list rates
+
+1,632 calls from main sessions and 889 from subagents. This is a simulation of uploaded tokens. It is not a threads run and it does not measure time to first token.
+
+| | Main sessions | Subagents |
+| --- | --- | --- |
+| Median context per call | 168K tokens | 77K tokens |
+| Median gap between calls | 8 seconds | 11 seconds |
+| Calls inside the 5-minute thread window | 91% | 95% |
+| Tokens uploaded, full resend | 302M | 90M |
+| Tokens uploaded, thread plus replay when it expires | 30M | 8M |
+| Cost with no caching | $616 | $216 |
+| Cost with the 1-hour cache | $59 | $31 |
+
+### API runs on Haiku 5.5: time to first token (ms) and cost per turn
+
+Each thread and cache cell at 20K and 100K has six samples, the other cells two. Prompts were synthetic, with no tool calls.
+
+| History | Arm | Median | p90 | Cost per turn |
+| --- | --- | ---: | ---: | ---: |
+| 20K | No cache | 2,370 | 2,513 | $0.0023 |
+| 20K | Prompt cache | 2,502 | 3,163 | $0.0004 |
+| 20K | Thread + cache | 1,484 | 2,772 | $0.0004 |
+| 20K | Cold reload | 2,312 | 2,387 | $0.0028 |
+| 100K | No cache | 3,378 | 4,382 | $0.0511 |
+| 100K | Prompt cache | 2,155 | 3,302 | $0.0058 |
+| 100K | Thread + cache | 1,441 | 2,206 | $0.0056 |
+| 100K | Cold reload | 3,732 | 3,924 | $0.0636 |
+
+Over 15 turns at 20K tokens, on one thread, the thread's first-token time was lower than the cached resend on 12 turns. Median over the last five turns: 1,028 ms against 1,426 ms. The history grew by only about 1.4K tokens in that run.
+
+### 500K tokens of history (Haiku 5.5, $1.5524 spent)
+
+Seven follow-up turns each for the cached resend and the thread. No cache and cold reload had one request each. Prompt tokens matched across arms within 0.16%.
+
+| History | Arm | Median | p90 | Cost per turn |
+| --- | --- | ---: | ---: | ---: |
+| 500K | No cache | 15,162 | 15,162 | $0.2513 |
+| 500K | Prompt cache | 1,838 | 3,896 | $0.0256 |
+| 500K | Thread + cache | 1,318 | 3,066 | $0.0255 |
+| 500K | Cold reload | 15,044 | 15,044 | $0.3143 |
+
+The thread's median first-token time was 28% lower than the cached resend (1,318 ms against 1,838 ms). The vendor quotes about 35%. Average cost per request including the cold first turn: $0.0617 for the cached resend and $0.0616 for the thread, 75% below no cache.
+
+### Expiry
+
+- Keep-alive: a thread created, a short continue at 240 seconds and a real one at 477 seconds. It answered. The keep-alive cost $0.0002 at 20K tokens and added about 46 tokens to the history.
+- Replay: after 338 seconds idle a continue returned 404. A replay of the same 100K history with a create request read 100,318 of 100,322 tokens from the cache, cost $0.0053 and answered in 1,579 ms. A thread create on that prefix took 1,646 ms. A cold reload on a fresh 100K prefix cost $0.0630 and took 3,074 ms. The 1-hour write for the 100K prefix was $0.1006.
+
 ## Limits
 
 - Thinking blocks are left out of the history the resend arms send, while a thread may keep the thinking blocks of its own earlier turns. That can make the arms differ in tokens and TTFT for reasons unrelated to threads, so read the token-usage comparison before you trust a TTFT difference. The docs offer effort as the main lever for thinking, so every request uses `--effort low`. The effort page also allows `thinking: {"type": "disabled"}` on Haiku 5.5 at high effort or below; this sample does not use it.
@@ -168,7 +230,7 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 - Threads are best-effort, in beta, and **not ZDR eligible** (and not HIPAA eligible). Do not run this on an organization that needs either.
 - Haiku 5.5 may emit a thinking block before text. `effort: low` is documented for Haiku 5.5; the probe still retries without it if your endpoint refuses it, and tells you. The effort page warns that at `low` the model is more likely to skip a check in long agent prompts, which does not matter for a latency test with short answers.
 - UNKNOWN: whether the real API accepts `tool_choice: none` together with `tools` on a thread create, which is what the history sends. The stub accepts it. The probe does not test it (it sends no tools); the first arm that fails will show it.
-- The stub server is written from the docs, not from the service. Real event ordering, error bodies and usage fields can differ in detail. Nothing here has been run against the real API yet.
+- The stub server is written from the docs, not from the service. Real event ordering, error bodies and usage fields can differ in detail. The results above come from runs against the real API.
 
 ## Tests
 
