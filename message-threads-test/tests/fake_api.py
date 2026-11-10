@@ -39,6 +39,7 @@ class State:
         self.actions = []       # failure injection queue: "500", "truncate"
         self.delay_per_token = 0.0   # seconds of "prefill" per uncached token
         self.base_delay = 0.0
+        self.event_delay = 0.0       # seconds before every SSE event after message_start (a slow, trickling stream)
         self.count_scale = 1
         self.usage_scale = 1         # inflate reported tokens to blow past the estimate
         self.think = False           # emit a thinking_delta first
@@ -73,7 +74,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         st = self.server.state
         n = int(self.headers.get("content-length", 0))
-        body = json.loads(self.rfile.read(n) or b"{}")
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:            # the client ended the upload part way (the deadline test)
+            self.close_connection = True
+            return
         hdrs = {k.lower(): v for k, v in self.headers.items()}
         with st.lock:
             st.log.append((self.path, hdrs, body))
@@ -201,6 +206,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         w = self.wfile
 
         def ev(t, d):
+            if t != "message_start" and st.event_delay:
+                time.sleep(st.event_delay)
             b = ("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(d, type=t)))).encode()
             w.write(b"%x\r\n" % len(b) + b + b"\r\n")
             w.flush()

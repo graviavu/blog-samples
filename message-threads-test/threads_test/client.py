@@ -3,6 +3,7 @@ import http.client
 import json
 import re
 import socket
+import threading
 import time
 import urllib.parse
 
@@ -10,8 +11,8 @@ from . import redact as R
 
 API_VERSION = "2026-10-21"  # from the docs cURL example (DOCS-NOTES.md)
 BETA = "message-threads-2026-08-12"
-SEND_CHUNK = 16384   # bytes per send when the upload is measured or paced
-SNDBUF = 16384       # socket send buffer while the upload is measured (a big buffer hides the upload time)
+SEND_CHUNK = 16384   # bytes per send when the upload is measured or paced. The socket keeps the OS default send buffers: setting
+                     # SO_SNDBUF would turn off send-buffer auto-tuning on macOS/BSD and cap throughput at about one buffer per round trip.
 
 
 class FatalApiError(Exception):
@@ -63,7 +64,9 @@ class Result:
         self.exception = None    # network-level failure, redacted text
         self.response_id = None  # kept in memory only, never written out
         self.body_bytes = None   # size of the request body that was sent
-        self.body_sent_s = None  # seconds from the start of the request until the last body byte was handed to the socket (measure_upload only)
+        self.connect_s = None    # seconds from the start of the request until DNS, TCP and TLS setup was done (measure_upload only)
+        self.body_sent_s = None  # seconds from the start of the request until the last body byte was handed to the kernel (measure_upload only)
+        self.deadline_hit = False  # the per-request wall-clock deadline passed; the client ended the request (never resent)
         self.aborted = False     # the client closed the stream on purpose (abort_after_delta)
 
     @property
@@ -138,15 +141,18 @@ def _error_code(body):
 
 
 class Client:
-    def __init__(self, base_url, key, timeout=600, allow_host=None):
+    def __init__(self, base_url, key, timeout=600, allow_host=None, deadline=None):
+        """timeout bounds one socket operation (connect, one read). deadline (seconds, None = none) bounds a whole post() on the
+        wall clock: when it passes, the client shuts the connection down and the Result says deadline_hit. Nothing is resent."""
         self.scheme, self.host, self.port = parse_base(base_url, allow_host)
         self.key = key
         self.timeout = timeout
+        self.deadline = deadline
         R.add_secret(key)
 
-    def _connect(self):
+    def _connect(self, timeout=None):
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        return cls(self.host, self.port, timeout=self.timeout)
+        return cls(self.host, self.port, timeout=timeout or self.timeout)
 
     def close(self):
         """Nothing is kept open between requests: every request uses its own connection."""
@@ -173,27 +179,48 @@ class Client:
         finally:
             conn.close()
 
-    def _send_body(self, conn, data, rate_bps, t0):
+    def _send_body(self, conn, data, rate_bps, t0, end=None):
         """Headers are already sent. Hands the body to the socket in chunks. rate_bps paces it on the client (a token bucket on
         wall-clock time) to imitate a slow uplink; None means as fast as the socket takes it. Nothing outside this process
-        is changed: no firewall, no traffic shaper, nothing to restore. Returns seconds since t0 when the last byte was handed over."""
+        is changed: no firewall, no traffic shaper, nothing to restore. Returns seconds since t0 when the last byte was handed to the
+        kernel (with the default send buffers, that can be before it left the machine)."""
         start = time.perf_counter()
         sent = 0
         for i in range(0, len(data), SEND_CHUNK):
+            if end is not None and time.perf_counter() >= end:
+                raise TimeoutError("request deadline passed during the upload")
             chunk = data[i:i + SEND_CHUNK]
             conn.send(chunk)
             sent += len(chunk)
             if rate_bps:
                 wait = start + sent * 8.0 / rate_bps - time.perf_counter()
+                if end is not None:
+                    wait = min(wait, end - time.perf_counter())
                 if wait > 0:
                     time.sleep(wait)
         return time.perf_counter() - t0
 
+    @staticmethod
+    def _watchdog(conn, res, seconds):
+        """Ends the request when the wall-clock deadline passes: shuts the socket down so a blocked read returns at once."""
+        def fire():
+            res.deadline_hit = True
+            sock = conn.sock
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        t = threading.Timer(max(0.0, seconds), fire)
+        t.daemon = True
+        return t
+
     def post(self, body, thread=False, measure_upload=False, rate_bps=None, abort_after_delta=False):
-        """measure_upload (implied by rate_bps) sends the body in chunks and records body_bytes and body_sent_s. The socket send buffer
-        is shrunk first, so the last send returns close to when the peer has taken the data; it is still the time the client handed
-        over the last byte, not the time the server received it. abort_after_delta closes the connection after the first content delta,
-        before message_stop (a dropped stream)."""
+        """measure_upload (implied by rate_bps) connects first, then sends the body in chunks, and records body_bytes, connect_s and
+        body_sent_s. The socket keeps the OS default send buffers, so body_sent_s is when the client handed the last byte to the
+        kernel, not when the server received it. abort_after_delta closes the connection after the first content delta,
+        before message_stop (a dropped stream). With all three off the request is the same bytes as before these options existed.
+        A Client deadline ends the request on the wall clock (deadline_hit); it is never resent."""
         res = Result()
         headers = {"content-type": "application/json", "accept": "text/event-stream", "x-api-key": self.key,
                    "anthropic-version": API_VERSION, "connection": "close"}
@@ -202,22 +229,31 @@ class Client:
         data = json.dumps(body).encode()
         res.body_bytes = len(data)
         t0 = time.perf_counter()  # connection setup and the upload are inside TTFT, the same for every arm
-        conn = self._connect()
+        end = t0 + self.deadline if self.deadline else None
+        conn = self._connect(min(self.timeout, self.deadline) if self.deadline else None)
+        dog = None
         try:
             if measure_upload or rate_bps:
                 conn.connect()
-                try:
-                    conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SNDBUF)
-                except OSError:
-                    pass
+                res.connect_s = time.perf_counter() - t0
+                if end is not None:
+                    dog = self._watchdog(conn, res, end - time.perf_counter())
+                    dog.start()
                 conn.putrequest("POST", "/v1/messages")
                 for k, v in dict(headers, **{"content-length": str(len(data))}).items():
                     conn.putheader(k, v)
                 conn.endheaders()
-                res.body_sent_s = self._send_body(conn, data, rate_bps, t0)
+                res.body_sent_s = self._send_body(conn, data, rate_bps, t0, end)
             else:
+                if end is not None:
+                    conn.connect()
+                    dog = self._watchdog(conn, res, end - time.perf_counter())
+                    dog.start()
                 conn.request("POST", "/v1/messages", body=data, headers=headers)
+            sock = conn.sock
             resp = conn.getresponse()
+            if dog is not None and conn.sock is None:
+                conn.sock = sock   # http.client hands a "connection: close" socket to the response; keep it for the watchdog
             res.status = resp.status
             if resp.status != 200:
                 raw = resp.read().decode("utf-8", "replace")
@@ -231,9 +267,18 @@ class Client:
         except Exception as e:  # network, timeout, protocol
             res.exception = R.redact("%s: %s" % (type(e).__name__, e))
         finally:
+            if dog is not None:
+                dog.cancel()
             conn.close()
             if res.total is None:
                 res.total = time.perf_counter() - t0
+            # A request that finished (complete, cut on purpose, or an HTTP error answer) is kept even if the timer fired just after.
+            if end is not None and not res.complete and not res.aborted and res.status in (None, 200) \
+                    and (res.deadline_hit or time.perf_counter() >= end):
+                res.deadline_hit = True
+                res.exception = "request deadline of %gs passed; the client ended it and did not resend it" % self.deadline
+            else:
+                res.deadline_hit = False
         return res
 
     @staticmethod
