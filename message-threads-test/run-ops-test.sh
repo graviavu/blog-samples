@@ -18,22 +18,7 @@ if [ "${1:-}" = "--self-test" ]; then
   exec "$ROOT/tests/run-tests.sh"
 fi
 
-child=0
-# Ctrl-C reaches the program through the terminal's process group; this shell only has to stay alive until the program has
-# flushed its results. SIGTERM (a kill of this script) is passed on so the program still flushes and prints the spend.
-on_int() { :; }
-on_term() { if [ "$child" -ne 0 ]; then kill -TERM "$child" 2>/dev/null; fi; }
-# Whatever happens, remove half-written temp files the program may have left in the default results folder.
-cleanup() { if [ -d "$ROOT/results" ]; then find "$ROOT/results" -name '*.tmp' -type f -delete 2>/dev/null; fi; }
-trap on_int INT
-trap on_term TERM
-trap cleanup EXIT
-
-"$PY" -I "$ROOT/threads_test/ops_cli.py" "$@" <&0 &
-child=$!
-rc=0
-while kill -0 "$child" 2>/dev/null; do
-  wait "$child"
-  rc=$?
-done
-exit "$rc"
+# exec: this shell becomes the program, so Ctrl-C (SIGINT from the terminal) and SIGTERM go straight to python, which stops,
+# flushes a PARTIAL ops.md / ops.json and prints the spend. Do not start it as a background job: a non-interactive shell would make
+# it ignore SIGINT. The program removes its own temp files; this script deletes nothing.
+exec "$PY" -I "$ROOT/threads_test/ops_cli.py" "$@"
