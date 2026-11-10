@@ -243,6 +243,94 @@ The thread's median TTFT was 28% lower than the cached resend (1,318 ms against 
 - Keep-alive: a thread created, a short continue at 240 seconds and a real one at 477 seconds. It answered. The keep-alive cost $0.0002 at 20K tokens and added about 46 tokens to the history.
 - Replay: after 338 seconds idle a continue returned 404. A replay of the same 100K history with a create request read 100,318 of 100,322 tokens from the cache, cost $0.0053 and answered in 1,579 ms. A thread create on that prefix took 1,646 ms. A cold reload on a fresh 100K prefix cost $0.0630 and took 3,074 ms. The 1-hour write for the 100K prefix was $0.1006.
 
+### Operations tests: upload size, dropped stream, savepoint (Haiku 5.5, $0.1346 spent)
+
+Run with `./run-ops-test.sh --run` (cap $0.60, estimate $0.20). Cost is an estimated usage value from the usage fields and the list prices in DOCS-NOTES.md, not an invoice. The send throttle is client-side pacing of the request body, a model of a slow uplink and not a measurement of one.
+
+#### B+: request body bytes and upload time (100,000-token history)
+
+| Condition | Arm | n | Body (KB) | Connect (ms) | Upload (ms) | Arithmetic (ms) | TTFT (ms) | TTFT after body sent (ms) | Total (ms) | Prompt tokens | Cost |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no throttle | Full resend + cache | 1 | 221.9 | 60 | 83 | n/a | 1,524 | 1,382 | 1,525 | 100,341 | $0.0053 |
+| no throttle | Thread create (replay) | 1 | 221.7 | 62 | 85 | n/a | 1,829 | 1,682 | 1,838 | 100,318 | $0.0053 |
+| no throttle | Thread continue | 1 | 0.4 | 70 | 1 | n/a | 1,298 | 1,226 | 1,302 | 100,440 | $0.0053 |
+| 1 Mbps | Full resend + cache | 1 | 221.9 | 61 | 1,780 | 1,775 | 3,287 | 1,446 | 3,288 | 100,341 | $0.0053 |
+| 1 Mbps | Thread create (replay) | 1 | 221.7 | 64 | 1,779 | 1,774 | 3,462 | 1,620 | 3,473 | 100,318 | $0.0053 |
+| 1 Mbps | Thread continue | 1 | 0.4 | 62 | 4 | 3 | 1,528 | 1,463 | 1,529 | 100,440 | $0.0053 |
+| 5 Mbps | Full resend + cache | 1 | 221.9 | 70 | 358 | 355 | 1,932 | 1,504 | 1,935 | 100,341 | $0.0053 |
+| 5 Mbps | Thread create (replay) | 1 | 221.7 | 60 | 358 | 355 | 1,878 | 1,460 | 1,896 | 100,318 | $0.0053 |
+| 5 Mbps | Thread continue | 1 | 0.4 | 61 | 1 | 1 | 1,362 | 1,300 | 1,362 | 100,440 | $0.0053 |
+
+Arithmetic is body bytes divided by the throttle rate; the upload column should sit at or just above it on a throttled row. The `Thread create` row is what a replay after an expired thread sends. The no-throttle rows use the OS default send buffers; their Upload is when the body was handed to the kernel.
+
+Bytes per token of this synthetic history (request body bytes / prompt tokens from the usage field): full resend **2.21**, thread create **2.21**. The body includes the tool definitions, the system prompt and the JSON around the text. It is a property of the generated log-and-question history this script sends, not a measurement of Claude Code tool output; other content has a different ratio.
+
+Arithmetic on the full-resend ratio of this synthetic history (size / rate only; no TLS, slow start or loss):
+
+| History | Body (MB) | at 1 Mbps (s) | at 5 Mbps (s) | at 20 Mbps (s) | at 100 Mbps (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 100,000 tokens | 0.22 | 1.8 | 0.4 | 0.1 | 0.0 |
+| 500,000 tokens | 1.11 | 8.8 | 1.8 | 0.4 | 0.1 |
+| 1,000,000 tokens | 2.21 | 17.7 | 3.5 | 0.9 | 0.2 |
+
+#### E: dropped-stream retry (5 runs per resend gap, gaps 0 and 5 s, 20,000-token history)
+
+Each run: thread create, a continue whose stream the client closed after the first content delta (before `message_stop`), the same continue sent again after the run's gap (0 s is an immediate resend), then a replay with a create. The gaps take turns from run to run.
+
+| Run | Resent after (s) | Same continue returned | Cut stream: input / cache read / cache write tokens at message_start | Cut at (UTC) | Replay | Replay cache read | Replay cost |
+| ---: | ---: | --- | --- | --- | --- | ---: | ---: |
+| 1 | 0 | success | 4 / 21079 / 353 | 2026-11-10 21:09:39 to 2026-11-10 21:09:41 | answered | 21,079 | $0.0004 |
+| 2 | 5 | success | 4 / 21079 / 352 | 2026-11-10 21:09:49 to 2026-11-10 21:09:51 | answered | 21,079 | $0.0004 |
+| 3 | 0 | thread_already_continued | 4 / 21079 / 353 | 2026-11-10 21:10:04 to 2026-11-10 21:10:06 | answered | 21,079 | $0.0004 |
+| 4 | 5 | success | 4 / 21079 / 352 | 2026-11-10 21:10:11 to 2026-11-10 21:10:14 | answered | 21,079 | $0.0004 |
+| 5 | 0 | thread_already_continued | 4 / 21079 / 352 | 2026-11-10 21:10:27 to 2026-11-10 21:10:30 | answered | 21,079 | $0.0004 |
+| 6 | 5 | thread_already_continued | 4 / 21079 / 352 | 2026-11-10 21:10:35 to 2026-11-10 21:10:37 | answered | 21,079 | $0.0004 |
+| 7 | 0 | success | 4 / 21079 / 352 | 2026-11-10 21:10:47 to 2026-11-10 21:10:50 | answered | 21,079 | $0.0004 |
+| 8 | 5 | success | 4 / 21079 / 352 | 2026-11-10 21:10:57 to 2026-11-10 21:10:59 | answered | 21,079 | $0.0004 |
+| 9 | 0 | success | 4 / 21079 / 353 | 2026-11-10 21:11:12 to 2026-11-10 21:11:14 | answered | 21,133 | $0.0004 |
+| 10 | 5 | success | 4 / 21079 / 353 | 2026-11-10 21:11:22 to 2026-11-10 21:11:24 | answered | 21,133 | $0.0004 |
+
+Counts: success 7, thread_already_continued 3.
+Resent after 0 s: success 3, thread_already_continued 2.
+Resent after 5 s: success 4, thread_already_continued 1.
+
+Billing check for the Console (UNKNOWN until you look). Window: 2026-11-10 21:09:36 to 2026-11-10 21:11:35 UTC. In it, test E made 27 complete requests and 10 cut ones.
+The complete requests account for 108 input, 21,699 cache write, 550,629 cache read and 8,024 output tokens ($0.0122 by the list prices). The cut requests reported 40 input and 210,790 cache read tokens at their start; their output is not known to this script.
+Every cut stream bills at least the input and the tokens generated before the cut. What matters is the output beyond the complete requests' 8,024: about 3,000 (300 x 10, the output cap of each cut) means each orphaned generation ran on to its cap after the client left; a few tokens per cut means generation stopped at the cut. Other traffic on the key in the window mixes in, so for this check run `./run-ops-test.sh --run --tests E` on its own.
+
+#### A: client-side savepoint (20,000-token history, 10 turns, forked twice at turn 5)
+
+The main line is a cached full resend. Each fork is the prefix up to turn 5, the reply of that turn, and a different new user message.
+Expected cache read if the entry written at turn 5 is hit: 26,822 tokens (the prompt of that turn). The entry of turn 4 would give 25,652.
+
+| Request | Prompt tokens | Cache read | Cache write | Uncached input | Cost | TTFT (ms) | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Main line, turn 6 (the request after the savepoint) | n/a | 26,818 | n/a | n/a | $0.0005 | 1,328 | reference |
+| Fork A | 27,947 | 26,818 | 1,125 | 4 | $0.0005 | 1,142 | HIT: read the entry written at turn 5 |
+| Fork B | 27,945 | 26,818 | 1,123 | 4 | $0.0005 | 1,254 | HIT: read the entry written at turn 5 |
+
+Main line, per turn:
+
+| Turn | Prompt tokens | Cache read | Cache write | TTFT (ms) | Cost |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 21,086 | 0 | 21,082 | 1,263 | $0.0027 |
+| 1 | 22,232 | 21,082 | 1,146 | 1,371 | $0.0004 |
+| 2 | 23,380 | 22,228 | 1,148 | 1,364 | $0.0004 |
+| 3 | 24,516 | 23,376 | 1,136 | 1,255 | $0.0004 |
+| 4 | 25,652 | 24,512 | 1,136 | 1,335 | $0.0004 |
+| 5 | 26,822 | 25,648 | 1,170 | 1,486 | $0.0005 |
+| 6 | 27,979 | 26,818 | 1,157 | 1,328 | $0.0005 |
+| 7 | 29,111 | 27,975 | 1,132 | 1,200 | $0.0005 |
+| 8 | 30,244 | 29,107 | 1,133 | 1,618 | $0.0005 |
+| 9 | 31,373 | 30,240 | 1,129 | 1,478 | $0.0005 |
+
+#### Reading this
+
+- Connect is DNS, TCP and TLS setup, its own column. Upload is from the end of that setup until the last body byte was handed to the kernel. It is when the client finished handing over, not when the server finished receiving.
+- The socket uses the OS default send buffers (no SO_SNDBUF). On the no-throttle rows the kernel can still be sending after the last byte was handed over, so those Upload cells are "handed to the kernel", a lower bound on the time on the wire. On a throttled row the pacing dominates.
+- TTFT runs from the start of the request, so it includes connect and upload. TTFT after body sent is TTFT minus connect minus upload: the server side plus the return trip (plus whatever the kernel still had to send).
+- Every cell is the median of the repetitions in the n column; with n = 1 it is a single observation, not a rate. I ran this on my Mac, so your latency will differ.
+
 ### What I haven't tested
 
 Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, up to 1M tokens, and more than one 500K run. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls, and with them a 404 from a turn the API never stored, such as a reply cut off by `max_tokens` while it calls a tool. The docs page lists that cause, and the stub can inject a cut stream, but the real API never saw it. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
