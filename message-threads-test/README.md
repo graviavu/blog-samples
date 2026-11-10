@@ -221,6 +221,10 @@ The thread's median first-token time was 28% lower than the cached resend (1,318
 - Keep-alive: a thread created, a short continue at 240 seconds and a real one at 477 seconds. It answered. The keep-alive cost $0.0002 at 20K tokens and added about 46 tokens to the history.
 - Replay: after 338 seconds idle a continue returned 404. A replay of the same 100K history with a create request read 100,318 of 100,322 tokens from the cache, cost $0.0053 and answered in 1,579 ms. A thread create on that prefix took 1,646 ms. A cold reload on a fresh 100K prefix cost $0.0630 and took 3,074 ms. The 1-hour write for the 100K prefix was $0.1006.
 
+### What I haven't tested
+
+Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, and more than one 500K run: the vendor's range goes to 1M tokens. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
+
 ## Limits
 
 - Thinking blocks are left out of the history the resend arms send, while a thread may keep the thinking blocks of its own earlier turns. That can make the arms differ in tokens and TTFT for reasons unrelated to threads, so read the token-usage comparison before you trust a TTFT difference. The docs offer effort as the main lever for thinking, so every request uses `--effort low`. The effort page also allows `thinking: {"type": "disabled"}` on Haiku 5.5 at high effort or below; this sample does not use it.
