@@ -222,7 +222,7 @@ The thread's median TTFT was 28% lower than the cached resend (1,318 ms against 
 
 ### What I haven't tested
 
-Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, up to 1M tokens, and more than one 500K run. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
+Replays and keep-alives beyond one each: the warm-cache replay and the idle-timer reset are single observations. Sizes above 500K, up to 1M tokens, and more than one 500K run. Growth over more than 15 turns. Models other than Haiku 5.5. Agent loops with tool calls, and with them a 404 from a turn the API never stored, such as a reply cut off by `max_tokens` while it calls a tool. The docs page lists that cause, and the stub can inject a cut stream, but the real API never saw it. Wall-clock latency of the context levers. The smaller-model technique. Threads on Claude Platform on AWS: the docs list it, and I have not run it. Bedrock is not on the docs list, and I did not test it.
 
 ## Limits
 
