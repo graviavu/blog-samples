@@ -2,6 +2,7 @@
 import http.client
 import json
 import re
+import socket
 import time
 import urllib.parse
 
@@ -9,6 +10,8 @@ from . import redact as R
 
 API_VERSION = "2026-10-21"  # from the docs cURL example (DOCS-NOTES.md)
 BETA = "message-threads-2026-08-12"
+SEND_CHUNK = 16384   # bytes per send when the upload is measured or paced
+SNDBUF = 16384       # socket send buffer while the upload is measured (a big buffer hides the upload time)
 
 
 class FatalApiError(Exception):
@@ -59,6 +62,9 @@ class Result:
         self.retry_after = None
         self.exception = None    # network-level failure, redacted text
         self.response_id = None  # kept in memory only, never written out
+        self.body_bytes = None   # size of the request body that was sent
+        self.body_sent_s = None  # seconds from the start of the request until the last body byte was handed to the socket (measure_upload only)
+        self.aborted = False     # the client closed the stream on purpose (abort_after_delta)
 
     @property
     def transient(self):
@@ -167,17 +173,50 @@ class Client:
         finally:
             conn.close()
 
-    def post(self, body, thread=False):
+    def _send_body(self, conn, data, rate_bps, t0):
+        """Headers are already sent. Hands the body to the socket in chunks. rate_bps paces it on the client (a token bucket on
+        wall-clock time) to imitate a slow uplink; None means as fast as the socket takes it. Nothing outside this process
+        is changed: no firewall, no traffic shaper, nothing to restore. Returns seconds since t0 when the last byte was handed over."""
+        start = time.perf_counter()
+        sent = 0
+        for i in range(0, len(data), SEND_CHUNK):
+            chunk = data[i:i + SEND_CHUNK]
+            conn.send(chunk)
+            sent += len(chunk)
+            if rate_bps:
+                wait = start + sent * 8.0 / rate_bps - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+        return time.perf_counter() - t0
+
+    def post(self, body, thread=False, measure_upload=False, rate_bps=None, abort_after_delta=False):
+        """measure_upload (implied by rate_bps) sends the body in chunks and records body_bytes and body_sent_s. The socket send buffer
+        is shrunk first, so the last send returns close to when the peer has taken the data; it is still the time the client handed
+        over the last byte, not the time the server received it. abort_after_delta closes the connection after the first content delta,
+        before message_stop (a dropped stream)."""
         res = Result()
         headers = {"content-type": "application/json", "accept": "text/event-stream", "x-api-key": self.key,
                    "anthropic-version": API_VERSION, "connection": "close"}
         if thread:
             headers["anthropic-beta"] = BETA
         data = json.dumps(body).encode()
+        res.body_bytes = len(data)
         t0 = time.perf_counter()  # connection setup and the upload are inside TTFT, the same for every arm
         conn = self._connect()
         try:
-            conn.request("POST", "/v1/messages", body=data, headers=headers)
+            if measure_upload or rate_bps:
+                conn.connect()
+                try:
+                    conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SNDBUF)
+                except OSError:
+                    pass
+                conn.putrequest("POST", "/v1/messages")
+                for k, v in dict(headers, **{"content-length": str(len(data))}).items():
+                    conn.putheader(k, v)
+                conn.endheaders()
+                res.body_sent_s = self._send_body(conn, data, rate_bps, t0)
+            else:
+                conn.request("POST", "/v1/messages", body=data, headers=headers)
             resp = conn.getresponse()
             res.status = resp.status
             if resp.status != 200:
@@ -187,7 +226,7 @@ class Client:
                 res.error_type, res.error = _parse_error(raw)
                 res.error_code = _error_code(res.error)
                 return res
-            self._read_stream(resp, res, t0)
+            self._read_stream(resp, res, t0, abort_after_delta)
             res.total = time.perf_counter() - t0
         except Exception as e:  # network, timeout, protocol
             res.exception = R.redact("%s: %s" % (type(e).__name__, e))
@@ -203,7 +242,7 @@ class Client:
         if isinstance(cc, dict):
             res.cache_creation.update({k: v for k, v in cc.items() if isinstance(v, int)})
 
-    def _read_stream(self, resp, res, t0):
+    def _read_stream(self, resp, res, t0, abort_after_delta=False):
         ev = None
         while True:
             line = resp.readline()
@@ -232,6 +271,9 @@ class Client:
                     res.first_kind = delta.get("type")
                 if delta.get("type") == "text_delta":
                     res.text += delta.get("text", "")
+                if abort_after_delta:
+                    res.aborted = True
+                    return
             elif t == "message_delta":
                 res.usage.update({k: v for k, v in (d.get("usage") or {}).items() if isinstance(v, int)})
                 self._merge_cc(res, d.get("usage"))
