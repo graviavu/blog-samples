@@ -161,7 +161,7 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 
 ## Results from the author's runs
 
-These are the numbers behind the blog post. I ran everything on my Mac, so your latency will be different. Cost is an estimated usage value from list prices, not an invoice.
+These are the numbers behind the blog post. I ran everything on my Mac, so your latency will be different. Cost is an estimated usage value computed from list prices.
 
 ### Pilot: context levers on an 8-turn file task (Sonnet, four arms, two runs each)
 
@@ -174,7 +174,7 @@ These are the numbers behind the blog post. I ran everything on my Mac, so your 
 
 ### Simulation: pricing a real agent loop at list rates
 
-1,632 calls from main sessions and 889 from subagents. This is a simulation of uploaded tokens. It is not a threads run and it does not measure time to first token.
+1,632 calls from main sessions and 889 from subagents. This is a simulation of uploaded tokens at list prices.
 
 | | Main sessions | Subagents |
 | --- | --- | --- |
