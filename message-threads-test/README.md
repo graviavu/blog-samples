@@ -161,7 +161,7 @@ On such an error nothing is retried or replayed (not even a thread continue, whi
 
 ## Results from the author's runs
 
-These are the numbers behind the blog post. One machine, one network, one day. Network conditions change first-token times, so your numbers will differ. Cost is an estimated usage value from list prices, not an invoice.
+These are the numbers behind the blog post. I ran everything on my Mac, so your latency will be different. Cost is an estimated usage value from list prices, not an invoice.
 
 ### Pilot: context levers on an 8-turn file task (Sonnet, four arms, two runs each)
 
