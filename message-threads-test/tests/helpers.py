@@ -10,6 +10,7 @@ from tests.fake_api import Server
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "threads_test", "cli.py")
+OPS_CLI = os.path.join(ROOT, "threads_test", "ops_cli.py")
 FAKE_KEY = "sk-ant-api03-FAKEKEYFORTESTS0123456789abcdef"
 SMALL = ["--tokens", "3000", "--turns", "2", "--reps", "2", "--nocache-turns", "2", "--nocache-reps", "1",
          "--max-tokens", "64", "--chars-per-token", "4.0"]
@@ -24,11 +25,11 @@ def env_for(url, key=FAKE_KEY):
     return e
 
 
-def spawn_tty(args, url=None, key=FAKE_KEY, text=""):
+def spawn_tty(args, url=None, key=FAKE_KEY, text="", cli=CLI):
     """Start the CLI with a pseudo-terminal as stdin (the typed phrase must come from a terminal) and stdout/stderr on pipes.
     Returns (process, master_fd). Keep master_fd open until the process ends."""
     master, slave = pty.openpty()
-    p = subprocess.Popen([sys.executable, "-I", CLI] + args, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    p = subprocess.Popen([sys.executable, "-I", cli] + args, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=env_for(url, key))
     os.close(slave)
     if text:
@@ -36,12 +37,12 @@ def spawn_tty(args, url=None, key=FAKE_KEY, text=""):
     return p, master
 
 
-def run_cli(args, url=None, stdin="", key=FAKE_KEY, timeout=120, pipe_stdin=False):
+def run_cli(args, url=None, stdin="", key=FAKE_KEY, timeout=120, pipe_stdin=False, cli=CLI):
     """stdin text is typed on a pseudo-terminal. pipe_stdin=True feeds it through a pipe instead (must be refused)."""
     if pipe_stdin or not stdin:
-        return subprocess.run([sys.executable, "-I", CLI] + args, input=stdin, capture_output=True, text=True,
+        return subprocess.run([sys.executable, "-I", cli] + args, input=stdin, capture_output=True, text=True,
                               env=env_for(url, key), timeout=timeout)
-    p, master = spawn_tty(args, url, key, stdin)
+    p, master = spawn_tty(args, url, key, stdin, cli)
     try:
         out, err = p.communicate(timeout=timeout)
     finally:

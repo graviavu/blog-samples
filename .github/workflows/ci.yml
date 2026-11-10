@@ -61,7 +61,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/*
+          shellcheck -x scripts/*.sh cloudfront-request-routing/*.sh cloudfront-request-routing/test/*.sh cloudfront-request-routing/test/mock/fake-aws cloudfront-business-hours-cache/*.sh cloudfront-business-hours-cache/tests/run.sh cloudfront-business-hours-cache/tests/bin/* message-threads-test/run-ops-test.sh
 
       - name: verify.sh against the local mock (tests the script, not CloudFront)
         working-directory: cloudfront-request-routing
@@ -86,3 +86,7 @@ jobs:
       - name: business-hours-cache run-test.sh against fake aws, curl, date, sleep and zip
         working-directory: cloudfront-business-hours-cache
         run: tests/run.sh
+
+      - name: message-threads-test ops tests against the local stub (python unittest, no key, no real API)
+        working-directory: message-threads-test
+        run: python3 -I -m unittest discover -s tests -t . -p 'test_ops.py' -v
